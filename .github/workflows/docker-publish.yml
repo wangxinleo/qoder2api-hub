@@ -67,7 +67,9 @@ jobs:
           IMG="qoder-smoke:${GITHUB_RUN_ID}"
           docker build -t "$IMG" .
           # 1) 应用模块必须都在镜像里（用源码里的 import 反查，防「新增文件忘了 COPY」）
-          docker run --rm --entrypoint sh "$IMG" -c 'cd /app && for m in $(grep -hoE "^import (qoder_[a-z_]+)" *.py | awk "{print \$2}" | sort -u); do test -f "/app/$m.py" || { echo "MISSING: $m.py"; exit 1; }; done; echo "all app modules present"'
+          #    import / from 两种写法都查：v1.4.0 镜像曾漏 COPY qoder_enterprise.py，
+          #    qoder_accounts.py 里的 `from qoder_enterprise import …` 逃过了只查 ^import 的旧守卫。
+          docker run --rm --entrypoint sh "$IMG" -c 'cd /app && for m in $(grep -hoE "^(import|from) (qoder_[a-z_]+)" *.py | awk "{print \$2}" | sort -u); do test -f "/app/$m.py" || { echo "MISSING: $m.py"; exit 1; }; done; echo "all app modules present"'
           # 2) 关键模块可导入
           docker run --rm --entrypoint python "$IMG" -c "import qoder_proxy, qoder_anthropic; print('imports ok')"
           # 3) 进程能启动并响应探活
