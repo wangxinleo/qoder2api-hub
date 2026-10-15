@@ -2984,15 +2984,15 @@ check("Responses 流式：散文 + marker 同帧 -> 不回显 marker、散文保
 
 print()
 print("[27.95] issue #16 兜底：hold 缓冲上限（超限 fail-open 放行）")
-_BIG16 = P.LEAK_MARKER + "\n[" + "1," * 20000          # 约 40KB 的候选前缀
+_BIG16 = P.LEAK_MARKER + "\n[" + "1," * 70000          # 约 140KB：超 128KB 上限
 _big_out = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
     iter([_raw27(_BIG16), _raw27("2]", "stop")]), {"terminal"})]
 _big_text = "".join(f["choices"][0]["delta"].get("content") or ""
                     for f in _big_out)
 check("超限：hold 超过 _HOLD_MAX_CHARS -> fail-open 放行且内容只出现一次",
       len(_BIG16) > P._HOLD_MAX_CHARS and _big_text == _BIG16 + "2]")
-check("上限常量：32KB / 200 帧",
-      P._HOLD_MAX_CHARS == 32768 and P._HOLD_MAX_FRAMES == 200)
+check("上限常量：128KB / 帧上限与字符上限同刻度",
+      P._HOLD_MAX_CHARS == 131072 and P._HOLD_MAX_FRAMES == P._HOLD_MAX_CHARS)
 _keep_frames16 = P._HOLD_MAX_FRAMES
 try:
     P._HOLD_MAX_FRAMES = 2
@@ -3004,6 +3004,62 @@ finally:
 check("帧数兜底：超过 _HOLD_MAX_FRAMES 帧仍未证伪 -> 放行",
       "".join(f["choices"][0]["delta"].get("content") or "" for f in _fr16)
       == P.LEAK_MARKER + "\n[12")
+
+_keep_frames16b = P._HOLD_MAX_FRAMES
+try:
+    P._HOLD_MAX_FRAMES = 3
+    _fr16b = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+        iter([_raw27(P.LEAK_MARKER), _raw27(""), _raw27(None), _raw27(""),
+              _raw27("\n["), _raw27("1"), _raw27("2]"), _raw27("", "stop")]),
+        {"terminal"})]
+finally:
+    P._HOLD_MAX_FRAMES = _keep_frames16b
+_texts16b = [f["choices"][0]["delta"].get("content") or "" for f in _fr16b]
+check("帧数兜底只统计内容帧：空帧不推进 hold_frames（2026-10-15 回归）",
+      _texts16b == [P.LEAK_MARKER + "\n[12]", ""], _texts16b)
+
+_LONG16 = P.LEAK_MARKER + "\n" + json.dumps(
+    [{"name": "terminal",
+      "arguments": json.dumps({"cmd": "echo " + "x" * 600}, ensure_ascii=False)}],
+    ensure_ascii=False)
+_fr16L = [_LONG16[i:i + 3] for i in range(0, len(_LONG16), 3)]
+_r16L = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(c) for c in _fr16L] + [_raw27("", "stop")]), _N16)]
+check("回归（2026-10-15）：%d 个内容帧（> 旧 200 帧上限）的长回声块仍完整回读为 tool_calls"
+      % len(_fr16L),
+      bool([f for f in _r16L if f["choices"][0]["delta"].get("tool_calls")])
+      and _txt16(_r16L) == ""
+      and any(f["choices"][0].get("finish_reason") == "tool_calls"
+              for f in _r16L),
+      (len(_fr16L), _txt16(_r16L)[:40]))
+
+_DS16 = (P.LEAK_MARKER + "\n"
+         + json.dumps([{"name": "terminal",
+                        "arguments": json.dumps({"cmd": "ls"}, ensure_ascii=False)}],
+                      ensure_ascii=False)
+         + " </｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>")
+_fr16D = [_DS16[i:i + 2] for i in range(0, len(_DS16), 2)]
+_r16D = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(c) for c in _fr16D] + [_raw27("", "stop")]), _N16)]
+check("DSML 收尾标签（跨帧切成 %d 片）不打断候选判定，终局仍回读为 tool_calls"
+      % len(_fr16D),
+      bool([f for f in _r16D if f["choices"][0]["delta"].get("tool_calls")])
+      and _txt16(_r16D) == "",
+      (_txt16(_r16D)[:60],))
+check("DSML 清理单元：完整标签 / 写入中前缀 / 混合形态 / 普通 `<` 文本不动",
+      P._strip_dsml_tail("abc</｜｜DSML｜｜ calls> ") == "abc"
+      and P._strip_dsml_tail("a < b") == "a < b"
+      and P._strip_dsml_tail("x</｜｜DS") == "x"
+      and P._strip_dsml_tail(
+          "a </｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DS").strip()
+      == "a"
+      and P._strip_dsml_tail("x<a") == "x<a")
+_r16T = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(P.LEAK_MARKER + "\n"
+                 + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"ls'),
+          _raw27(" </｜｜DS")]), _N16)]
+check("DSML：截断回声块 + 写入中标签前缀 -> 整段被吞（不泄漏）",
+      _txt16(_r16T) == "")
 
 print()
 print("[28] 发布前补强：终局验证 §10.7#5 的零覆盖项（防止静默回归）")

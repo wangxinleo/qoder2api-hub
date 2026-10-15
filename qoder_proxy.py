@@ -2929,8 +2929,46 @@ _MARKER_HOLD_WINDOW = max(len(LEAK_MARKER), len(TOOL_RESULT_MARKER)) - 1
 # issue #16 兜底：hold 缓冲上限。正常文本长期"看起来仍是候选"时（模型写超长
 # JSON/正则示例），hold 会持续增长 -> 内存与首字延迟风险。超限即 fail-open
 # 放行并记一条 WARN：宁可漏一次，也不无限压住客户端。
-_HOLD_MAX_CHARS = 32768            # 32KB（真实回声块远小于此；见档案 §13）
-_HOLD_MAX_FRAMES = 200             # 极端"每帧 1 字符"场景的二级兜底
+# 2026-10-15 修正（上游细粒度流误触事故，详见 qoder3013-diagnosis 报告）：
+#   1) hold_frames 只统计「带内容的帧」——上游实测 ~2.4 字符/帧且夹带空帧 /
+#      reasoning 帧，旧实现全帧计数，~500 字符的合法回声块在 200 帧处即被
+#      mid-block fail-open 放行（原始协议文本泄漏到客户端 + 工具调用丢失）；
+#   2) 帧上限抬到与字符上限同刻度——内容帧每帧 ≥1 字符 => 帧数 ≤ 字符数，
+#      字符上限必然先到，帧上限退化为防御性冗余（保留变量便于极端场景调节）。
+_HOLD_MAX_CHARS = 131072           # 128KB（真实回声块远小于此；见档案 §13）
+_HOLD_MAX_FRAMES = _HOLD_MAX_CHARS  # 见上：与字符上限同刻度（只统计内容帧）
+
+
+# ---------------------------------------------------------------------------
+# DSML 收尾残留清理（2026-10-15）
+# ---------------------------------------------------------------------------
+# 上游在「marker + JSON 数组」回声块尾部偶尔附带 DSML 闭标签
+# （</｜｜DSML｜｜ parameter> / invoke / calls），且沿用细粒度帧下发，标签会被
+# 切成任意前缀。这些标签不属于正文：候选判定与终局还原前先剔除，否则标签到达
+# 的瞬间会把回声块误证伪 -> fail-open 放行原始协议文本（客户端可见泄漏）。
+_DSML_SUFFIX_RE = re.compile(r"(?:\s*" + TAG_START + r">)+\s*$")
+
+
+def _strip_dsml_tail(text):
+    """剥掉文本**尾部**的 DSML 残留（完整标签后缀 + 「写作中」前缀），直到稳定。
+
+    只处理后缀：避免误删 JSON 字符串字面量里出现的 DSML 形态文本。
+    跨帧切分时残留可能是任意形态：`</｜`、`</｜｜DS`、`</｜｜DSML｜｜ calls>`
+    或「完整标签 + 未写完前缀」的混合；循环处理直到不再变化。
+    """
+    t = text or ""
+    while True:
+        t2 = _DSML_SUFFIX_RE.sub("", t)
+        i = t2.rfind("<")
+        if i >= 0:
+            tail = t2[i:]
+            if ">" not in tail and ("DSML" in tail or "｜" in tail
+                                    or "|" in tail
+                                    or set(tail) <= set("</|｜")):
+                t2 = t2[:i]
+        if t2 == t:
+            return t
+        t = t2
 
 
 def parse_leaked_tool_calls(text, allowed_names=None):
@@ -2944,13 +2982,13 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为空串
     （整段都是该块）；未识别时原样返回 text。
     """
-    t = (text or "").strip()
+    t = _strip_dsml_tail((text or "").strip())
     # 整段被 ``` 围栏包裹时先剥壳（模型复述时常带围栏）
     if t.startswith("```") and t.endswith("```") and len(t) > 6:
         inner = t[3:]
         if inner[:4].lower() == "json":
             inner = inner[4:]
-        t = inner[:-3].strip()
+        t = _strip_dsml_tail(inner[:-3].strip())
     if not t.startswith(LEAK_MARKER):
         return None, text
     rest = t[len(LEAK_MARKER):].strip()
@@ -3131,7 +3169,7 @@ def _still_leak_candidate(text):
         return True
     if state == "no":
         return False
-    rest = (body or "").lstrip()
+    rest = _strip_dsml_tail(body or "").lstrip()
     if not rest:
         return True
     if rest.endswith("```"):
@@ -3163,7 +3201,7 @@ def _leaked_partial_droppable(text, allowed_names=None):
     state, body = _leak_body_offset(t)
     if state != "body":
         return False
-    rest = (body or "").strip()
+    rest = _strip_dsml_tail(body or "").strip()
     if rest.endswith("```"):
         rest = rest[:-3].strip()
     if not _json_array_prefix_ok(rest):
@@ -3323,7 +3361,11 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
             continue
         if hold is not None:
             hold += piece
-            hold_frames += 1
+            if piece:
+                # 只统计「带内容的帧」（2026-10-15）：空帧 / 纯 reasoning 帧
+                # 不是 hold 的进度，旧实现全帧计数会在 ~500 字符的回声块上
+                # 提前触发 200 帧上限 -> mid-block fail-open 泄漏。
+                hold_frames += 1
             if _echo_hold_candidate(hold):
                 # issue #16 兜底：超限即 fail-open 放行（内存 + 首字延迟）。
                 if len(hold) > _HOLD_MAX_CHARS \
@@ -3396,6 +3438,8 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
         calls, clean = parse_leaked_tool_calls(hold, allowed_names)
         if calls:
             recovered = True
+            log("recovered leaked tool-call echo (%d chars / %d frames -> %d call(s))"
+                % (len(hold), hold_frames, len(calls)), level="INFO", tag="chat")
             for i, call in enumerate(calls):
                 yield _leak_chunk_frame(meta, {"tool_calls": [{
                     "index": i,
