@@ -123,14 +123,14 @@ docker compose up -d --build
 ```bash
 docker run -d --name qoder-proxy --restart unless-stopped \
   -p 8790:8790 -v $(pwd)/accounts:/app/accounts -v $(pwd)/usage:/app/usage \
-  -e API_KEY=your_secret_key ghcr.io/shuishuipingan/qoder2api-hub:latest
+  -e API_KEY=your_secret_key ghcr.io/wangxinleo/qoder2api-hub:latest
 ```
 
-> **镜像与版本入口**：[**GHCR 包页面**](https://github.com/shuishuipingan/qoder2api-hub/pkgs/container/qoder2api-hub)（列出全部可用 tag、架构与拉取命令）· [**Releases**](https://github.com/shuishuipingan/qoder2api-hub/releases)（每个版本的变更说明）。
+> **镜像与版本入口**：[**GHCR 包页面**](https://github.com/wangxinleo/qoder2api-hub/pkgs/container/qoder2api-hub)（列出全部可用 tag、架构与拉取命令）· [**Releases**](https://github.com/wangxinleo/qoder2api-hub/releases)（每个版本的变更说明）。
 >
-> 可用 tag：**`latest`** · **`1.3`**（跟随最新 1.3.x）· **具体版本**（如 `1.3.3`）· **`sha-<短提交>`**（钉死某次构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
+> 可用 tag：**`latest`**（跟随最新构建）· **具体版本**（如 `1.5.0-wangxinleo`，`-wangxinleo` 后缀为本 fork 专属版本线，与上游版本区分）· **`sha-<短提交>`**（钉死某次构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
 >
-> 提示：GitHub 仓库**首页侧栏**未必列出容器包 —— 用上面那个包页面链接即可，或直接 `docker pull ghcr.io/shuishuipingan/qoder2api-hub:latest`。
+> 提示：GitHub 仓库**首页侧栏**未必列出容器包 —— 用上面那个包页面链接即可，或直接 `docker pull ghcr.io/wangxinleo/qoder2api-hub:latest`。
 
 ```
 

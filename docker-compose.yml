@@ -1,8 +1,8 @@
 services:
   qoder-proxy:
-    # 默认使用官方预构建镜像（每个版本自动构建并推送多架构 amd64/arm64 到 GHCR）。
+    # 默认使用本 fork 的预构建镜像（每次构建自动刷新 latest，发版推送多架构 amd64/arm64 到 GHCR）。
     # 想从源码自行构建：注释掉下面这行 image，改用 build: .
-    image: ghcr.io/shuishuipingan/qoder2api-hub:latest
+    image: ghcr.io/wangxinleo/qoder2api-hub:latest
     # build: .
     container_name: qoder-proxy
     restart: unless-stopped
