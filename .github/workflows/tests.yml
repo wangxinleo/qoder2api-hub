@@ -9,6 +9,8 @@ on:
     # 发版不可能带着与代码不一致的 tag 出门。
     tags: ["v*"]
   pull_request:
+  # 手动触发：排障 / 验证「没有新提交时测试是否绿」不必等下一个 push。
+  workflow_dispatch:
 
 # 同一分支的第二次推送让第一次变得没有意义：取消它而不是付两套矩阵的钱。
 concurrency:
