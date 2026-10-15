@@ -2495,7 +2495,7 @@ class Account(object):
             self.save(os.path.dirname(self.path))
 
     def fetch_credits(self):
-        """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度。"""
+        """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度 + 企业资源包。"""
         url = self.openapi_base() + PATH_QUOTA
         try:
             q = http_json(url, method="GET", headers=self.headers(), timeout=30)
@@ -2507,6 +2507,7 @@ class Account(object):
             return self._note_quota_anomaly(q, "non-dict response")
         uq = q.get("userQuota") or {}
         aq = q.get("addOnQuota") or {}
+        org = q.get("orgResourcePackage") or {}
 
         def _num(d, k):
             try:
@@ -2541,25 +2542,49 @@ class Account(object):
                 out["package_code"] = str(code)
             return out
 
-        remain = int(_num(uq, "remaining") + _num(aq, "remaining"))
-        used = int(_num(uq, "used") + _num(aq, "used"))
-        size = int(_num(uq, "total") + _num(aq, "total"))
+        # 企业 VPC 实例配额体是单包 orgResourcePackage（used/remaining/cap），
+        # 与公共版 userQuota/addOnQuota 可能并存——三者相加（对齐参考实现）。
+        remain = int(_num(uq, "remaining") + _num(aq, "remaining")
+                     + _num(org, "remaining"))
+        used = int(_num(uq, "used") + _num(aq, "used") + _num(org, "used"))
+        size = int(_num(uq, "total") + _num(aq, "total") + _num(org, "cap"))
         # ---- #25-d：退化 body 合理性守卫（保守）--------------------------
         # 形态（naonao 实测）：isQuotaExceeded=true + 两个 quota 全 0/缺键。
         # 判定**不依赖** expiresAt=253402214400——那是 CN 号「永不过期」的
         # 正常占位，健康号同样返回它，拿它当判据会误伤。
         # 判据：exceeded=true 且 remain 合计=0 且 size 合计=0（「从没有过
-        # 额度」；真·耗尽的特征是 size>0 而 remain=0，会被放行）；或两个
-        # quota 键都缺失（解析不了 -> 拒绝写入比写 0 诚实）。
+        # 额度」；真·耗尽的特征是 size>0 而 remain=0，会被放行）；或三个
+        # 额度键（userQuota/addOnQuota/orgResourcePackage）都缺失
+        # （解析不了 -> 拒绝写入比写 0 诚实）。
         # 保守性：任一信号单独出现都放行——真·余额归零与新号不受影响。
-        both_missing = (not isinstance(q.get("userQuota"), dict)
-                        and not isinstance(q.get("addOnQuota"), dict))
-        degenerate = both_missing or (bool(q.get("isQuotaExceeded"))
-                                      and remain == 0 and size == 0)
+        all_missing = (not isinstance(q.get("userQuota"), dict)
+                       and not isinstance(q.get("addOnQuota"), dict)
+                       and not isinstance(q.get("orgResourcePackage"), dict))
+        degenerate = all_missing or (bool(q.get("isQuotaExceeded"))
+                                     and remain == 0 and size == 0)
         if degenerate:
             return self._note_quota_anomaly(
-                q, "both quota objects missing" if both_missing
+                q, "no quota objects (user/addOn/org all absent)" if all_missing
                 else "exceeded=true with zero size/remain")
+        # 行按来源形态是否出现发出：公共体照旧两行；企业体只多一行
+        # 「企业资源包」（上游给 cap，语义即 size）。
+        packages = []
+        if isinstance(q.get("userQuota"), dict):
+            packages.append({"name": "基础额度", "remain": int(_num(uq, "remaining")),
+                             "used": int(_num(uq, "used")),
+                             "size": int(_num(uq, "total")),
+                             **_expiry_of(uq)})
+        if isinstance(q.get("addOnQuota"), dict):
+            packages.append({"name": "赠送/签到额度",
+                             "remain": int(_num(aq, "remaining")),
+                             "used": int(_num(aq, "used")),
+                             "size": int(_num(aq, "total")),
+                             **_expiry_of(aq)})
+        if isinstance(q.get("orgResourcePackage"), dict):
+            packages.append({"name": "企业资源包", "remain": int(_num(org, "remaining")),
+                             "used": int(_num(org, "used")),
+                             "size": int(_num(org, "cap")),
+                             **_expiry_of(org)})
         self.credits = {
             "remain": remain,
             "used": used,
@@ -2567,14 +2592,7 @@ class Account(object):
             "exceeded": bool(q.get("isQuotaExceeded")),
             "usage_pct": q.get("totalUsagePercentage"),
             "expires_at": normalize_epoch(q.get("expiresAt")),
-            "packages": [
-                {"name": "基础额度", "remain": int(_num(uq, "remaining")),
-                 "used": int(_num(uq, "used")), "size": int(_num(uq, "total")),
-                 **_expiry_of(uq)},
-                {"name": "赠送/签到额度", "remain": int(_num(aq, "remaining")),
-                 "used": int(_num(aq, "used")), "size": int(_num(aq, "total")),
-                 **_expiry_of(aq)},
-            ],
+            "packages": packages,
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }

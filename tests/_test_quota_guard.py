@@ -3,7 +3,8 @@
     python tests/_test_quota_guard.py
 
 d) fetch_credits plausibility guard：退化 body 不覆盖健康快照、ok=False、
-   落盘 raw 摘要；且**不误伤真·归零**（保守性由 Q2 钉住）。
+   落盘 raw 摘要；且**不误伤真·归零**（保守性由 Q2 钉住）；企业形态
+   orgResourcePackage（cap 作 size）照常解析（Q7/Q8）。
 e) _stamp_checkin 补调：CLAIMED/already 分支同步盖章，令 can_checkin 收口
    （naonao 的因果链：lastCheckin 恒 null -> 每轮重走）。
 """
@@ -96,7 +97,7 @@ a3 = _mk("d3")
 a3.credits = dict(HEALTHY)
 _stub_json(MISSING)
 r3 = a3.fetch_credits()
-check("Q3 两个 quota 键都缺 -> 不覆盖 + ok=False",
+check("Q3 三个额度键（user/addOn/org）都缺 -> 不覆盖 + ok=False",
       (a3.credits or {}).get("remain") == 399 and r3.get("ok") is False,
       (a3.credits, r3))
 
@@ -120,6 +121,41 @@ r5 = a5.fetch_credits()
 check("Q5 正常 body -> 照常覆盖 + ok=True（回归）",
       (a5.credits or {}).get("remain") == 649 and r5.get("ok") is True,
       (a5.credits, r5))
+
+ORG_ONLY = {"userType": "enterprise", "usageType": "credits",
+            "isQuotaExceeded": False, "totalUsagePercentage": 0.0,
+            "expiresAt": 1792512000000,
+            "orgResourcePackage": {"used": 121.0, "remaining": 1879.0,
+                                   "percentage": 0.07, "unit": "credits",
+                                   "cap": 2000.0, "available": True}}
+
+a6 = _mk("d6")
+a6.credits = dict(HEALTHY)
+_stub_json(ORG_ONLY)
+r6 = a6.fetch_credits()
+check("Q7 企业真形态（仅 orgResourcePackage）-> cap 作 size、ok=True",
+      (a6.credits or {}).get("remain") == 1879
+      and (a6.credits or {}).get("used") == 121
+      and (a6.credits or {}).get("size") == 2000 and r6.get("ok") is True,
+      (a6.credits, r6))
+check("Q7b 企业资源包入 packages、无退化误报",
+      any(p.get("name") == "企业资源包" and p.get("size") == 2000
+          for p in (a6.credits or {}).get("packages") or [])
+      and getattr(a6, "last_quota_anomaly", None) is None,
+      ((a6.credits or {}).get("packages"),
+       getattr(a6, "last_quota_anomaly", None)))
+
+MIXED = {"isQuotaExceeded": False, "expiresAt": 1792065206,
+         "userQuota": {"total": 100, "used": 40, "remaining": 60},
+         "orgResourcePackage": {"cap": 2000.0, "used": 121.0, "remaining": 1879.0}}
+a7 = _mk("d7")
+_stub_json(MIXED)
+r7 = a7.fetch_credits()
+check("Q8 公共+企业包并存 -> 三者相加（对齐参考实现）",
+      (a7.credits or {}).get("remain") == 1939
+      and (a7.credits or {}).get("used") == 161
+      and (a7.credits or {}).get("size") == 2100 and r7.get("ok") is True,
+      (a7.credits, r7))
 
 with open(os.path.join(D, "d1.json"), encoding="utf-8") as fh:
     disk = json.load(fh)

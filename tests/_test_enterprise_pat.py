@@ -365,12 +365,23 @@ check("A6 企业签到/活动族全程 /sash/ 零出站（http_json 未被调用
       CALLS == [], CALLS)
 
 _reset()
-_route(A.PATH_QUOTA, {"userQuota": {"total": 100, "used": 40, "remaining": 60},
-                      "addOnQuota": {"total": 0, "used": 0, "remaining": 0}})
+_route(A.PATH_QUOTA, {"userType": "enterprise", "usageType": "credits",
+                      "isQuotaExceeded": False, "totalUsagePercentage": 0.0,
+                      "expiresAt": 1792512000000,
+                      "orgResourcePackage": {"used": 121.0, "remaining": 1879.0,
+                                             "percentage": 0.07, "unit": "credits",
+                                             "cap": 2000.0, "available": True}})
 r6 = ent6.fetch_credits()
-check("A6 fetch_credits 出站为企业 openapi + 正常解析",
-      r6.get("ok") is True and (ent6.credits or {}).get("remain") == 60
-      and _urls() == [ENT_OPENAPI + A.PATH_QUOTA], (r6, _urls()))
+c6 = ent6.credits or {}
+check("A6 fetch_credits 企业真形态（orgResourcePackage，cap 作 size）出站为企业 openapi",
+      r6.get("ok") is True and c6.get("remain") == 1879 and c6.get("used") == 121
+      and c6.get("size") == 2000 and _urls() == [ENT_OPENAPI + A.PATH_QUOTA],
+      (r6, _urls()))
+check("A6 企业资源包入 packages 且无退化误报",
+      any(p.get("name") == "企业资源包" and p.get("remain") == 1879
+          and p.get("size") == 2000 for p in c6.get("packages") or [])
+      and getattr(ent6, "last_quota_anomaly", None) is None,
+      (c6.get("packages"), getattr(ent6, "last_quota_anomaly", None)))
 check("A6 企业配额请求叠加 Cosy-Version/Cosy-ClientType",
       CALLS[0]["headers"].get("Cosy-Version") == "1.0.1"
       and CALLS[0]["headers"].get("Cosy-ClientType") == "5",

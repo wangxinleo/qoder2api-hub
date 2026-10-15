@@ -231,12 +231,12 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
-**基线（2026-10-15 · 加入企业 PAT 套件 + 企业看板 JS 套件）**：
+**基线（2026-10-15 · 企业 PAT 套件 + 看板 JS 套件 + 企业配额形态修复）**：
 
 | 口径 | 数值 |
 |---|---|
 | 套件数 | **31 suites** |
-| 全部断言 | **1099 checks** |
+| 全部断言 | **1103 checks** |
 | 结果 | 0 failed / exit 0 |
 | 前端九套件小计 | **154**（19/9/20/19/19/15/31/10/12） |
 | legacy 套件 | 630（其中 4 条 SKIP，语义见 `_test_qoder.py` 的 SUMMARY 说明） |
@@ -244,8 +244,9 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 > 注：环境里若存在 `NO_PROXY=127.0.0.1` 类变量，`_test_proxy_policy.py` 的 3 条
 > 「死代理必失败」断言会误报（与代码无关）；`env -u NO_PROXY -u no_proxy` 后 31/31 全绿。
 >
-> 企业相关两套件：`_test_enterprise_pat.py`（56 条，桩 `http_json` 的 VPC 出站断言）与
-> `_test_dashboard_enterprise_pat.js`（20 条，PAT 弹窗载荷 + 账号行 badge）。
+> 企业相关两套件：`_test_enterprise_pat.py`（57 条，桩 `http_json` 的 VPC 出站断言）与
+> `_test_dashboard_enterprise_pat.js`（20 条，PAT 弹窗载荷 + 账号行 badge）；企业配额形态
+> 修复另在 `_test_quota_guard.py` 增 3 条（Q7/Q7b/Q8：orgResourcePackage 解析与三者相加）。
 
 **提交前建议三步**：
 
