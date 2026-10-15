@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.4.0-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.0--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.0-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -498,6 +498,31 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.5.0-wangxinleo
+
+> 本 fork 的专属版本线：版本号带 `-wangxinleo` 后缀与上游版本明确区分；镜像推送至 `ghcr.io/wangxinleo/qoder2api-hub`。
+
+**✨ 新增功能**
+
+**① 企业版 PAT 登录（Qoder CN 企业 VPC）** —— 企业账号一键接入，与个人版账号完全隔离：
+
+- 导入企业 PAT（`pt-…`）即可接入企业 VPC 实例：`enterpriseDomain` 按账号自定义（不限于固定实例）；账号文件中的 realm 字段与个人版语义无关；
+- **企业域名单一 host、无公共域回退**：企业凭据绝不发往公共端点；
+- 企业账号自动排除签到 / 活动类任务（公共任务对企业实例无意义）；
+- 仅企业连接叠加上游要求的 Cosy 签名头，个人版请求逐字节不变；
+- 旧账号文件（无 `enterpriseDomain` 字段）加载行为不变；面板不显示完整令牌（仅指纹掩码）。
+
+**🐛 问题修复**
+
+- **企业额度显示为 0**：企业配额接口返回 `orgResourcePackage` 单包 body，原解析只认多包结构 → 现在正确解析并显示（基础额度 / 赠送 / 签到额度 / 企业资源包分列，全缺失时不误报为 0）。
+
+**⚠️ 其他变更**
+
+- **修复 v1.4.0 镜像启动即 `ModuleNotFoundError`**：Dockerfile 漏 COPY `qoder_enterprise.py`（构建推送全绿但容器坏在启动前）；CI 冒烟守卫升级为 `import`/`from` 双查，「新增模块忘 COPY」这类问题从此在构建阶段拦住；
+- tests.yml 增加 `workflow_dispatch` 手动触发入口（排障时不必造提交）。
+
+**验证**：全量 31 suites / 1103 checks / 0 failed；CI 三平台矩阵绿（Ubuntu py3.9/3.12 + Windows py3.12）；镜像冒烟（模块存在性 + imports + /ping）通过。
 
 ### v1.4.0
 
