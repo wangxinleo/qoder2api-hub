@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.0--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.0-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.5.1--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.1-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -498,6 +498,14 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.5.1-wangxinleo
+
+**🐛 问题修复**
+
+- **工具调用回声 mid-block 泄漏（生产事故修复）**：deepseek-flash + `effort=max` 流式会话实测 5 次事故——工具调用中断丢失、客户端界面出现原始协议文本（`[assistant 请求调用工具]` + JSON 数组，日志 `released oversized leak hold (N chars / 201 frames) — fail-open`）。根因：① hold 帧计数把空帧 / 纯推理帧也计入，约 500 字符的合法回声块在 200 帧处即提前触发二级兜底 mid-block fail-open 放行；② 回声块尾部 DSML 闭标签（如 `</｜｜DSML｜｜ parameter>`）按细粒度帧到达，会把候选判定误证伪、同样 mid-block 放行。修复：帧计数只统计内容帧；字符上限 32KB→128KB、帧上限抬至与字符上限同刻度；新增 `_strip_dsml_tail`，候选判定与终局还原前先剥离尾部 DSML 残留；回读成功新增 INFO 日志（`recovered leaked tool-call echo …`）便于部署核验。
+
+**验证**：生产交付补丁逐字节应用（`qoder_proxy.py` md5 `e9b6799b579340506dbefdddb92bf5a1`、`_test_qoder.py` md5 `52999e910eaabb897fcec132113695e7`，与交付文档指纹一致）；新增 5 条回归断言（内容帧计数 / 226 帧长回声块完整回读 / DSML 收尾跨帧不打断 / DSML 清理单元 / 截断吞掉）全部通过；全量 31 suites / 1108 checks，唯一红 `_test_proxy_policy` 为沙箱预存在问题（基线对照同样红，与本次改动无关）。
 
 ### v1.5.0-wangxinleo
 
