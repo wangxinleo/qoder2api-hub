@@ -326,6 +326,8 @@ personalToken: pt- (长期兜底, 看板导入)
 
 刷新按 `refreshToken` 前缀路由，PAT 永不覆盖活跃 OAuth 会话，只做最终兜底；`access token` 轮换后 COSY 会话自动重建。
 
+**企业私有化（VPC）实例**：PAT 导入时可选填企业域名（如 `acme.vpc.qoder.com.cn`），归一化为**实例名**存入账号的 `enterpriseDomain` 字段（公共账号为空串）。账号的兑换/刷新/配额走 `{实例}-openapi.vpc.qoder.com.cn`，对话与模型清单走 `{实例}-gateway.vpc.qoder.com.cn`（**单 host，无 api2/api3 类公共域回退**）；区域恒为国内版，企业账号不参与每日签到/活动（Token 保活刷新不受影响）。
+
 ---
 
 ## 三、账号添加与管理
@@ -350,6 +352,8 @@ personalToken: pt- (长期兜底, 看板导入)
 1. 在 Qoder 网页版「设置 → Personal Access Token」创建 `pt-` 令牌；
 2. 看板点击 **「🔑 导入 PAT」**，选择区域并粘贴；
 3. 网关自动交换 `jt-`/`jrt-`、拉取账号身份入池。
+
+**企业私有化（VPC）实例**：弹窗可填企业域名（如 `acme` 或 `acme.vpc.qoder.com.cn`）——该账号兑换/刷新/配额走 `{实例}-openapi.vpc.qoder.com.cn`、对话与模型清单走 `{实例}-gateway.vpc.qoder.com.cn`（单 host，无公共回退），且不参与签到/活动；导入前可在网关所在机器用 `python scripts/verify_enterprise_pat.py --domain <域名> [--chat]` 先行验证 PAT。
 
 ### 方式三：JSON 导入 / 导出
 - 支持全量/单账号导出（可选带密钥）、Dry-Run 预检导入、覆盖同 UID；
@@ -426,7 +430,7 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 | GET | /scheduler | 定时调度器运行状态与排程日志 |
 | POST | /scheduler/trigger | 手动立即执行后台巡检保活 |
 | POST | /accounts/login/start | 发起 OAuth 设备授权 |
-| POST | /accounts/import/pat | 导入 PAT 令牌 |
+| POST | /accounts/import/pat | 导入 PAT 令牌（可选 enterpriseDomain，企业 VPC 实例） |
 | POST | /accounts/checkin | 手动签到（单个/全部） |
 
 ---
@@ -441,7 +445,7 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 # 本机凭证扫描）
 python _test_qoder.py
 
-# 全量套件（29 个：Python + 前端 JS；--jobs 限并发，--logs 把每套件完整
+# 全量套件（31 个：Python + 前端 JS；--jobs 限并发，--logs 把每套件完整
 # 日志落在可见目录而不是临时目录，CI 与本地同一条命令）
 python tests/run_all.py --jobs 4 --logs suite-logs
 
@@ -474,6 +478,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 | `qoder_proxy.py` | 主网关：HTTP 路由、COSY 数据面、双协议转换、用量统计、看板鉴权 |
 | `qoder_sign.py` | 自定义 Base64、纯库 AES-128/256 + GCM、RSA、DPAPI、QMC 解密、COSY 签名 |
 | `qoder_accounts.py` | 双区账号池、OAuth 设备流、PAT、Token 生命周期、**本机凭证扫描/导入** |
+| `qoder_enterprise.py` | 企业版 VPC 域名归一化与三类端点派生（openapi / gateway / portal，纯 stdlib） |
 | `qoder_catalog.py` | 双区官方模型快照加载（外部 JSON 优先，内嵌冻结副本兜底）、别名与独占表 |
 | `qoder_catalog_intl.json` / `qoder_catalog_cn.json` | 双区官方模型快照（客户端 catalog 逐字段原样导出，`_refresh_catalog.py` 刷新） |
 | `qoder_tasks.py` | 签到闭环（含 DISABLED 归一化）、Pro 福利包、批量执行、保活巡检 |

@@ -6,6 +6,8 @@
   - OAuth 设备授权（PKCE S256，浏览器授权 + /deviceToken/poll 轮询，
     dt- 30 天 / drt- 1 年）——免桌面客户端一键登录
   - PAT 导入（pt- 长期令牌 -> jobToken 交换 jt-/jrt-）
+  - 企业私有化（VPC）实例：PAT 只在企业专属域名兑换/刷新/查询（无公共域回退），
+    对话走企业 gateway 单 host，账号不参与个人签到/活动
   - 按 token 前缀路由的刷新（drt- -> deviceToken/refresh；
     jrt- -> jobToken/refresh，失败回落 PAT 重新交换）
   - 每日签到 / 额度（quota）/ 套餐（plan）查询
@@ -32,6 +34,7 @@ import uuid
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
+from qoder_enterprise import enterprise_origins, normalize_vpc_domain
 
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
@@ -793,6 +796,9 @@ _CAMPAIGN_FAILURE_CN = {
     "RISK_DEPENDENCY_UNAVAILABLE": "风控服务不可用，稍后重试",
 }
 CHECKIN_REASON_NOT_FOUND = "checkin_endpoint_not_found"
+# 企业 VPC 账号不参与个人签到/活动：独立的跳过原因（与"本区域无接口"区分）
+CHECKIN_REASON_ENTERPRISE = "enterprise_account"
+ENTERPRISE_ACTIVITY_MSG = "企业版账号不参与每日签到/活动"
 
 # 会话死亡标记：上游主动吊销离线会话，刷新已无意义，需要重新登录。
 SESSION_DEAD_MARKERS = ("TOKEN_EXPIRE", "12153", "Offline user session not found")
@@ -818,6 +824,19 @@ def gateway_candidates(realm):
         if host and host not in out:
             out.append(host)
     return out
+
+
+def gateway_candidates_for(account):
+    """账号级推理主机候选：企业 VPC 账号只走 {instance}-gateway 单 host。
+
+    企业实例没有 api2/api3 类故障切换域名证据（参考实现仅用单 host），
+    因此这里刻意不拼接任何公共域；公共账号返回值与 gateway_candidates(realm)
+    逐项一致（回归测试对照）。
+    """
+    ent = str(getattr(account, "enterprise_domain", "") or "").strip()
+    if ent:
+        return [enterprise_origins(ent)["gateway"]]
+    return gateway_candidates(getattr(account, "realm", "cn"))
 
 
 def detect_realm_from_domain(domain):
@@ -1237,6 +1256,9 @@ class Account(object):
         self.user_type = str(data.get("userType") or "") or DEFAULT_USER_TYPE
         self.organization_id = str(data.get("organizationId") or "")
         self.organization_name = str(data.get("organizationName") or "")
+        # 企业私有化（VPC）实例名，如 acme（归一化后；公共账号为空串）。
+        # 旧账号 JSON 无该键 -> 防御式读空，行为与历史完全一致。
+        self.enterprise_domain = str(data.get("enterpriseDomain") or "").strip()
         # 签到能力：None=未探测 / True=接口存在 / False=接口不存在（404）。
         # 运行时探测而非按区域硬编码——官方随时可能在任一区域增删活动接口。
         self._checkin_cap = None
@@ -1279,6 +1301,7 @@ class Account(object):
             "userType": self.user_type,
             "organizationId": self.organization_id,
             "organizationName": self.organization_name,
+            "enterpriseDomain": self.enterprise_domain,
         }
 
     def public(self):
@@ -1330,6 +1353,7 @@ class Account(object):
                                         else "not_found")),
             "checkinReason": self.checkin_capability()[1],
             "userType": self.user_type,
+            "enterpriseDomain": self.enterprise_domain,
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": derive_id(self.uid, "session"),
         }
@@ -1707,7 +1731,7 @@ class Account(object):
     # -- 出站头 ------------------------------------------------------------
     def headers(self, purpose="openapi"):
         cfg = get_realm_config(self.realm)
-        return {
+        h = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
             "User-Agent": CLIENT_UA,
@@ -1718,6 +1742,13 @@ class Account(object):
             "Origin": cfg["website"],
             "Referer": cfg["website"] + "/",
         }
+        if self.enterprise_domain:
+            # 企业 VPC 实测：配额/套餐等 openapi 端点要求 Cosy 两头（缺失或
+            # 只有裸 Bearer 时会回登录页/错误体，被 #25-d 守卫判为退化响应）。
+            # 公共账号不叠加，公共路径逐字节不变。
+            h["Cosy-Version"] = "1.0.1"
+            h["Cosy-ClientType"] = "5"
+        return h
 
     def desktop_headers(self):
         """桌面端 0.4.3 同款出站头（活动平台 /sash/... 必需）。
@@ -1786,14 +1817,28 @@ class Account(object):
                     "可能不可见、领取可能失败。这是已知限制，不等于今天没有活动。")
         return ""
 
+    # -- 企业 VPC（Qoder CN 私有化实例）-----------------------------------
+    def is_enterprise(self):
+        """企业 VPC 实例账号（enterpriseDomain 非空即真；公共账号恒 False）。"""
+        return bool(self.enterprise_domain)
+
+    def openapi_base(self):
+        """账号级 openapi 基址：企业 -> VPC openapi；公共 -> realm 配置。
+
+        企业 PAT 只在企业专属域名有效，**绝不允许**回退公共域；路径与公共
+        CN 完全一致，仅替换 host。
+        """
+        if self.enterprise_domain:
+            return enterprise_origins(self.enterprise_domain)["openapi"]
+        return get_realm_config(self.realm)["openapi"]
+
     # -- 刷新（按 token 前缀路由） ----------------------------------------
     def refresh(self):
         """刷新 access token。drt- 走 deviceToken，jrt-/PAT 走 jobToken。
 
         PAT 永不覆盖活跃的 OAuth 会话，只做 jrt- 过期后的最终兜底。
         """
-        cfg = get_realm_config(self.realm)
-        base = cfg["openapi"]
+        base = self.openapi_base()
         # 1) OAuth 设备族
         if self.refresh_token.startswith("drt-"):
             return self._post_token(base + PATH_DEVICE_REFRESH,
@@ -1882,7 +1927,13 @@ class Account(object):
         return self._checkin_cap, self._checkin_cap_reason
 
     def can_checkin(self):
-        """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。"""
+        """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。
+
+        企业 VPC 账号一律 False：sash/campaign 语义对企业实例未知，排除即
+        零风险（额度可见性不受影响，仍走企业 openapi 刷新）。
+        """
+        if self.is_enterprise():
+            return False
         capable, _ = self.checkin_capability()
         if capable is False:
             return False
@@ -1896,6 +1947,9 @@ class Account(object):
         接口在本区域不存在时返回 (False, {"unavailable": True, reason:...})，
         并记录能力探测结果（活动上线后 TTL 到期会自动重探）。
         """
+        if self.is_enterprise():
+            return False, {"unavailable": True, "reason": CHECKIN_REASON_ENTERPRISE,
+                           "error": ENTERPRISE_ACTIVITY_MSG}
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + PATH_CHECKIN_STATUS
         try:
@@ -1948,6 +2002,10 @@ class Account(object):
         不再按区域门控：接口不存在（国际版 404）按"本区域无此接口"跳过并给
         出明确原因，而不是静默什么都不做（历史问题：看板点签到毫无反应）。
         """
+        if self.is_enterprise():
+            return {"ok": True, "unavailable": True,
+                    "reason": CHECKIN_REASON_ENTERPRISE,
+                    "msg": ENTERPRISE_ACTIVITY_MSG + "，已跳过"}
         ok, st = self.checkin_status()
         if not ok:
             if st.get("unavailable"):
@@ -2006,6 +2064,8 @@ class Account(object):
 
         返回 (payload|None, http_code, error_str)；payload 为服务端 JSON。
         """
+        if self.is_enterprise():
+            return None, 0, ENTERPRISE_ACTIVITY_MSG
         url = get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS
         try:
             return http_json(url, method="GET", headers=self.desktop_headers(),
@@ -2142,6 +2202,8 @@ class Account(object):
 
     def campaign_reward(self, campaign_id):
         """GET …/campaigns/{id}/reward -> 该活动的发放状态（幂等，只读）。"""
+        if self.is_enterprise():
+            return {"error": ENTERPRISE_ACTIVITY_MSG}
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + (PATH_CAMPAIGN_REWARD % campaign_id)
         try:
@@ -2160,6 +2222,8 @@ class Account(object):
             （实测：同机多号共享每轮一次的额度，第二个号会被 BLOCKED 且列表里
             隐藏该活动——官方文档写"每账号"，实际执行是"每人"）。
         """
+        if self.is_enterprise():
+            return {"ok": False, "error": ENTERPRISE_ACTIVITY_MSG}
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
@@ -2245,6 +2309,13 @@ class Account(object):
             的 epoch 秒与可读文本（见 next_checkin_window）；**无论本次是否真的
             领到都给出**，前端只在"没到账"时渲染。
         """
+        if self.is_enterprise():
+            # 防御双闸之一（另一闸在 can_checkin/run_checkin）：企业账号零出站。
+            return {"ok": True, "claimed": [], "already": [], "blocked": [],
+                    "pending": [], "locked": [], "codes": [], "views": [],
+                    "campaigns": [], "errors": [], "earned": 0,
+                    "skipped_enterprise": True,
+                    "message": ENTERPRISE_ACTIVITY_MSG + "，本步跳过"}
         claim_gap = CLAIM_GAP_DEFAULT if gap is None else max(0.0, float(gap))
         # 领取前只需"身份有效"（内存 → 落盘 → 组件），**不要** force 刷新：
         # force 会让每次签到都换一套身份并把落盘缓存刷掉，「重建不换」就失效了
@@ -2425,8 +2496,7 @@ class Account(object):
 
     def fetch_credits(self):
         """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度。"""
-        cfg = get_realm_config(self.realm)
-        url = cfg["openapi"] + PATH_QUOTA
+        url = self.openapi_base() + PATH_QUOTA
         try:
             q = http_json(url, method="GET", headers=self.headers(), timeout=30)
         except Exception as exc:
@@ -2517,8 +2587,7 @@ class Account(object):
 
     def fetch_plan(self):
         """GET /api/v2/user/plan -> 套餐名（Pro Trial 等）。"""
-        cfg = get_realm_config(self.realm)
-        url = cfg["openapi"] + PATH_PLAN
+        url = self.openapi_base() + PATH_PLAN
         try:
             p = http_json(url, method="GET", headers=self.headers(), timeout=15,
                           retries=1)
@@ -2533,6 +2602,8 @@ class Account(object):
 
     # -- Pro 升级包（一次性 +1800） ---------------------------------------
     def pro_eligibility(self):
+        if self.is_enterprise():
+            return False, ENTERPRISE_ACTIVITY_MSG
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + PATH_PRO_ELIGIBILITY
         try:
@@ -2548,6 +2619,8 @@ class Account(object):
             return False, str(exc)
 
     def pro_claim(self):
+        if self.is_enterprise():
+            return {"ok": False, "error": ENTERPRISE_ACTIVITY_MSG}
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + PATH_PRO_CLAIM
         try:
@@ -2851,6 +2924,10 @@ class AccountPool(object):
                     account.last_checkin = existing.last_checkin
                 if not account.personal_token and existing.personal_token:
                     account.personal_token = existing.personal_token
+                if not account.enterprise_domain and existing.enterprise_domain:
+                    # 同 uid 重导入（可能来自不带企业域名的渠道）不得把企业属性
+                    # 覆盖为空——与 personalToken 的合并先例同款。
+                    account.enterprise_domain = existing.enterprise_domain
                 self.accounts[self.accounts.index(existing)] = account
             else:
                 self.accounts.append(account)
@@ -3362,25 +3439,45 @@ class AccountPool(object):
             return self.logins.pop(state, None) is not None
 
     # -- PAT 导入 ----------------------------------------------------------
-    def import_pat(self, pat, realm="cn"):
-        """导入 pt- 个人访问令牌：交换 jobToken 并拉取身份后入库。"""
+    def import_pat(self, pat, realm="cn", enterprise_domain=""):
+        """导入 pt- 个人访问令牌：交换 jobToken 并拉取身份后入库。
+
+        enterprise_domain 非空 = 企业私有化（VPC）实例（实例名或域名均可）：
+        兑换与 userinfo 只走 {instance}-openapi.vpc.qoder.com.cn，realm 恒为 cn；
+        **绝不对公共域名回退**（企业 PAT 在公共域无效，回退既误导排障，也把
+        凭据发到错误的区域）。失败信息统一包装为含企业 host 的 RuntimeError。
+        """
         pat = str(pat or "").strip()
         if not pat.startswith("pt-"):
             raise ValueError("PAT must start with pt-")
+        instance = ""
+        if str(enterprise_domain or "").strip():
+            # 归一化失败 -> ValueError（中文消息）原样上抛，路由层回 400 且不落库
+            instance = normalize_vpc_domain(enterprise_domain)
+            realm = "cn"       # VPC 仅 CN 域
         cfg = get_realm_config(realm)
-        data = http_json(cfg["openapi"] + PATH_JOB_EXCHANGE,
-                         data=json.dumps({"personal_token": pat}).encode(),
-                         method="POST",
-                         headers={"Content-Type": "application/json",
-                                  "Accept": "application/json",
-                                  "User-Agent": CLIENT_UA},
-                         timeout=30)
-        token = data.get("token") or ""
+        base = enterprise_origins(instance)["openapi"] if instance else cfg["openapi"]
+        try:
+            data = http_json(base + PATH_JOB_EXCHANGE,
+                             data=json.dumps({"personal_token": pat}).encode(),
+                             method="POST",
+                             headers={"Content-Type": "application/json",
+                                      "Accept": "application/json",
+                                      "User-Agent": CLIENT_UA},
+                             timeout=30)
+            token = data.get("token") or ""
+        except Exception as exc:
+            if instance:
+                raise RuntimeError("企业版 PAT 验证失败 (%s): %s" % (base, exc))
+            raise
         if not token:
+            if instance:
+                raise RuntimeError("企业版 PAT 验证失败 (%s): "
+                                   "jobToken exchange returned no token" % base)
             raise ValueError("jobToken exchange returned no token")
         uid, nickname, user_type, org_id, org_name = "", "", DEFAULT_USER_TYPE, "", ""
         try:
-            ui = http_json(cfg["openapi"] + PATH_USERINFO, method="GET",
+            ui = http_json(base + PATH_USERINFO, method="GET",
                            headers={"Accept": "application/json",
                                     "User-Agent": CLIENT_UA,
                                     "Authorization": "Bearer " + token},
@@ -3411,6 +3508,7 @@ class AccountPool(object):
             "userType": user_type,
             "organizationId": org_id,
             "organizationName": org_name,
+            "enterpriseDomain": instance,
         })
         self.add(account)
         return account
@@ -3758,6 +3856,11 @@ def normalise_import_row(row, realm=None):
     detected = str(realm or pick("realm") or "").strip().lower()
     if detected not in ("cn", "intl"):
         detected = detect_realm_from_domain(pick("domain"))
+    # 企业 VPC 实例（归一化实例名；非法值该行 ValueError 拒收）；带域名恒为 cn
+    ent_raw = str(pick("enterpriseDomain") or "").strip()
+    enterprise = normalize_vpc_domain(ent_raw) if ent_raw else ""
+    if enterprise:
+        detected = "cn"
     cfg = get_realm_config(detected)
     raw_uid = str(pick("uid") or "").strip()
     uid = re.sub(r"[^A-Za-z0-9_-]", "_", raw_uid).strip("_ ")
@@ -3781,6 +3884,7 @@ def normalise_import_row(row, realm=None):
         "userType": str(pick("userType") or "") or DEFAULT_USER_TYPE,
         "organizationId": str(pick("organizationId") or ""),
         "organizationName": str(pick("organizationName") or ""),
+        "enterpriseDomain": enterprise,
         "lastError": "",
         "cooldownUntil": 0.0,
     }

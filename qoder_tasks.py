@@ -711,6 +711,12 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
                       跟随 gap。0 是合法值（不等待），因此这里只做 is None 判断，
                       既不用 falsy 判断，也不在本层 max(1.0, ...) 之类地 clamp。
     """
+    if account.is_enterprise():
+        # 企业 VPC 账号不参与个人签到/活动：首行早退，零出站（防御双闸之二，
+        # 另一闸在 Account.can_checkin/campaign_checkin）。
+        name = account.nickname or account.uid[:8]
+        return {"ok": True, "logs": [f"— [{name}] 企业版账号不参与每日签到/活动，本步跳过"],
+                "earned_credit": 0, "skipped_enterprise": True}
     settle = 1.0 if gap is None else max(0.0, float(gap))
     # 透传给活动平台内部：只有调用方显式给了 claim_gap 才覆盖 gap（gap=0 不丢）
     camp_gap = settle if claim_gap is None else max(0.0, float(claim_gap))
@@ -820,6 +826,13 @@ def run_pro_claim(account):
       · state="already_claimed" 本就已领取   → earned_credit 记 0，只如实回报事实。
     否则批量汇总的 credit_added 每次都会虚增 +1800（历史缺陷）。
     """
+    if account.is_enterprise():
+        # 企业 VPC 账号不参与签到/活动（Pro 包同族）：零出站早退。
+        name = account.nickname or account.uid[:8]
+        return {"ok": True, "logs": [f"— [{name}] 企业版账号不参与签到/活动，本步跳过"],
+                "earned_credit": 0, "already_claimed": False,
+                "state": "skipped_enterprise",
+                "msg": "企业版账号不参与签到/活动"}
     logs = []
     name = account.nickname or account.uid[:8]
     ok, elig = account.pro_eligibility()

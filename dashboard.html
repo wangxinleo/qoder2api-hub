@@ -1167,6 +1167,18 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
             <span><b>国际版</b> (qoder.com)</span>
           </label>
         </div>
+        <div style="display:flex;flex-direction:column;gap:5px">
+          <label for="patEntDomain" style="font-size:13px"><b>企业版 VPC 域名</b>（可选，私有化部署）</label>
+          <input id="patEntDomain" type="text" placeholder="acme.vpc.qoder.com.cn"
+                 autocomplete="off" oninput="onPatEntDomainInput()"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);
+                        border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
+          <p class="hint" style="margin:0">
+            私有化实例填企业域名（如 <code>acme</code> 或 <code>acme.vpc.qoder.com.cn</code>），
+            请在 <code>https://{域名}/account/integrations</code> 创建 PAT。
+            填写后强制按企业版（国内版）导入，该账号不参与每日签到/活动。
+          </p>
+        </div>
         <div id="patBody" style="min-height:20px"></div>
       </div>
     </div>
@@ -2364,6 +2376,10 @@ function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
     : '<span class="realm-badge-intl">国际版</span>';
+  const entBadge = a.enterpriseDomain
+    ? ' <span class="badge ok" style="font-weight:600" title="企业版私有化实例 ' + esc(a.enterpriseDomain)
+      + '，不参与每日签到/活动">企业 · ' + esc(a.enterpriseDomain) + '</span>'
+    : '';
   // Inline handlers embed these in an HTML attribute, so they must survive
   // both the attribute and the quoted JS string. uid comes from an upstream
   // JWT; treat it as untrusted and keep it to a safe charset.
@@ -2380,7 +2396,7 @@ function accountRow(a){
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
-    +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
+    +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + entBadge + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + '</td>'
@@ -2886,11 +2902,24 @@ function openPatImport(){
   if(body) body.innerHTML = '';
   const input = document.getElementById('patInput');
   if(input) input.value = '';
+  const ent = document.getElementById('patEntDomain');
+  if(ent) ent.value = '';
   const rCn = document.getElementById('patRadioCn');
   const rIntl = document.getElementById('patRadioIntl');
+  if(rIntl) rIntl.disabled = false;
   if(rCn) rCn.checked = (window.VIEW_REALM !== 'intl');
   if(rIntl) rIntl.checked = (window.VIEW_REALM === 'intl');
   if(m) m.classList.add('show');
+}
+
+/* 填写企业域名即锁定为企业版（国内版）：取消并禁用国际版单选项 */
+function onPatEntDomainInput(){
+  const ent = document.getElementById('patEntDomain');
+  const filled = !!(ent && ent.value.trim());
+  const rCn = document.getElementById('patRadioCn');
+  const rIntl = document.getElementById('patRadioIntl');
+  if(filled){ if(rCn) rCn.checked = true; }
+  if(rIntl){ rIntl.disabled = filled; if(filled) rIntl.checked = false; }
 }
 
 function closePatImport(){
@@ -2906,14 +2935,21 @@ async function doImportPat(btn){
     if(body) body.innerHTML = '<p class="hint" style="color:var(--warn)">令牌必须以 pt- 开头，请粘贴完整的 Personal Access Token。</p>';
     return;
   }
-  const realm = (document.getElementById('patRadioIntl') && document.getElementById('patRadioIntl').checked) ? 'intl' : 'cn';
+  const entInput = document.getElementById('patEntDomain');
+  const entDomain = (entInput && entInput.value || '').trim();
+  // 企业版实例固定属国内版，忽略区域单选项
+  const realm = entDomain ? 'cn'
+    : ((document.getElementById('patRadioIntl') && document.getElementById('patRadioIntl').checked) ? 'intl' : 'cn');
+  const destText = entDomain ? ('企业版 ' + entDomain) : (realm === 'cn' ? '国内版' : '国际版');
   if(btn){ btn.disabled = true; btn.textContent = '导入中...'; }
-  if(body) body.innerHTML = '<p class="hint">正在交换 jobToken 并拉取账号身份…</p>';
+  if(body) body.innerHTML = '<p class="hint">' + (entDomain ? '正在验证企业版 PAT 并拉取账号身份…' : '正在交换 jobToken 并拉取账号身份…') + '</p>';
   try{
-    const r = await postJSON('/accounts/import/pat', {pat: pat, realm: realm});
+    const payload = {pat: pat, realm: realm};
+    if(entDomain) payload.enterpriseDomain = entDomain;
+    const r = await postJSON('/accounts/import/pat', payload);
     const a = (r.imported || [])[0] || {};
-    if(body) body.innerHTML = '<p class="hint" style="color:#26bb82">✓ 已导入 ' + esc(a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (realm === 'cn' ? '国内版' : '国际版') + '</p>';
-    toast('已导入 ' + (a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (realm === 'cn' ? '国内版' : '国际版'));
+    if(body) body.innerHTML = '<p class="hint" style="color:#26bb82">✓ 已导入 ' + esc(a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + esc(destText) + '</p>';
+    toast('已导入 ' + (a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + destText);
     if(input) input.value = '';
     await loadAccounts();
     await refresh();

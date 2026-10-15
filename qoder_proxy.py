@@ -51,8 +51,8 @@ import qoder_catalog
 import qoder_settings
 import qoder_sign
 from qoder_sign import qoder_encode, SESSIONS
-from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
-                            local_vm_status)
+from qoder_accounts import (get_realm_config, gateway_candidates_for,
+                            CLIENT_UA, local_vm_status)
 from pathlib import Path
 
 VERSION = "1.4.0"
@@ -2047,6 +2047,7 @@ def read_dynamic_models(realm=None):
 
     主机按官方的候选顺序尝试（国际版 api1 → api2 → api3）：切换主机不影响
     签名（签名只覆盖 path），单个域名故障不再导致模型清单整体拉取失败。
+    企业 VPC 账号只有单一 gateway host（无 api2/api3 类回退）。
     """
     r = realm or CURRENT_REALM
     account = POOL.pick(realm=r) if POOL else None
@@ -2055,7 +2056,7 @@ def read_dynamic_models(realm=None):
     # 签名以 qoder_encode("{}") 作为 body 参与 MD5；请求同样携带该 body。
     sign_body = qoder_encode(b"{}")
     payload = None
-    for host in gateway_candidates(r):
+    for host in gateway_candidates_for(account):
         raw_url = host + MODELS_PATH
         try:
             sess = SESSIONS.get(account)
@@ -4309,8 +4310,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         encoded = qoder_encode(
             json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
-        # 签名只覆盖 path，换主机不影响签名有效性。
-        hosts = gateway_candidates(account.realm)
+        # 签名只覆盖 path，换主机不影响签名有效性。企业 VPC 账号为单 host
+        # （gateway_candidates_for：{instance}-gateway.vpc.qoder.com.cn）。
+        hosts = gateway_candidates_for(account)
         host_i = 0
         raw_url = hosts[host_i] + CHAT_PATH
 
@@ -6782,12 +6784,19 @@ class Handler(BaseHTTPRequestHandler):
             realm = payload.get("realm") or CURRENT_REALM
             if realm not in ("intl", "cn"):
                 realm = "cn"
+            ent = str(payload.get("enterpriseDomain") or "").strip()
+            if ent:
+                # 企业 VPC 仅 CN 域：带域名时强制国内版（忽略区域入参）
+                realm = "cn"
             try:
-                account = POOL.import_pat(pat, realm=realm)
+                account = POOL.import_pat(pat, realm=realm,
+                                          enterprise_domain=ent)
             except Exception as exc:
                 return self._error(400, "PAT import failed: %s" % exc)
-            log("imported PAT account %s (realm=%s)"
-                % (account.uid[:8], realm))
+            log("imported PAT account %s (realm=%s%s)"
+                % (account.uid[:8], realm,
+                   ", enterprise=%s" % account.enterprise_domain
+                   if account.enterprise_domain else ""))
             return self._json(200, {"imported": [account.public()],
                                     "accounts": account_views()})
         if path == "/accounts/import/desktop":
