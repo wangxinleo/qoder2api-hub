@@ -231,6 +231,31 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
+**基线（2026-10-16 · 企业优先派单 + 轮询公平性修复）**：
+
+| 口径 | 数值 |
+|---|---|
+| 套件数 | **36 suites** |
+| 全部断言 | **1243 checks** |
+| 结果 | 0 failed / exit 0 |
+| 前端九套件小计 | **158**（19/9/23/19/20/15/31/10/12） |
+| legacy 套件 | 641（其中 4 条 SKIP，语义见 `_test_qoder.py` 的 SUMMARY 说明） |
+
+> 注：环境里若存在 `NO_PROXY=127.0.0.1` 类变量，`_test_proxy_policy.py` 的 3 条
+> 「死代理必失败」断言会误报（与代码无关）；`env -u NO_PROXY -u no_proxy` 后 36/36 全绿。
+>
+> 本轮新增两套件：`_test_alloc_parity.py`（6 条：偶数池轮询偏差 ≤1；修复前 4 号池
+> `[0,200,0,200]` 形态直接钉死）与 `_test_enterprise_first.py`（30 条：`enterprise_first`
+> 设置往返 / realm 覆盖、派单分层矩阵、层内加权数学、`top_expiry_days` 边界）。前端：
+> `_test_dashboard_limits_auth.js` +1（第 6 键 `enterprise_first`）、
+> `_test_dashboard_enterprise_pat.js` +3（账号行企业额度到期小字）。
+>
+> 「改坏必红」自证（修改后还原，md5 复核无残差）：① `qoder_proxy.py:4426` 回退为
+> `POOL.pick(realm=realm)` → `_test_alloc_parity.py` 6 条中 **2 条红**（t2a 桩炸 +
+> t2b 计数 `{'par-t2b-0': 0, 'par-t2b-1': 200, 'par-t2b-2': 0, 'par-t2b-3': 200}`）；
+> ② `pick()` 删掉 `_pick_enterprise_first` 短路 → `_test_enterprise_first.py` 30 条中
+> **4 条红**（分层 ON 的落点断言）。
+
 **基线（2026-10-15 · 企业 PAT 套件 + 看板 JS 套件 + 企业配额形态修复）**：
 
 | 口径 | 数值 |

@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.3--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.3-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.5.4--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.4-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -498,6 +498,20 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.5.4-wangxinleo
+
+**🐛 问题修复**
+
+- **高余额账号不接单根因：轮询 cursor 被请求体占位双耗**：主链路 `open_upstream` 为请求体占位调了一次 `POOL.pick(realm=realm)`，但代表号只用于 `aliyun_user_type` 占位（发送前被真实服务号覆写），白耗一格全局轮询 cursor；随后 `pick_for_session` 再前进一格——偶数号池下固定一半账号服务数恒 0（4 号池 400 次调用实测分布 `[0,200,0,200]`，见 `tests/_test_alloc_parity.py` 修复前红证据）。修复：`representative = None`，池内严格轮转恢复（最大偏差 ≤1）。
+
+**✨ 新增功能**
+
+- **企业优先派单（可配置 `enterprise_first`，默认关）**：设置页新增限额行（全局/国际版/国内版三层作用域；空=继承、0=关、>0=开）。开启后优先在企业版（VPC）就绪账号中派单；企业子集全部不可用时（禁用/冷却/熔断/模型冷却/exclude）自动回落既有「临期优先 → 平滑轮询」路径兜底；存量会话亲和不受影响（保持已绑定账号，企业号不抢占公共号已绑定会话，新会话回到企业优先）。
+- **层内到期软加权**：企业号按顶层额度 `expiresAt` 到期紧迫度加权（越近权重越高，窗口复用 `expiring_window_days`）；CN 永不过期占位（归一后 253402214）与缺值/异常一律权重 1——仅调度偏好，不做拦截。
+- **默认关不变式**：未配置 `enterprise_first`（或 =0）时选号行为与新增前逐字节一致（无新增调用、既有 expiring-first → rotate 顺序不变），旧设置文件与旧面板载荷均兼容。
+
+**验证**：新增 `tests/_test_alloc_parity.py` 6 断言（含修复前 4 号池 `[0,200,0,200]` 根因红证据）与 `tests/_test_enterprise_first.py` 30 断言（设置往返 / 分层矩阵 / 加权数学 / 边界）；「改坏必红」自证两项（4426 revert → t2 红、分层短路删除 → 4 红）捕获后还原；`_test_qoder.py` 641 checks / 637 passed / 0 failed（4 skipped）；全量 36 suites / 1243 checks 无红（旧基线 34 suites / 1203 checks，差值 +40；`_test_proxy_policy` 按 `env -u NO_PROXY -u no_proxy` 纪律后 3 红转绿）。
 
 ### v1.5.3-wangxinleo
 

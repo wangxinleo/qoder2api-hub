@@ -173,6 +173,20 @@ function doEnv(init){
   const pubHtml = row(Object.assign({}, base, { enterpriseDomain: '' }));
   check('公共账号（空串）不渲染企业 badge', !/企业 ·/.test(pubHtml), pubHtml.indexOf('企业 ·'));
 
+  // 企业额度到期小字（task 10-16 · R5）：真实到期显示、占位/公共号不显示
+  const expDays = Math.floor(Date.now() / 1000) + 5 * 86400;
+  const entCred = { remain: 851, size: 2000, expires_at: expDays };
+  const entHtml5 = row(Object.assign({}, base, { enterpriseDomain: 'acme', credits: entCred }));
+  check('企业号 + credits.expires_at 5 天后 -> 渲染「5 天后到期」小字',
+    /额度 5 天后到期/.test(entHtml5), null);
+  const pubHtmlExp = row(Object.assign({}, base, { enterpriseDomain: '', credits: entCred }));
+  check('公共号（有到期值）不渲染「额度」小字', !/额度/.test(pubHtmlExp),
+    pubHtmlExp.indexOf('额度'));
+  const entHtmlHold = row(Object.assign({}, base, { enterpriseDomain: 'acme',
+    credits: { remain: 851, size: 2000, expires_at: 253402214 } }));
+  check('企业号 + 占位 expires_at=253402214（CN 永不过期）-> 不渲染「额度」小字',
+    !/额度/.test(entHtmlHold), entHtmlHold.indexOf('额度'));
+
   // 指纹两行：**被测文件**与**套件自身**，各带 as-of（UTC）——并发编辑下先比时间戳，再谈要不要重跑
   console.log('SUITE: ' + path.basename(__filename) + ' md5=' + SUITE_MD5);
   console.log('FILE: ' + path.basename(path.join(ROOT, 'dashboard.html'))

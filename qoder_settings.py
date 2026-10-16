@@ -376,7 +376,11 @@ class PanelSessions(object):
 # （.team/_gap/03-candidate-deep-dive.md R4），不给任何非零默认。
 LIMIT_KEYS = ("reserve_credits", "daily_token_limit",
               "daily_credit_limit", "model_daily_token_limit",
-              "expiring_window_days")
+              "expiring_window_days",
+              # task 10-16（R2）：企业优先派单开关。与 expiring_window_days
+              # 同型——**调度偏好，不是拦截护栏**；默认 0 = 关，未配置的安装
+              # 选号行为与新增前逐字节一致。
+              "enterprise_first")
 LIMIT_REALMS = ("intl", "cn")
 LIMIT_SCOPES = ("global",) + LIMIT_REALMS
 LIMITS_KEY = "limits"

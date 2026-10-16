@@ -2392,7 +2392,16 @@ function accountRow(a){
               : '<span class="badge ok">可用</span>';
   const err = a.lastError ? '<div class="hint" style="color:var(--warn);margin:2px 0 0">' + esc(a.lastError) + '</div>' : '';
   const cred = a.credits;
-  const credText = cred ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size)) : '<span style="color:var(--dim)">未查询</span>';
+  // task 10-16（R5）：企业账号在 credits 有**真实**到期值时显示「额度 N 天后到期」
+  // 小字（占位值 253402214/253402214400 会算出负值或荒谬值 -> 自动不显示）。
+  // 只读展示，不参与任何判定。
+  const entDays = (function(){
+    if(!a.enterpriseDomain || !cred) return '';
+    const days = (Number(cred.expires_at || 0) * 1000 - Date.now()) / 86400000;
+    if(!(days >= 0 && days < 3650)) return '';
+    return ' <span style="color:var(--dim);font-size:11px">· 额度 ' + (days < 1 ? '不足 1' : Math.round(days)) + ' 天后到期</span>';
+  })();
+  const credText = (cred ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size)) : '<span style="color:var(--dim)">未查询</span>') + entDays;
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
@@ -3753,7 +3762,7 @@ async function saveApiKeys(btn){
   }
 }
 
-/* ---- 事实性限额护栏（5 键 × global / intl / cn，与后端 qoder_settings.LIMIT_KEYS 一一对应）----
+/* ---- 事实性限额护栏（6 键 × global / intl / cn，与后端 qoder_settings.LIMIT_KEYS 一一对应）----
    语义：留空 = 继承 global；显式 0 = 关闭（0 不是「限制为 0」）；阈值 ≤ 0 的护栏完全不生效。
    量纲：credits 类护栏的单位是**积分点数**（实测账号区间 0~1100），不是 token 量级。 */
 const LIMIT_FIELDS = [
@@ -3767,6 +3776,8 @@ const LIMIT_FIELDS = [
     hint: '同一账号对同一个模型的当日 token 用量达到该值后，只暂停该模型的接单，其余模型照常。单位是 token。' },
   { key: 'expiring_window_days', label: '临期优先窗口', unit: '天', step: 1,
     hint: '余额将在该天数内到期的账号优先派发（0 = 关闭该偏好）。这是调度偏好，不是拦截护栏。' },
+  { key: 'enterprise_first', label: '企业优先派单', unit: '', step: 1,
+    hint: '开启后企业版（VPC）账号的就绪号优先接单；企业号全部不可用时自动改用个人号兜底（存量会话保持已绑定的号）。1 = 开启、0 = 关闭。层内按到期更近者加权，窗口复用「临期优先窗口」。' },
 ];
 const LIMIT_SCOPES = [
   { scope: 'global', prefix: '全局默认' },

@@ -89,7 +89,8 @@ const authApi = new Function('fetch', 'authHeaders', 'panelNeedsLogin',
     daily_token_limit: { global: 0, intl: null, cn: null },
     daily_credit_limit: { global: 800, intl: 1200, cn: null },
     model_daily_token_limit: { global: 0, intl: null, cn: null },
-    expiring_window_days: { global: 7, intl: null, cn: null }
+    expiring_window_days: { global: 7, intl: null, cn: null },
+    enterprise_first: { global: 0, intl: null, cn: null }
   };
   let env = makeEnv();
   env.api.renderLimits(MAP);
@@ -104,11 +105,15 @@ const authApi = new Function('fetch', 'authHeaders', 'panelNeedsLogin',
   await env.api.saveLimits(env.st.btn);
   const sent = env.st.posted[0];
   check('保存打到 /settings/save', !!sent && sent.url === '/settings/save');
-  check('载荷是 5 键 × 3 作用域', !!sent && Object.keys(sent.body.limits).length === 5
+  check('载荷是 6 键 × 3 作用域（含 enterprise_first）', !!sent && Object.keys(sent.body.limits).length === 6
+    && Object.keys(sent.body.limits.enterprise_first).length === 3
     && Object.keys(sent.body.limits.reserve_credits).length === 3);
   check('空串=继承、0=关闭 原样传递（不被序列化成 0）',
     !!sent && sent.body.limits.reserve_credits.global === '500'
     && sent.body.limits.reserve_credits.intl === '' && sent.body.limits.reserve_credits.cn === '0');
+  check('enterprise_first 空串原样传递（后端按继承/0 处理，不被前端兜底成 0）',
+    !!sent && sent.body.limits.enterprise_first.global === ''
+    && sent.body.limits.enterprise_first.intl === '' && sent.body.limits.enterprise_first.cn === '');
   env = makeEnv();
   env.api.renderLimits(null);
   await env.api.saveLimits(env.st.btn);

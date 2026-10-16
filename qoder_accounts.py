@@ -1560,6 +1560,35 @@ class Account(object):
                 best = days
         return best
 
+    def top_expiry_days(self, now=None):
+        """顶层 credits["expires_at"] 的剩余天数（企业层内加权的数据源）；不可用 None。
+
+        占位（归一后 >= _EXPIRY_NEVER_EPOCH）、缺失、非法 -> None；未归一毫秒
+        防御性 /1000（判据与 normalize_epoch 一致：> 1e11 即毫秒）。已过期
+        （< 0）如实返回负数，由调用方决定是否采用。
+
+        注：CN 占位 253402214400（毫秒原始值）按同判据归一为 253402214
+        （= fetch_credits 落库形态），days 为负 -> 由权重函数按"已过期"归 1；
+        真正的占位（如 253402214400000 归一后 == _EXPIRY_NEVER_EPOCH）在此
+        返回 None。两条护栏都保证占位值不进加权、不会被顶格。
+        """
+        cred = self.credits
+        if not isinstance(cred, dict):
+            return None
+        exp = cred.get("expires_at")
+        if exp is None:
+            return None
+        try:
+            exp_f = float(exp)
+        except (TypeError, ValueError):
+            return None
+        if exp_f > 1e11:                     # 防御：未归一毫秒
+            exp_f /= 1000.0
+        if exp_f >= _EXPIRY_NEVER_EPOCH:     # 永不过期占位 -> 不参与
+            return None
+        now = now if now is not None else time.time()
+        return (exp_f - now) / 86400.0
+
     def in_expiring_window(self, now=None):
         """是否落在「即将过期」窗口内（window <= 0 直接 False 短路）。"""
         window = self.expiring_window_days
@@ -2892,6 +2921,10 @@ class AccountPool(object):
         self.quota_refresher = None
         # task-61 §2.6：临期加权轮询的运行期状态（uid -> 当前累计权重，重启即重置）
         self._expiry_weights = {}
+        # task 10-16（R2）：企业优先派单的池级作用域值（未配置 = None = 关）。
+        # 由 apply_settings 从 limits_data 捕获——这是池策略，不是每账号预算，
+        # 故不 setattr 到账号。
+        self._enterprise_first_scope = None
         _ACTIVE_POOL = self
 
     def load(self):
@@ -3046,6 +3079,10 @@ class AccountPool(object):
         keys = ("reserve_credits", "daily_token_limit", "daily_credit_limit",
                 "model_daily_token_limit", "expiring_window_days")
         limits = limits_data if isinstance(limits_data, dict) else {}
+        # task 10-16（R2）：企业优先是**池级**策略（不是每账号预算），单独捕获：
+        # 不加入上面的 keys 元组、不做 setattr；None/非 dict 推送不覆写现值（防御）。
+        if isinstance(limits_data, dict):
+            self._enterprise_first_scope = limits_data.get("enterprise_first")
         flips = []
         with _QUOTA_LOCK:
             accounts = list(self.accounts)
@@ -3106,6 +3143,14 @@ class AccountPool(object):
         return sum(1 for a in snapshot if a.enabled and a.access_token and
                    a.ready(model=model))
 
+    def enterprise_first_enabled(self, realm=None):
+        """企业优先派单是否开启（池级策略；未配置 = 关）。
+
+        三级作用域与护栏同语义（realm override > global）；生效值 > 0 = 开。
+        这是调度偏好，不是拦截护栏——只影响 pick() 的分层，不影响 ready()。
+        """
+        return _scope_limit_value(self._enterprise_first_scope, realm) > 0
+
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None):
         exclude = exclude or set()
         if session_key:
@@ -3137,15 +3182,37 @@ class AccountPool(object):
         except (TypeError, ValueError):
             return 1
 
-    def _weighted_pick(self, candidates):
+    def _enterprise_expiry_weight(self, account):
+        """企业层内临期权重 = max(1, int(round(window - days)) + 1)（与包级同式）。
+
+        窗口 = account.expiring_window_days（三级作用域已由 apply_settings 落到
+        账号，默认 0）；数据源 = 顶层 credits.expires_at。窗口 0 / 无数据 / 已过期
+        -> 1（等权 = 企业子集纯轮转，默认行为不变）。
+        """
+        window = account.expiring_window_days or 0
+        if window <= 0:
+            return 1
+        days = account.top_expiry_days()
+        if days is None or days < 0:
+            return 1
+        try:
+            return max(1, int(round(float(window) - float(days))) + 1)
+        except (TypeError, ValueError):
+            return 1
+
+    def _weighted_pick(self, candidates, weight_fn=None):
         """nginx smooth weighted round-robin（wb:2422 同算法）。
 
         每轮各账号累加权重、最大者胜、胜者回吐本轮总权重 —— 等权时退化为严格轮转。
         状态在 self._lock 内读写；_expiry_weights 是运行期状态（重启重置）。
+        weight_fn：可选权重函数（默认 _expiry_weight = 包级临期；企业层传
+        _enterprise_expiry_weight，数据源为顶层 expires_at）。默认参数路径与
+        既有调用点行为逐字节一致。
         """
         if not candidates:
             return None
-        weights = [self._expiry_weight(a) for a in candidates]
+        weight_fn = weight_fn or self._expiry_weight
+        weights = [weight_fn(a) for a in candidates]
         total = sum(weights) or 1
         with self._lock:
             state = self._expiry_weights
@@ -3173,6 +3240,26 @@ class AccountPool(object):
         if not cands:
             return None
         return self._weighted_pick(cands)
+
+    def _pick_enterprise_first(self, realm=None, exclude=None, model=None):
+        """企业优先层：企业子集内先降权两轮、再临期加权（smooth WRR）。
+
+        等权（窗口 0 / 无数据）时平滑加权退化为严格轮转 = 企业子集纯轮询；
+        无企业候选返回 None（由 pick 回落既有路径 = 个人兜底）。不推进 _cursor——
+        企业层公平性由 smooth WRR 保证，天然无偶数池奇异。
+        """
+        exclude = exclude or set()
+        with self._lock:
+            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        cands = [a for a in snapshot
+                 if a.uid not in exclude and a.is_enterprise()
+                 and a.ready(model=model)]
+        if not cands:
+            return None
+        now = time.time()
+        healthy = [a for a in cands if not a.degraded(now)]
+        return self._weighted_pick(healthy or cands,
+                                   weight_fn=self._enterprise_expiry_weight)
 
     def _rotate_pick(self, realm=None, exclude=None, model=None):
         """纯 round-robin + 两轮降权扫描（task-74 三族之三）。
@@ -3204,11 +3291,20 @@ class AccountPool(object):
         return None
 
     def pick(self, realm=None, exclude=None, model=None):
-        """选号：临期积分优先（平滑加权），否则回落普通轮转。
+        """选号：企业优先分层（可配置）> 临期积分优先（平滑加权）> 普通轮转。
 
+        enterprise_first 默认 0（关）-> 短路，与旧行为逐字节一致。
         `expiring_window_days` 默认 0（R7）-> in_expiring_window() 恒 False ->
         _pick_expiring_first 返回 None -> 与旧的纯 round-robin **完全一致**。
         """
+        if self.enterprise_first_enabled(realm):
+            account = self._pick_enterprise_first(realm=realm, exclude=exclude,
+                                                  model=model)
+            if account is not None:
+                return account
+            # 企业子集无候选 -> 落回既有路径：此刻不存在"就绪且未被 exclude 的
+            # 企业号"，既有 _pick_expiring_first/_rotate_pick 只会选到个人号
+            # （个人兜底），无需再写一层个人分支。
         account = self._pick_expiring_first(realm=realm, exclude=exclude,
                                             model=model)
         if account is not None:

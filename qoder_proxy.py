@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates_for,
                             CLIENT_UA, local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.3-wangxinleo"
+VERSION = "1.5.4-wangxinleo"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4423,7 +4423,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
     model_key = qoder_catalog.resolve_upstream_key(model, realm=realm)
 
-    representative = POOL.pick(realm=realm) if POOL else None
+    # task 10-16（R3）：这里原为 `POOL.pick(realm=realm)`，但代表号只用于请求体
+    # 的占位 aliyun_user_type（发送前会被真实服务号覆写）——pick 会白耗一格轮询
+    # cursor，偶数池下固定一半账号服务数恒 0（根因见 tests/_test_alloc_parity.py）。
+    representative = None
     body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
