@@ -3163,7 +3163,15 @@ def _marker_starts_at(text):
 
 
 def _still_leak_candidate(text):
-    """整段文本目前是否仍是「marker + JSON 数组」候选？（流式暂存判定用）"""
+    """整段文本目前是否仍是「marker + JSON 数组」候选？（流式暂存判定用）
+
+    与 _json_array_prefix_ok 的「能否继续扩展成合法数组」不同：数组体已出现
+    **结构性非法**（解析不可能再成功，如模型复述时破坏内层转义）时也返回 True
+    —— 保持 hold，把最终处置交给流末三分支（还原 / 吞掉 / 补发）。非流式同
+    形态已被 issue #9 语义吞掉（P5 修复），流式若在此处 mid-block 证伪补发，
+    就是同一个泄漏（残余 #3）。Extra data（合法数组 + 尾随散文）除外——那是
+    正文混排，维持既有「立即证伪补发」语义。
+    """
     state, body = _leak_body_offset(text)
     if state == "pre":
         return True
@@ -3174,7 +3182,15 @@ def _still_leak_candidate(text):
         return True
     if rest.endswith("```"):
         rest = rest[:-3]
-    return _json_array_prefix_ok(rest)
+    if _json_array_prefix_ok(rest):
+        return True
+    if not rest.startswith("["):
+        return False
+    try:
+        json.loads(rest)
+        return True          # 理论不可达（prefix_ok 已 True）
+    except Exception as exc:
+        return not str(exc).startswith("Extra data")
 
 
 def _leaked_partial_droppable(text, allowed_names=None):
