@@ -3510,7 +3510,13 @@ def _flatten_content_text(content):
         return "", []
     if isinstance(content, str):
         return content, []
-    if not isinstance(content, list):
+    if isinstance(content, dict):
+        # 单 part 形态（部分客户端把单个 part 对象直接当 content 而非列表）：
+        # 当单元素列表处理，绝不 str() —— 否则图像 dict 被字符串化成 Python
+        # 字面量文本，模型收到的是一段 {'type': 'image_url', ...}，
+        # 图像从未真正到达模型（issue #33 的反馈根因）。
+        content = [content]
+    elif not isinstance(content, list):
         return str(content), []
     texts, images = [], []
     for piece in content:
@@ -4953,7 +4959,10 @@ def _flatten_content(content):
         return ""
     if isinstance(content, str):
         return content
-    if not isinstance(content, list):
+    if isinstance(content, dict):
+        # 单 part 形态当单元素列表（同 _flatten_content_text 的 dict 修复）
+        content = [content]
+    elif not isinstance(content, list):
         return str(content)
     texts, parts = [], []
     for piece in content:
