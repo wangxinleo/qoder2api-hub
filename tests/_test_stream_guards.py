@@ -117,6 +117,22 @@ try:
               _lines[1] == b"data: [1,2,3]\n\n", _lines[1])
 
     print()
+    print("[3b] iter_inner_sse：JSON null 占位帧丢弃（MiniMax 链路心跳）")
+    _ok3b, _lines3b = _no_raise(
+        "iter_inner_sse 遇 body:\"null\" 帧不抛异常",
+        lambda: list(P.iter_inner_sse(
+            _Stream([_envelope("null"), _envelope(_chunk("X")),
+                     _envelope("null")]), holder={})))
+    if _ok3b:
+        check("null 帧被丢弃：只有真实帧产出（1 条）", len(_lines3b) == 1,
+              _lines3b)
+        check("丢弃 null 不串味：真实帧内容逐字节原样",
+              _lines3b[0] == ("data: " + _chunk("X") + "\n\n").encode(),
+              _lines3b[0])
+    check("clean_chunk 对 \"null\" 仍原样返回（本体语义不动）",
+          P.clean_chunk("null") == "null")
+
+    print()
     print("[4] iter_inner_sse：非 dict 外层帧跳过（既有行为钉住）")
     _lines2 = list(P.iter_inner_sse(
         [b"data: [1,2,3]\n\n", _envelope(_chunk("Z"))], holder={}))

@@ -504,8 +504,12 @@ python _verify_models.py --base http://127.0.0.1:8790
 **🐛 问题修复**
 
 - **工具调用回声 mid-block 泄漏（生产事故修复）**：deepseek-flash + `effort=max` 流式会话实测 5 次事故——工具调用中断丢失、客户端界面出现原始协议文本（`[assistant 请求调用工具]` + JSON 数组，日志 `released oversized leak hold (N chars / 201 frames) — fail-open`）。根因：① hold 帧计数把空帧 / 纯推理帧也计入，约 500 字符的合法回声块在 200 帧处即提前触发二级兜底 mid-block fail-open 放行；② 回声块尾部 DSML 闭标签（如 `</｜｜DSML｜｜ parameter>`）按细粒度帧到达，会把候选判定误证伪、同样 mid-block 放行。修复：帧计数只统计内容帧；字符上限 32KB→128KB、帧上限抬至与字符上限同刻度；新增 `_strip_dsml_tail`，候选判定与终局还原前先剥离尾部 DSML 残留；回读成功新增 INFO 日志（`recovered leaked tool-call echo …`）便于部署核验。
+- **切换模型 E2E 压力验证的三处稳定性修复**（本地代理 + 真实上游，三轮战役 57 请求：同上下文逐轮切换 DeepSeek / Kimi / GLM / MiniMax / Auto，含生产事故参数组合 `effort=max`）：
+  - **MiniMax 链路 `data: null` 占位帧透传**：上游信封把 JSON `null` 当心跳帧发（真实帧后常跟 1–2 个），透传后严格解析的客户端在 `payload.get()` 上崩溃；现于 `iter_inner_sse` 直接丢弃（裸数组 / 标量的透传语义不变）。
+  - **裸空 assistant 被 Kimi 族 400 拒绝**：reasoning-only 回合等「无 tool_calls、content 空」的合法客户端历史形态，在移到 Kimi / K3 族时导致每次请求 400 `assistant must not be empty`；现于 `flatten_messages` 丢弃这类无信息量消息（DeepSeek 族带非空 `reasoning_content` 的形态维持原样）。
+  - **复述时内层转义被破坏的数组回声**：模型复述 `[assistant 请求调用工具]` + JSON 数组时漏掉引号转义（`"arguments": "{\"command\": "echo …`），闭合 `]` 但 JSON 解析非法，此前判定透传；现 `_leaked_partial_droppable` 对「闭合但非法」按 issue #9 语义吞掉，Extra data（合法数组 + 尾随散文）与完整合法数组的 fail-open 透传不变。
 
-**验证**：生产交付补丁逐字节应用（`qoder_proxy.py` md5 `e9b6799b579340506dbefdddb92bf5a1`、`_test_qoder.py` md5 `52999e910eaabb897fcec132113695e7`，与交付文档指纹一致）；新增 5 条回归断言（内容帧计数 / 226 帧长回声块完整回读 / DSML 收尾跨帧不打断 / DSML 清理单元 / 截断吞掉）全部通过；全量 31 suites / 1108 checks，唯一红 `_test_proxy_policy` 为沙箱预存在问题（基线对照同样红，与本次改动无关）。
+**验证**：生产交付补丁逐字节应用（`qoder_proxy.py` md5 `e9b6799b579340506dbefdddb92bf5a1`、`_test_qoder.py` md5 `52999e910eaabb897fcec132113695e7`，与交付文档指纹一致）；新增 5 条回归断言（内容帧计数 / 226 帧长回声块完整回读 / DSML 收尾跨帧不打断 / DSML 清理单元 / 截断吞掉）全部通过；全量 31 suites / 1108 checks，唯一红 `_test_proxy_policy` 为沙箱预存在问题（基线对照同样红，与本次改动无关）。切换模型 E2E 战役（三轮 57 请求，含 `effort=max` 生产事故组合）：34 次回读还原、`released oversized leak hold` 全程 0、修复后中断 0；三处修复各带回归测试（`_test_stream_guards.py` [3b] / `_test_flatten_guard.py` / `_test_echo_recovery.py`），全量 33 suites / 1149 checks。
 
 ### v1.5.0-wangxinleo
 

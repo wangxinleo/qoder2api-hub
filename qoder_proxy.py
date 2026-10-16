@@ -3182,13 +3182,16 @@ def _leaked_partial_droppable(text, allowed_names=None):
     非法）时，应吞掉整段而不是透传给终端用户。三个条件同时成立才吞：
       1) strip 后以 LEAK_MARKER 开头（真实散文回复几乎不会这样开头）；
       2) 本次请求声明了 tools（allowed_names 非空）——与恢复路径同前置条件；
-      3) marker 之后（剥掉围栏后）仍是 JSON 数组字面量的前缀
-         （复用现成的 _json_array_prefix_ok）——即"本该是数组，只是没写完"。
+      3) marker 之后（剥掉围栏后）是一个**不会/无法还原成合法调用**的 JSON
+         数组文本——要么还没写完，要么已闭合但解析非法（如模型复述时把
+         arguments 的内层转义破坏掉：`"arguments": "{\"command\": "echo ...`，
+         json 错误点落在中部，_json_array_prefix_ok 判 False）。
     返回 True = 应吞掉正文（输出空 content）。
 
     完整且合法的 JSON 数组不算：那种情况下恢复失败另有原因（工具名未声明 /
     arguments 非法），保持既有 fail-open 透传语义（见 _test_qoder.py 的 [27]
-    断言"未声明工具名 -> 不吞正文"），只有"数组本身没写完 / 非法"才吞。
+    断言"未声明工具名 -> 不吞正文"）。Extra data（合法数组 + 尾随散文）也不
+    吞——尾随文本可能是有意的正文混排。
     """
     if not text or not allowed_names:
         return False
@@ -3204,13 +3207,21 @@ def _leaked_partial_droppable(text, allowed_names=None):
     rest = _strip_dsml_tail(body or "").strip()
     if rest.endswith("```"):
         rest = rest[:-3].strip()
-    if not _json_array_prefix_ok(rest):
+    if not rest:
+        return True
+    if not rest.startswith("["):
         return False
     try:
         json.loads(rest)
         return False
-    except Exception:
-        return True
+    except Exception as exc:
+        if str(exc).startswith("Extra data"):
+            return False
+        if rest.endswith("]"):
+            # 闭合的 ] 定稿但解析非法：文本已不可能再扩展，正是 issue #9
+            # 要吞的「非法回声」（转义被复述破坏的实测样本即此形态）。
+            return True
+        return _json_array_prefix_ok(rest)
 
 
 def _tool_echo_head(text):
@@ -3755,6 +3766,15 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
                 item["reasoning_content"] = m.get("reasoning_content") or ""
             flat.append(item)
             continue
+        if role == "assistant" and not str(text or "").strip():
+            # 裸空 assistant（无 tool_calls、content 空）是合法客户端历史形态
+            # （如 reasoning-only 回合/中断残留），Kimi 族上游却以 400
+            # "assistant must not be empty" 拒绝整个请求 —— 有它在历史里，
+            # 切到 Kimi/K3 族的每一次请求都失败。空消息无信息量，直接丢弃；
+            # DeepSeek 族（keep_reasoning）带非空 reasoning 的形态维持原样。
+            _rsn = m.get("reasoning_content")
+            if not (keep_reasoning and isinstance(_rsn, str) and _rsn.strip()):
+                continue
         if role in ("user", "assistant"):
             item = {"role": role, "content": text or ""}
             if role == "assistant" and keep_reasoning \
@@ -4718,6 +4738,12 @@ def iter_inner_sse(resp, holder=None):
         try:
             inner = json.loads(body)
         except Exception:
+            continue
+        if inner is None:
+            # 上游把 JSON null 当占位/心跳帧发（MiniMax 链路实测：真实帧后
+            # 常跟 1-2 个 body:"null"）。null 无信息量，透传却会让严格解析
+            # 的客户端在 `data: null` 帧上崩（payload 非对象）；其余非 dict
+            # 形态（裸数组/标量）保持「不清洗、原样透传」语义不变。
             continue
         if isinstance(inner, dict):
             # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
