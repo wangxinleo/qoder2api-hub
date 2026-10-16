@@ -1079,23 +1079,49 @@ check("level-less model drops reasoning_effort (upstream ignores it anyway)",
 check("client tools kept", len(body2["tools"]) == 1)
 check("latest prompt is c", body2["chat_context"]["text"]["text"] == "c")
 
-# tool 角色降级 + assistant tool_calls 序列化
-body3 = P.build_qoder_body({
-    "model": "qmodel",
-    "messages": [
-        {"role": "user", "content": "run"},
-        {"role": "assistant", "content": "",
-         "tool_calls": [{"id": "c1", "type": "function",
-                         "function": {"name": "Bash", "arguments": "{\"cmd\":\"ls\"}"}}]},
-        {"role": "tool", "tool_call_id": "c1", "name": "Bash", "content": "file1"},
-    ],
-}, None, "qmodel")
+# tool 角色形态：2026-10-16 结构化默认化（R1）后 auto+CN 走结构化透传；
+# 文本化形态（tool 降级 + tool_calls 序列化）由 QD_STRUCTURED_TOOL_HISTORY=off
+# 一键回退承载（A8 回退口径）。此段属预期内语义翻转（原断言基于旧白名单默认）。
+_MSGS3 = [
+    {"role": "user", "content": "run"},
+    {"role": "assistant", "content": "",
+     "tool_calls": [{"id": "c1", "type": "function",
+                     "function": {"name": "Bash", "arguments": "{\"cmd\":\"ls\"}"}}]},
+    {"role": "tool", "tool_call_id": "c1", "name": "Bash", "content": "file1"},
+]
+body3 = P.build_qoder_body({"model": "qmodel", "messages": _MSGS3}, None,
+                           "qmodel")
 roles3 = [m["role"] for m in body3["messages"]]
-check("tool role degraded to user", roles3 == ["system", "user", "assistant", "user"])
-check("assistant tool_calls serialized into content",
-      "Bash" in body3["messages"][2]["content"])
-check("tool result carried as user text",
-      "file1" in body3["messages"][3]["content"])
+check("结构化默认（auto+CN）：tool 角色保留（不降级）",
+      roles3 == ["system", "user", "assistant", "tool"], roles3)
+check("结构化默认：assistant.tool_calls 原样透传、正文不写 LEAK_MARKER",
+      ((body3["messages"][2].get("tool_calls") or [{}])[0]
+       .get("function") or {}).get("name") == "Bash"
+      and body3["messages"][2].get("content") == ""
+      and P.LEAK_MARKER not in json.dumps(body3["messages"], ensure_ascii=False),
+      body3["messages"][2])
+check("结构化默认：tool 结果以 role=tool + tool_call_id 透传",
+      body3["messages"][3].get("tool_call_id") == "c1"
+      and "file1" in body3["messages"][3]["content"], body3["messages"][3])
+_orig_s3off = os.environ.get("QD_STRUCTURED_TOOL_HISTORY")
+try:
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "off"
+    body3t = P.build_qoder_body({"model": "qmodel", "messages": _MSGS3},
+                                None, "qmodel")
+finally:
+    if _orig_s3off is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_s3off
+roles3t = [m["role"] for m in body3t["messages"]]
+check("off 回退（A8）：tool 角色降级为 user",
+      roles3t == ["system", "user", "assistant", "user"], roles3t)
+check("off 回退：assistant tool_calls 序列化进 content",
+      "Bash" in body3t["messages"][2]["content"],
+      body3t["messages"][2]["content"][:60])
+check("off 回退：tool 结果以 user 文本承载",
+      "file1" in body3t["messages"][3]["content"],
+      body3t["messages"][3]["content"][:60])
 
 print()
 print("[6.5] DeepSeek reasoning_content backfill keys off the UPSTREAM model key")
@@ -2806,7 +2832,7 @@ check("开关：默认值 = 2000（保守）",
       P._tool_result_keep_chars() == P.TOOL_RESULT_KEEP_DEFAULT == 2000)
 
 print()
-print("[27.7] 结构化工具历史直传（task-32：provider 白名单 + 一键回退）")
+print("[27.7] 结构化工具历史直传（task-32 机制；2026-10-16 auto=CN 全模型 + 一键回退）")
 _SMSGS32 = [
     {"role": "user", "content": "weather?"},
     {"role": "assistant", "content": None, "tool_calls": [
@@ -2833,10 +2859,10 @@ check("开关：auto + CN + GLM（上游 key gm5x）-> 结构化",
       P.structured_tool_history_enabled(model="glm-5.3-flash",
                                         model_key="gm53flash",
                                         realm="cn", messages=_SMSGS32) is True)
-check("开关：auto + CN + DeepSeek -> 文本化（未验证 provider 默认不启用）",
+check("开关：auto + CN + DeepSeek -> 结构化（2026-10-16 结构化默认化；原白名单已翻转为 carve-out）",
       P.structured_tool_history_enabled(model="deepseek-flash",
                                         model_key="deepseek-flash",
-                                        realm="cn", messages=_SMSGS32) is False)
+                                        realm="cn", messages=_SMSGS32) is True)
 check("开关：auto + INTL -> 文本化（INTL legacy 未实测）",
       P.structured_tool_history_enabled(model="qwen3.8-flash",
                                         model_key="qwen3.8-flash",
@@ -3516,9 +3542,9 @@ finally:
     else:
         os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
 
-check("开关三态·auto：默认只放行 CN+白名单（Qwen/GLM/gm4 真；DeepSeek/Kimi/INTL 假）",
+check("开关三态·auto：CN 全模型真（含 DeepSeek/Kimi）；INTL 假（legacy 未实测）",
       _auto_cn_qwen is True and _auto_cn_glm is True and _auto_cn_glm2 is True
-      and _auto_cn_ds is False and _auto_cn_kimi is False
+      and _auto_cn_ds is True and _auto_cn_kimi is True
       and _auto_intl_qwen is False,
       (_auto_cn_qwen, _auto_cn_glm, _auto_cn_ds, _auto_cn_kimi, _auto_intl_qwen))
 check("开关三态·on/off：on 强制放行（含 DeepSeek/INTL），off 一律关闭",

@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates_for,
                             CLIENT_UA, local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.2-wangxinleo"
+VERSION = "1.5.3-wangxinleo"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2971,16 +2971,12 @@ def _strip_dsml_tail(text):
         t = t2
 
 
-def parse_leaked_tool_calls(text, allowed_names=None):
-    """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
+def _leak_echo_rest(text):
+    """回声块的公共归一化：返回 LEAK_MARKER 之后的数组文本；非回声形态返回 None。
 
-    严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
-      1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
-      2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
-      3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
-
-    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为空串
-    （整段都是该块）；未识别时原样返回 text。
+    归一化顺序（parse / salvage 共用，判据层唯一副本）：strip -> 尾部 DSML
+    残渣剥离 -> 整段 ``` / ```json 围栏剥壳（剥壳后再剥一次 DSML）-> 必须
+    LEAK_MARKER 前缀。只做形态归一化，不判断数组本身的合法性。
     """
     t = _strip_dsml_tail((text or "").strip())
     # 整段被 ``` 围栏包裹时先剥壳（模型复述时常带围栏）
@@ -2990,9 +2986,57 @@ def parse_leaked_tool_calls(text, allowed_names=None):
             inner = inner[4:]
         t = _strip_dsml_tail(inner[:-3].strip())
     if not t.startswith(LEAK_MARKER):
-        return None, text
-    rest = t[len(LEAK_MARKER):].strip()
-    if not (rest.startswith("[") and rest.endswith("]")):
+        return None
+    return t[len(LEAK_MARKER):].strip()
+
+
+def _leaked_item_to_call(item, allowed_names=None):
+    """逐条目校验并归一为一条结构化 call（parse / salvage 共用的唯一判据副本）。
+
+    返回 (call|None, reason)：reason 取值 not-dict / bad-name / bad-args-type /
+    args-not-json / undeclared-name（供 salvage 的 WARN 明细；parse 只用 call，
+    任一条目失败即整体拒绝）。校验顺序与历史实现一致：dict -> name ->
+    arguments 形态/合法性 -> 声明集合。
+    """
+    if not isinstance(item, dict):
+        return None, "not-dict"
+    name = item.get("name")
+    args = item.get("arguments")
+    if not isinstance(name, str) or not name.strip():
+        return None, "bad-name"
+    if isinstance(args, (dict, list)):
+        args = json.dumps(args, ensure_ascii=False)
+    if not isinstance(args, str):
+        return None, "bad-args-type"
+    if args.strip():
+        try:
+            json.loads(args)
+        except Exception:
+            return None, "args-not-json"
+    if allowed_names and name.strip() not in allowed_names:
+        return None, "undeclared-name"
+    return {
+        "id": _new_id("call_"),
+        "type": "function",
+        "function": {"name": name.strip(), "arguments": args},
+    }, ""
+
+
+def parse_leaked_tool_calls(text, allowed_names=None):
+    """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
+
+    严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
+      1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
+      2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
+      3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
+
+    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为空串
+    （整段都是该块）；未识别时原样返回 text。任一条目不合法即整体失败
+    （无部分还原）；「外层合法 + 条目级损坏」的部分挽救见
+    salvage_leaked_tool_calls（本函数保持严格，是其前置判据）。
+    """
+    rest = _leak_echo_rest(text)
+    if rest is None or not (rest.startswith("[") and rest.endswith("]")):
         return None, text
     try:
         arr = json.loads(rest)
@@ -3002,30 +3046,47 @@ def parse_leaked_tool_calls(text, allowed_names=None):
         return None, text
     calls = []
     for item in arr:
-        if not isinstance(item, dict):
+        call, _reason = _leaked_item_to_call(item, allowed_names)
+        if call is None:
             return None, text
-        name = item.get("name")
-        args = item.get("arguments")
-        if not isinstance(name, str) or not name.strip():
-            return None, text
-        if isinstance(args, (dict, list)):
-            args = json.dumps(args, ensure_ascii=False)
-        if not isinstance(args, str):
-            return None, text
-        if args.strip():
-            try:
-                json.loads(args)
-            except Exception:
-                return None, text
-        calls.append({
-            "id": _new_id("call_"),
-            "type": "function",
-            "function": {"name": name.strip(), "arguments": args},
-        })
-    if allowed_names:
-        if not all(c["function"]["name"] in allowed_names for c in calls):
-            return None, text
+        calls.append(call)
     return calls, ""
+
+
+def salvage_leaked_tool_calls(text, allowed_names=None):
+    """部分挽救（2026-10-16 事故）：外层数组完整可解析时，还原合法条目、
+    丢弃损坏条目。parse 是「全合法才还原」的严格判定；本函数在其失败后兜底：
+
+      - 仅「外层完整可解析数组 + ≥1 合法条目」时生效；0 合法 -> None
+        （回落既有链：吞掉判定 / fail-open 补发，零放宽）；
+      - 不做 raw_decode 前缀提取（Extra data 混排语义保留）、不做损坏修复
+        （丢弃而非猜测）；
+      - 合法性判据与 parse 共用 `_leak_echo_rest` + `_leaked_item_to_call`
+        （判据层唯一副本纪律，见 spec leak-recovery-guards）。
+
+    返回 (calls, dropped) | None：calls 与 parse 成功时同构；dropped 为
+    [(idx, reason), ...] 明细（reason 见 `_leaked_item_to_call`），供三链路
+    WARN 观测。
+    """
+    rest = _leak_echo_rest(text)
+    if rest is None or not (rest.startswith("[") and rest.endswith("]")):
+        return None
+    try:
+        arr = json.loads(rest)
+    except Exception:
+        return None
+    if not isinstance(arr, list) or not arr:
+        return None
+    calls, dropped = [], []
+    for idx, item in enumerate(arr):
+        call, reason = _leaked_item_to_call(item, allowed_names)
+        if call is not None:
+            calls.append(call)
+        else:
+            dropped.append((idx, reason))
+    if not calls:
+        return None                 # 0 合法 -> 回落既有链（零放宽核心守卫）
+    return calls, dropped
 
 
 def _leak_body_offset(text):
@@ -3463,6 +3524,19 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
 
     if hold is not None:
         calls, clean = parse_leaked_tool_calls(hold, allowed_names)
+        if calls is None:
+            # 部分挽救（2026-10-16 事故）：外层数组合法但条目级损坏时，
+            # parse 整体失败 -> 还原合法条目、丢弃损坏条目（WARN 留痕），
+            # 避免整段回声块 fail-open 泄漏为正文。
+            _salv = salvage_leaked_tool_calls(hold, allowed_names)
+            if _salv:
+                calls, _dropped = _salv
+                clean = ""
+                log("salvaged leaked tool-call echo: %d call(s) restored, "
+                    "%d dropped (%s)"
+                    % (len(calls), len(_dropped),
+                       ", ".join("idx=%d:%s" % (i, r) for i, r in _dropped)),
+                    level="WARN", tag="chat")
         if calls:
             recovered = True
             log("recovered leaked tool-call echo (%d chars / %d frames -> %d call(s))"
@@ -3633,7 +3707,13 @@ def _current_turn_start(messages):
 # 接受结构化历史并被正确消费（含 3 轮链、结构化+旧文本信封混合、并行调用、
 # id 不匹配）；DeepSeek / Kimi 在 assistant.content=null 时被拒，**content=""
 # 即通过**。因此本实现恒用空字符串，绝不发 null。
-STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5")
+#
+# 2026-10-16（结构化默认化）：原 provider 白名单翻转为 carve-out 排除表。
+# auto = 「CN 出口 + id 齐备」全模型默认结构化——把工具历史序列化成文本正是
+# 制造「模型照抄 marker 文本」回声的根因（参考同通道 /workspace/QoderGateway
+# 全程原生透传、零工具调用问题）；默认空表不排除任何模型，E2E 验证失败/待验
+# 模型用前缀回填（命中即回退文本化，如 ("dfmodel",)）。
+STRUCTURED_TOOL_HISTORY_EXCLUDE = ()
 _STRUCTURED_LOG_ONCE = {"done": False}
 
 
@@ -3670,11 +3750,12 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
                                     messages=None):
     """本次请求是否走结构化工具历史。
 
-    - off          -> False（一键回退文本化）
-    - on           -> True（显式强制：DeepSeek / Kimi / INTL 补验证用）
-    - auto（默认） -> 仅「CN 出口 + provider 白名单 + id 齐备」为真：
-        task-31 实测只在 CN / legacy 通道覆盖过（INTL 超时未取得结果），
-        故 auto 不在 INTL 启用；DeepSeek / Kimi 待补端到端验证，同样排除。
+    - off          -> False（一键回退文本化 + 回读守卫兜底）
+    - on           -> True（显式强制）
+    - auto（默认） -> 「CN 出口 + id 齐备」全模型结构化；仅当模型前缀命中
+        carve-out 排除表（STRUCTURED_TOOL_HISTORY_EXCLUDE，默认空）时回退。
+        INTL 维持排除：legacy 通道未实测（task-31 超时未取得结果），故 auto
+        不在 INTL 启用；回读守卫 + salvage 继续覆盖 INTL 的文本化残余路径。
     任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
     """
     if not _tool_ids_ok(messages):
@@ -3688,13 +3769,13 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
         return False
     for cand in (str(model_key or ""), str(model or "")):
         low = cand.strip().lower()
-        if low and low.startswith(STRUCTURED_TOOL_HISTORY_WHITELIST):
-            if not _STRUCTURED_LOG_ONCE["done"]:
-                _STRUCTURED_LOG_ONCE["done"] = True
-                log("structured tool history: ON (model=%s key=%s realm=%s)"
-                    % (model, model_key, realm), tag="chat")
-            return True
-    return False
+        if low and low.startswith(STRUCTURED_TOOL_HISTORY_EXCLUDE):
+            return False                    # carve-out 命中 -> 文本化
+    if not _STRUCTURED_LOG_ONCE["done"]:
+        _STRUCTURED_LOG_ONCE["done"] = True
+        log("structured tool history: ON (model=%s key=%s realm=%s)"
+            % (model, model_key, realm), tag="chat")
+    return True                             # CN 全模型默认结构化
 
 
 def flatten_messages(messages, keep_reasoning=False, structured=False):
@@ -4886,6 +4967,19 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         _echo_src = _block16 or ""
         if _echo_src:
             _rec, _clean = parse_leaked_tool_calls(_echo_src, allowed_names)
+            if _rec is None:
+                # 部分挽救：与流式链路同判（外层合法 + 条目级损坏 -> 还原
+                # 合法条目、丢弃损坏条目 + WARN）。
+                _salv = salvage_leaked_tool_calls(_echo_src, allowed_names)
+                if _salv:
+                    _rec, _dropped = _salv
+                    _clean = ""
+                    log("salvaged leaked tool-call echo: %d call(s) restored, "
+                        "%d dropped (%s)"
+                        % (len(_rec), len(_dropped),
+                           ", ".join("idx=%d:%s" % (i, r)
+                                     for i, r in _dropped)),
+                        level="WARN", tag="chat")
             if _rec:
                 message["content"] = _head16 + (_clean or "")
                 tool_calls_map = {i: c for i, c in enumerate(_rec)}
@@ -5678,6 +5772,20 @@ def stream_responses_events(inner_lines, model, holder):
         if not any(text_parts) or _marker_starts_at(text_buffer):
             leak_calls, leak_clean = parse_leaked_tool_calls(
                 text_buffer, holder.get("allowed_names"))
+            if leak_calls is None:
+                # 部分挽救：与 chat 流式/非流式链路同判（外层合法 + 条目级
+                # 损坏 -> 还原合法条目、丢弃损坏条目 + WARN）。
+                _salv = salvage_leaked_tool_calls(
+                    text_buffer, holder.get("allowed_names"))
+                if _salv:
+                    leak_calls, _salv_dropped = _salv
+                    leak_clean = ""
+                    log("salvaged leaked tool-call echo: %d call(s) restored, "
+                        "%d dropped (%s)"
+                        % (len(leak_calls), len(_salv_dropped),
+                           ", ".join("idx=%d:%s" % (i, r)
+                                     for i, r in _salv_dropped)),
+                        level="WARN", tag="chat")
             if leak_calls is None and _leaked_partial_droppable(
                     text_buffer, holder.get("allowed_names")):
                 dropped_leak = True

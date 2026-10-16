@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.2--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.2-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.5.3--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.3-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -498,6 +498,15 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.5.3-wangxinleo
+
+**🐛 问题修复**
+
+- **工具调用回声根因修复：CN 全模型结构化工具历史默认化**：此前工具历史发往上游前被序列化为文本（`[assistant 请求调用工具]` + JSON 数组），长上下文模型系统性复述该文本产生回声泄漏（工具调用中断、协议文本透传终端用户）；门控从「模型白名单」（仅个别模型结构化）反转为「默认全开 + carve-out 排除表（默认空）」——CN 出口全模型默认以结构化 `role=tool` + 原样 `tool_calls` 上行（前提：`tool_call_id` 齐备；缺 id fail-safe 回退文本化），INTL 维持排除（legacy 通道未实测完成）；`QD_STRUCTURED_TOOL_HISTORY=off` 一键回退。回声来源不再上行，与原生透传方案对齐。
+- **残余路径部分挽救（salvage）**：三链路（流式 / 非流式 / Responses）严格解析失败后新增部分挽救——外层数组 JSON 合法且 ≥1 合法条目时，将合法条目还原为结构化 `tool_calls`、丢弃损坏条目并 WARN 留痕（idx + 原因）；0 合法条目仍返回 None 回落既有链，fail-open 补发 / 截断吞掉等边界逐字节不变（零放宽）。
+
+**验证**：新增 `tests/_test_echo_salvage.py` 40 断言（2026-10-16 事故样本逐字节副本 + 三链路集成 + 零放宽矩阵 7 行）；本地 E2E 四用例全绿（单轮非流/流、多轮结构化历史、`off` 回退——多轮场景模型正确消费 `role=tool` 历史、零 LEAK_MARKER 文本、零挽救触发）；全量 34 suites / 1203 checks 全绿（旧基线 33 suites / 1160 checks；差值含新套件 +40、既有 pin 重构 +3、`_test_proxy_policy` 按 `env -u NO_PROXY -u no_proxy` 纪律后 3 红转绿）。
 
 ### v1.5.2-wangxinleo
 
