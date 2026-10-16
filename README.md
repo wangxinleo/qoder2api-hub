@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.1--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.1-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.5.2--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.2-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -498,6 +498,14 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.5.2-wangxinleo
+
+**🐛 问题修复**
+
+- **流式分帧坏转义回声 mid-block 补发泄漏（残余 #3）**：模型复述历史工具调用时把 `arguments` 内层转义破坏（`"arguments": "{\"command\": "echo …`），这类 109 字符坏转义块按流式微小分帧到达时，候选判定（`_json_array_prefix_ok`）在坏字符帧即误判「不可能再扩展」→ mid-block 补发为正文，内部协议文本（`[assistant 请求调用工具]` + JSON 数组）透传终端用户（同形态非流式已由 v1.5.1 的 issue #9 修复覆盖，流式路径此前只在「整块单帧到达」时才能吞掉）。修复：`_still_leak_candidate` 对「`[` 开头 + JSON 解析已结构性非法（非 Extra data）」的数组体不再证伪，保持 hold 到流末，交由三分类处置（还原 / 吞掉 / 补发）——与非流式语义对齐；Extra data（合法数组 + 尾随散文）即时证伪补发、未闭合 + 中部错误流末 fail-open 两条既有界线不变。
+
+**验证**：真实 HTTP 全链路端到端对照（真实 Handler / 守卫链 / chunked 写出，上游信封流仅 `open_upstream` 处注入；实测 109 字符坏转义样本按 7 字符/帧分帧投喂）——pre-fix（c50adbb）复现整段 109 字符泄漏透传，post-fix（本版）零正文吞掉 + 审计日志 `dropped truncated leaked tool-call echo (109 chars) — issue #9`；合法数组分帧仍正常还原 `tool_calls`、非流式吞掉均无回归。回归测试：`_test_echo_recovery.py` [8] 分帧（7 字符/帧）零输出钉死 + [9] 边界（Extra data 即时证伪 / 未闭合 fail-open）+ 3 条单元锚点（25→32 断言）；全量 33 suites / 1156 checks，唯一红 `_test_proxy_policy` 为沙箱预存在问题（基线对照同样红，与本次改动无关）。
 
 ### v1.5.1-wangxinleo
 
