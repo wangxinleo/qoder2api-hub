@@ -27,3 +27,8 @@ Thumbs.db
 python/
 .tmp_*
 _acc/
+
+.qoder
+.trellis
+AGENTS.md
+.gitattributes
