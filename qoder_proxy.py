@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates_for,
                             CLIENT_UA, local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.4-wangxinleo"
+VERSION = "1.5.5-wangxinleo"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -412,8 +412,9 @@ USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                 "original_credits")
 
 # Web-panel access control. The panel is gated by its own password (default
-# "admin"), independent of the /v1 API key. Sessions live in memory only.
-PANEL = qoder_settings.PanelSessions()
+# "admin"), independent of the /v1 API key. Sessions are signed tokens whose key
+# lives in accounts/settings.json, so a restart no longer forces a re-login.
+PANEL = qoder_settings.PanelSessions(lambda: ACCOUNTS_DIR)
 API_KEY_FILE_SET = False
 
 
@@ -592,6 +593,13 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
                 per[k] += fields[k]
         summary = json.loads(json.dumps(_usage))
     _persist_usage(row, summary, "usage persist failed")
+    # issue #43：把「这个号刚被用过」告诉余额刷新器（**只打标，不联网**）。
+    # 打标失败绝不能影响记账/响应，所以整段吞异常。
+    try:
+        if account and CREDITS_USAGE_REFRESHER is not None:
+            CREDITS_USAGE_REFRESHER.mark_used(account)
+    except Exception:
+        pass
     try:
         t_tokens = fields.get("total_tokens", 0)
         dur = " %dms" % elapsed_ms if elapsed_ms is not None else ""
@@ -696,9 +704,15 @@ def _epoch_or_none(value):
     return seconds if seconds >= 0 else None
 
 
+def _local_day_start(ts):
+    """任意时间戳 -> 本地自然日 0 点（epoch 秒）。"""
+    lt = time.localtime(ts)
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                            0, 0, 0, 0, 0, -1)))
+
+
 def _local_midnight(days_back=0):
-    lt = time.localtime(time.time() - days_back * 86400)
-    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    return _local_day_start(time.time() - days_back * 86400)
 
 
 def range_window(value, since=None, until=None):
@@ -1073,6 +1087,8 @@ def recent_usage(limit=100, realm=None, page=1):
 
 
 POOL = None
+# issue #43：使用驱动的余额刷新器（main() 里创建；单测/CLI 场景保持 None）
+CREDITS_USAGE_REFRESHER = None
 SCHEDULER = None
 ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
 REALM_STATE_FILE = os.path.join(ACCOUNTS_DIR, "active_realm.json")
@@ -1183,19 +1199,25 @@ def credits_summary():
             cred = {}
         realm = getattr(a, "realm", "") or ""
         remain = cred.get("remain")
+        # issue #39：团队账号的套餐 may 用满而共享池仍有余额——汇总按有效余额，
+        # 同时保留原始 remain 便于核对（两者都会出现在行里）。
+        eff = qoder_accounts.effective_remain(cred)
         rows.append({
             "uid": getattr(a, "uid", "") or "",
             "nickname": getattr(a, "nickname", "") or "",
             "realm": realm,
             "credits_remain": remain,
+            "credits_remain_effective": eff,
+            "credits_shared_remain": (cred.get("shared") or {}).get("remain")
+            if isinstance(cred.get("shared"), dict) else None,
             "credits_used": cred.get("used"),
             "credits_size": cred.get("size"),
             # 登记时间：credits.updated_at（fetch_credits 写入），不是文件 mtime。
             "registered_at": cred.get("updated_at"),
         })
-        if isinstance(remain, (int, float)) and not isinstance(remain, bool):
-            by_realm[realm] = by_realm.get(realm, 0) + int(remain)
-            total_remain += int(remain)
+        if isinstance(eff, (int, float)) and not isinstance(eff, bool):
+            by_realm[realm] = by_realm.get(realm, 0) + int(eff)
+            total_remain += int(eff)
     return {
         "by_realm": by_realm,
         "totals": {"remain": total_remain, "accounts": len(rows)},
@@ -1441,6 +1463,292 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
         "since": lo, "until": hi,
         "series": [buckets[key] for key in sorted(buckets)],
         "credits": credits[:50],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7 天 / 30 天 Token 用量图（日期 × 分组 两个维度）
+# ---------------------------------------------------------------------------
+# 与 /usage/timeseries 的关系：那边只有「日期」一个维度（分桶总量），这里多
+# 一个分组维度（模型 / 区域 / Key / 账号），供堆叠柱状图用。两者口径一致
+# （error 行计入 errors、token 字段与 credit 的累加方式相同）。
+# 性能：日志是单进程顺序 append 的，所以从尾部倒读、遇到早于窗口的行即停——
+# 30 天窗口不必从文件头扫起（日志实测可长到几十 MB/天）。
+DAILY_MAX_DAYS = 90
+DAILY_GROUPS = ("model", "realm", "key", "account")
+_daily_cache = {}
+_daily_lock = threading.Lock()
+
+
+def _iter_usage_rows_since(since, chunk=256 * 1024):
+    """逆序产出 usage 行，遇到早于 since 的行即停止（生成器，内存 O(1)）。
+
+    只在倒读终止时依赖时间有序性：单进程 append 保证同一时刻附近的行总在
+    相邻块内，所以按 at 截断不会漏掉窗口内的行。
+    """
+    try:
+        fh = open(USAGE_LOG, "rb")
+    except FileNotFoundError:
+        return
+    try:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        buf = b""
+        while pos > 0:
+            step = min(chunk, pos)
+            pos -= step
+            fh.seek(pos)
+            buf = fh.read(step) + buf
+            parts = buf.split(b"\n")
+            buf = parts[0]
+            for raw in reversed(parts[1:]):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except Exception:
+                    continue
+                at = row.get("at")
+                if not isinstance(at, (int, float)) or at < since:
+                    return
+                yield row
+        raw = buf.strip()
+        if raw:
+            try:
+                row = json.loads(raw)
+            except Exception:
+                return
+            at = row.get("at")
+            if isinstance(at, (int, float)) and at >= since:
+                yield row
+    except Exception as exc:
+        log("daily usage tail read failed: %s" % exc)
+    finally:
+        fh.close()
+
+
+def _daily_group_id(row, group):
+    """一行归入哪个分组。缺失键不静默丢弃（与 by-key 视图同口径）。"""
+    if group == "model":
+        return row.get("model") or "(unknown)"
+    if group == "realm":
+        return row.get("realm") or "(unknown)"
+    if group == "key":
+        return row.get("key_id") or "(no-key)"
+    return row.get("account") or "(unattributed)"
+
+
+def usage_daily(days=7, group="model", realm=None, ttl=10):
+    """Cached wrapper：面板轮询用，同一窗口+分组 10 秒内不重复扫日志。"""
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 7
+    days = max(1, min(DAILY_MAX_DAYS, days))
+    group = str(group or "model").strip().lower()
+    if group not in DAILY_GROUPS:
+        group = "model"
+    since = _local_day_start(time.time())
+    for _ in range(days - 1):
+        # 逐个「减一天再取本地零点」而不是 once 减 (days-1)*86400：
+        # 有夏令时的时区上按秒回推会得到 01:00 而不是 00:00，随后桶键与行的
+        # 本地零点全 miss → 30 天窗口的前半段被静默丢掉（7 天档碰不到）。
+        since = _local_day_start(since - 86400)
+    key = (realm_scope(realm) or "all", days, group, since)
+    now = time.time()
+    with _daily_lock:
+        hit = _daily_cache.get(key)
+        if hit is not None and (now - hit[0]) < ttl:
+            # 命中时刷新时间戳 => 淘汰变成 LRU 而不是 FIFO。不刷新的话
+            # min(...) 挑的是「最早创建」的那个，也就是正在被轮询的热点条目。
+            _daily_cache[key] = (now, hit[1])
+            return hit[1]
+    data = _usage_daily_uncached(days, group, realm, since)
+    with _daily_lock:
+        if len(_daily_cache) > 32:
+            # 只淘汰**最旧的单个**条目。原先这里是 clear()——清空会把其它
+            # 仍在被轮询的 (realm, days, group) 组合一起作废，下一轮全部重算。
+            oldest = min(_daily_cache, key=lambda k: _daily_cache[k][0])
+            _daily_cache.pop(oldest, None)
+        _daily_cache[key] = (time.time(), data)
+    return data
+
+
+def _iter_usage_rows_forward(since, chunk=256 * 1024):
+    """顺序读整个日志，只产出 at >= since 的行（倒读失明时的兜底用）。
+
+    record_usage 是顺序 append 的，所以正常情况永远走不到这里；只有当日志
+    被外部重排、或系统时钟大幅回拨导致倒读第一行就早于 since 时才需要它。
+    """
+    try:
+        with open(USAGE_LOG, "rb") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except Exception:
+                    continue
+                at = row.get("at")
+                if isinstance(at, (int, float)) and at >= since:
+                    yield row
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        log("daily usage forward read failed: %s" % exc)
+
+
+def _usage_log_size():
+    try:
+        return os.path.getsize(USAGE_LOG)
+    except OSError:
+        return 0
+
+
+def _usage_log_head_ts(probe_bytes=4096):
+    """读 usage 日志**第一条**记录的 at（只读开头几 KB）。
+
+    用来区分「窗口内本来就没数据」与「倒读被乱序日志阻死」——倒读对这两种
+    情况都产出 0 行，正确处置却相反（前者不该扫，后者必须扫）。正常日志是
+    单进程顺序 append 的，头行 at 最小；头行落在窗口内却一行都倒读不到，
+    只能是文件被重排过。
+    """
+    try:
+        with open(USAGE_LOG, "rb") as fh:
+            chunk = fh.read(probe_bytes)
+    except OSError:
+        return None
+    for raw in chunk.split(b"\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            at = json.loads(raw).get("at")
+        except Exception:
+            return None
+        return at if isinstance(at, (int, float)) else None
+    return None
+
+
+def _usage_daily_uncached(days, group, realm, since):
+    until = since + days * 86400
+    series = []
+    index = {}
+    for i in range(days):
+        # 同 since 的理由：索引用**重算出来的本地零点**，与 fold() 里的
+        # _local_day_start(at) 同一口径；直接 since + i*86400 在 DST 时区会
+        # 错位一小时，index.get() 全 miss。
+        start = since
+        for _ in range(i):
+            # +1 天再 +12h：只加 86400 在秋季回拨那天会落在「次日 23:00」
+            # （再取零点就退回去了），加半天余量能保证跨到下一自然日。
+            start = _local_day_start(start + 86400 + 43200)
+        lt = time.localtime(start)
+        item = {
+            "at": start,
+            "day": time.strftime("%Y-%m-%d", lt),
+            "label": time.strftime("%m-%d", lt),
+            "requests": 0, "errors": 0,
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "reasoning_tokens": 0, "cached_tokens": 0,
+            "total_tokens": 0, "credit": 0.0,
+            "groups": {},
+        }
+        series.append(item)
+        index[start] = item
+    groups = {}
+    totals = {"requests": 0, "errors": 0, "total_tokens": 0, "credit": 0.0}
+    day_cache = {}
+    seen = [0]
+
+    def fold(row):
+        if realm and not row_matches_realm(row, realm):
+            return
+        at = row.get("at") or 0
+        hour = int(at // 3600)
+        day_start = day_cache.get(hour)
+        if day_start is None:
+            day_start = _local_day_start(at)
+            day_cache[hour] = day_start
+        item = index.get(day_start)
+        if item is None:
+            return
+        is_err = bool(row.get("error"))
+        if is_err:
+            item["errors"] += 1
+        else:
+            item["requests"] += 1
+        tokens = row.get("total_tokens") or 0
+        for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
+                      "cached_tokens", "total_tokens"):
+            item[field] += (row.get(field) or 0)
+        credit = row.get("credit") or 0
+        item["credit"] += credit
+        gid = _daily_group_id(row, group)
+        item["groups"][gid] = item["groups"].get(gid, 0) + tokens
+        agg = groups.get(gid)
+        if agg is None:
+            agg = groups[gid] = {"id": gid, "requests": 0, "errors": 0,
+                                 "total_tokens": 0, "credit": 0.0}
+        if is_err:
+            agg["errors"] += 1
+        else:
+            agg["requests"] += 1
+        agg["total_tokens"] += tokens
+        agg["credit"] += credit
+        totals["total_tokens"] += tokens
+        totals["credit"] += credit
+        if is_err:
+            totals["errors"] += 1
+        else:
+            totals["requests"] += 1
+
+    bad_rows = [0]
+
+    def fold_safe(row):
+        # usage.jsonl 是历史追加的，_extract_usage 不做类型收敛（上游给什么写
+        # 什么），一行 "total_tokens": "123" 就足以让 += 抛 TypeError。裸调会让
+        # 整个端点永久 500（脏行通常在尾部，倒读天天先撞它）；而同口径的
+        # _usage_timeseries_uncached 是 except 住降级的——这里对齐成「跳坏行」。
+        try:
+            fold(row)
+        except Exception:
+            bad_rows[0] += 1
+
+    for row in _iter_usage_rows_since(since):
+        seen[0] += 1
+        fold_safe(row)
+    if not seen[0]:
+        # 倒读一行都没产出：要么「窗口内本来就无数据」（新装、隔很久没请求），
+        # 要么「倒读被乱序日志/时钟回拨阻死」。两者在倒读侧都是 0 行，正确处置
+        # 却完全相反。用**文件头第一条 at** 区分：正常日志从早到晚递增，头行
+        # 早于窗口起点就是合法空窗口，不必扫；头行落在窗口内却一行都读不到，
+        # 只能是文件被重排过，值得付一次顺序全扫。
+        # （曾用「文件小于 8MB 才兜底」的体积门限，那恰好只在不需要兜底的小
+        #   日志上生效，在大日志上留下静默空图。）
+        head = _usage_log_head_ts()
+        if isinstance(head, (int, float)) and head >= since:
+            log("daily usage: backward read went blind, falling back to full scan",
+                level="WARN", tag="usage")
+            for row in _iter_usage_rows_forward(since):
+                fold_safe(row)
+    if bad_rows[0]:
+        log("daily usage: skipped %d inconsistent rows" % bad_rows[0],
+            level="WARN", tag="usage")
+    ordered = sorted(groups.values(), key=lambda g: -(g["total_tokens"] or 0))
+    return {
+        "ok": True,
+        "realm": realm or "all",
+        "days": days,
+        "group_by": group,
+        "bucket_seconds": 86400,
+        "since": since,
+        "until": until,
+        "series": series,
+        "groups": ordered,
+        "totals": totals,
     }
 
 
@@ -2911,6 +3219,230 @@ def parse_dsml_tool_calls(text):
 # tool_calls），客户端就会把这段 JSON 当正文显示、本轮工具调用不执行。
 # 这里补齐回读：在严格守卫下还原成结构化 tool_calls 并从正文移除。
 LEAK_MARKER = "[assistant 请求调用工具]"
+# issue #36 follow-up: the same upstream converter also emits the marker
+# with ANGLE brackets (<assistant 请求调用工具>). Normalize it to the square-bracket
+# form at every entry so there is exactly one code path for detection.
+LEAK_MARKER_ALT = "<assistant 请求调用工具>"
+
+
+def _normalize_leak_marker(text):
+    """Rewrite a leading angle-bracket marker variant into the
+    square-bracket form (also through a ``` fence).
+
+    Only a LEADING hit is rewritten; the variant appearing mid-prose is
+    untouched (that is not the start of an echo block).
+    """
+    if not text:
+        return text
+    t = text.lstrip()
+    lead = text[:len(text) - len(t)]
+    if t.startswith(LEAK_MARKER_ALT):
+        return lead + LEAK_MARKER + t[len(LEAK_MARKER_ALT):]
+    if t.startswith("```"):
+        rest = t[3:]
+        low = rest.lstrip().lower()
+        if low.startswith("json"):
+            after = rest.lstrip()[4:].lstrip()
+        else:
+            after = rest.lstrip()
+        if after.startswith(LEAK_MARKER_ALT):
+            return (lead + t[:len(t) - len(after)]
+                    + LEAK_MARKER + after[len(LEAK_MARKER_ALT):])
+    return text
+
+
+# issue #36：上游把 DSML 工具调用转成「marker + JSON 数组」后，偶尔还会在
+# 数组之后漏出原始 DSML 闭合标签（</｜DSML｜parameter> / </｜DSML｜invoke>
+# / </｜DSML｜calls>，全角或半角竖线）。这些残片落在 hold 尾部会让
+# _json_array_prefix_ok 在 "Extra data" 处证伪 -> 整段被当正文补发，工具调用
+# 不执行且内部协议文本泄漏给用户。剥离只作用于尾部（内部出现则不属于此形态）。
+_DSML_CLOSE_TAG_RE = re.compile(r"</[^>]*DSML[^>]*>\s*$")
+
+
+def _strip_dsml_close_tail(text):
+    """反复剥掉正文尾部连续的 DSML 闭合标签 + 空白；返回剥离后的文本。"""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _DSML_CLOSE_TAG_RE.sub("", text)
+    return text
+
+
+def _dsml_tail_holdable(tail):
+    """Extra-data 尾巴是否是「DSML 闭合标签（完整 / 帧边界截断的半截）」。
+
+    先剥掉所有尾部完整标签，剩余若空（全是标签）或以 </ 开头（标签
+    进行中）→ 值得暂留。宽松只影响延迟：流末 parse 入口的完整剥离是
+    最终兜底（issue #36 后续）。
+    """
+    s = (tail or "").strip()
+    if not s:
+        return True
+    prev = None
+    while prev != s:
+        prev = s
+        s = _DSML_CLOSE_TAG_RE.sub("", s).strip()
+    if not s:
+        return True
+    # 半截标签进行中：已见 "</" 或恰好切在首字符 "<"（1 字符/帧的真实边界）。
+    # 长度护栏：真实 DSML 标签 <= ~25 字符，80 已留足余量；更长的大概率是
+    # 散文，不再压住（fail-open 语义不破坏）。
+    if s.startswith("</"):
+        return len(s) <= 80
+    return s == "<"
+
+
+# issue #37：回声块**外层数组合法、内层 arguments 非法**（未转义换行/引号、
+# 截断、尾部多余文本、非法转义）。这种块能确定是工具协议回声（marker + 数组 +
+# 已声明的工具名），只是参数坏了——绝不能当正文放出去（协议泄漏），也不能
+# 伪造一个可执行调用（会写坏文件）。统一替换为一句明确的失败说明。
+BAD_ARGS_NOTICE = ("（上游返回的工具调用参数不是合法 JSON，网关已丢弃该调用，"
+                   "未执行任何工具；请重试。）")
+
+# issue #37（fail-closed）：错误详情是**固定串**——它会写进日志与客户端响应，
+# 绝不能把实际参数、路径或正文带出去。
+BAD_ARGS_ERROR_DETAIL = ("upstream tool-call echo contains invalid JSON "
+                         "arguments; no tools were emitted")
+
+
+# issue #49 方向 C 的节流状态：一分钟最多一条 WARN，其余只计数——
+# 形态3（54 组空壳）一次会话就能刷出几十条，不节流会把日志淹掉。
+_LEAK_WARN_STATE = {"last": 0.0, "suppressed": 0, "total": 0}
+_LEAK_WARN_INTERVAL = 60.0
+
+
+def _log_unrecovered_leak(text, where="chat"):
+    """识别到「像工具协议回声、但四条回读路径都没认」时记一条 WARN（issue #49 方向 C）。
+
+    为什么必须可见：失败路径是 fail-open（原样透传），于是**协议失败**被转换成
+    **语义失真**——模型说「已清理」，工具其实没执行，客户端看到的是正常结束。
+    日志至少让发生率可观测，而不是只能靠用户去查磁盘。
+    节流：一分钟一条，其余计入 suppressed（下一条日志里带出来）。
+    """
+    try:
+        t = text or ""
+        marks = t.count(LEAK_MARKER) + t.count(LEAK_MARKER_ALT)
+        dsml = t.count("DSML")
+        if not marks and not dsml:
+            return
+        st = _LEAK_WARN_STATE
+        st["total"] += 1
+        now = time.time()
+        if now - st["last"] < _LEAK_WARN_INTERVAL:
+            st["suppressed"] += 1
+            return
+        sup = st["suppressed"]
+        st["last"] = now
+        st["suppressed"] = 0
+        log("unrecovered tool-protocol leak passed through (%d chars, "
+            "markers=%d, dsml=%d) at %s — issue #49 (total=%d, suppressed=%d)"
+            % (len(t), marks, dsml, where, st["total"], sup),
+            level="WARN", tag="chat")
+    except Exception:
+        pass
+
+
+class InvalidToolArguments(UpstreamStatus):
+    """已确认是工具协议回声，但内层 arguments 不是合法 JSON（issue #37）。
+
+    fail-closed：不泄漏协议文本、不伪造可执行调用，也**不伪装成成功结束**。
+    抛到上层后由各协议的错误出口转成明确失败：
+      · chat 流式   -> data: {"error": ...} + [DONE]（不再发正常 finish）
+      · Responses   -> response.failed（不再发 response.completed）
+      · Anthropic   -> event: error（不再发 message_stop）
+      · 非流式      -> HTTP 502 + 标准错误信封
+    重试与账号冷却入口都显式排除本异常（见 should_retry_envelope /
+    _handle_envelope_account_cooldown）：它不是账号问题，也不该自动重发收费请求。
+    """
+
+    def __init__(self):
+        super(InvalidToolArguments, self).__init__(502, BAD_ARGS_ERROR_DETAIL)
+
+
+_JSON_FENCE = chr(96) * 3
+
+
+def _strip_json_fence(text):
+    """剥掉**首/尾**代码围栏残余（头部 ```[json]`、尾部 ```）。
+
+    为什么需要：流式里 `_find_marker_split` 会把开围栏切进散文，hold 只剩
+    「marker + 数组 + 换行 + 闭围栏」；旧实现只在「整串被围栏包住」时才剥，
+    于是这种形状被判成非回声 -> 当正文补发（issue #37 fail-closed 的漏检）。
+    只动首尾，不碰中段。
+    """
+    t = (text or "").strip()
+    if t.startswith(_JSON_FENCE):
+        inner = t[len(_JSON_FENCE):]
+        if inner[:4].lower() == "json":
+            inner = inner[4:]
+        t = inner.lstrip()
+    if t.endswith(_JSON_FENCE) and len(t) > len(_JSON_FENCE):
+        t = t[:-len(_JSON_FENCE)].rstrip()
+    return t
+
+
+def _echo_with_bad_args(text, allowed_names=None):
+    """这段正文是否是「工具协议回声 + 内层参数非法」？（issue #37）
+
+    判定链（全部满足才算）：
+      1) 整段是 marker（方/尖括号）+ JSON 数组（可带围栏、可带 DSML 尾标签）；
+      2) 外层数组能解析、非空，每项是 dict 且有非空字符串 name；
+      3) 声明了 tools 时，所有 name 都在声明集合里；
+      4) 至少一个 arguments 是**非空字符串但解析失败**。
+    普通散文 / 讨论 marker / 合法 JSON 示例都不会命中。
+    """
+    if not text:
+        return False
+    t = _strip_json_fence(_normalize_leak_marker((text or "").strip()))
+    # 围栏与 DSML 尾标签可能交替出现（围栏 -> DSML、DSML -> 围栏），
+    # 剥两轮直到稳定；每轮都只动**首尾**，中段正文不受影响。
+    prev = None
+    while prev != t:
+        prev = t
+        t = _strip_json_fence(_strip_dsml_close_tail(t).strip()).strip()
+    # issue #49：允许「散文 + 重复 marker」——取最后一个 marker，跳过连续重复。
+    _mpos = t.rfind(LEAK_MARKER)
+    if _mpos < 0:
+        return False
+    t = t[_mpos:]
+    while t.startswith(LEAK_MARKER):
+        t = t[len(LEAK_MARKER):].lstrip()
+    t = _strip_dsml_close_tail(t)
+    if t.endswith(_JSON_FENCE) and len(t) > len(_JSON_FENCE):
+        t = _strip_dsml_close_tail(t[:-len(_JSON_FENCE)].rstrip())
+    rest = t.strip()
+    if not (rest.startswith("[") and rest.endswith("]")):
+        return False
+    try:
+        arr = json.loads(rest)
+    except Exception:
+        return False
+    if not isinstance(arr, list) or not arr:
+        return False
+    bad = 0
+    for item in arr:
+        if not isinstance(item, dict):
+            return False
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return False
+        if allowed_names and name.strip() not in allowed_names:
+            return False
+        if "arguments" not in item:
+            return False
+        args = item.get("arguments")
+        if isinstance(args, (dict, list)):
+            continue
+        if not isinstance(args, str):
+            return False
+        if not args.strip():
+            continue
+        try:
+            json.loads(args)
+        except Exception:
+            bad += 1
+    return bad > 0
+
 
 # issue #11：tool 角色消息被序列化进 content 时的开标记（写入侧见
 # flatten_messages）。网关只写开标记、不写闭标记；模型常自造一个
@@ -2924,19 +3456,17 @@ TOOL_RESULT_CLOSE = "[工具结果结束]"
 # issue #16-B1：跨帧补全窗口 = 最长标记长度 - 1（LEAK_MARKER 18 字符 -> 17）。
 # 只有帧/缓冲**末尾**的这 17 个字符内匹配到某个标记的真前缀时才暂留；
 # 下一帧一旦证伪立即补发（fail-open），不会无限压住正常文本。
-_MARKER_HOLD_WINDOW = max(len(LEAK_MARKER), len(TOOL_RESULT_MARKER)) - 1
+_MARKER_HOLD_WINDOW = max(len(LEAK_MARKER), len(LEAK_MARKER_ALT),
+                           len(TOOL_RESULT_MARKER)) - 1
 
 # issue #16 兜底：hold 缓冲上限。正常文本长期"看起来仍是候选"时（模型写超长
 # JSON/正则示例），hold 会持续增长 -> 内存与首字延迟风险。超限即 fail-open
 # 放行并记一条 WARN：宁可漏一次，也不无限压住客户端。
-# 2026-10-15 修正（上游细粒度流误触事故，详见 qoder3013-diagnosis 报告）：
-#   1) hold_frames 只统计「带内容的帧」——上游实测 ~2.4 字符/帧且夹带空帧 /
-#      reasoning 帧，旧实现全帧计数，~500 字符的合法回声块在 200 帧处即被
-#      mid-block fail-open 放行（原始协议文本泄漏到客户端 + 工具调用丢失）；
-#   2) 帧上限抬到与字符上限同刻度——内容帧每帧 ≥1 字符 => 帧数 ≤ 字符数，
-#      字符上限必然先到，帧上限退化为防御性冗余（保留变量便于极端场景调节）。
-_HOLD_MAX_CHARS = 131072           # 128KB（真实回声块远小于此；见档案 §13）
-_HOLD_MAX_FRAMES = _HOLD_MAX_CHARS  # 见上：与字符上限同刻度（只统计内容帧）
+# issue #36 后续：帧上限只防**空转**（连续空帧不增长），有增长的合法回声块
+# （每帧 1 字符也会推进长度）交给字符上限兜底——否则 201 字符的合法块在
+# 1 字符/帧下会在 200 帧处被误伤 fail-open。
+_HOLD_MAX_CHARS = 32768            # 32KB（真实回声块远小于此；见档案 §13）
+_HOLD_MAX_FRAMES = 200             # 连续空转帧上限（帧不增长才算一帧）
 
 
 # ---------------------------------------------------------------------------
@@ -2971,32 +3501,13 @@ def _strip_dsml_tail(text):
         t = t2
 
 
-def _leak_echo_rest(text):
-    """回声块的公共归一化：返回 LEAK_MARKER 之后的数组文本；非回声形态返回 None。
-
-    归一化顺序（parse / salvage 共用，判据层唯一副本）：strip -> 尾部 DSML
-    残渣剥离 -> 整段 ``` / ```json 围栏剥壳（剥壳后再剥一次 DSML）-> 必须
-    LEAK_MARKER 前缀。只做形态归一化，不判断数组本身的合法性。
-    """
-    t = _strip_dsml_tail((text or "").strip())
-    # 整段被 ``` 围栏包裹时先剥壳（模型复述时常带围栏）
-    if t.startswith("```") and t.endswith("```") and len(t) > 6:
-        inner = t[3:]
-        if inner[:4].lower() == "json":
-            inner = inner[4:]
-        t = _strip_dsml_tail(inner[:-3].strip())
-    if not t.startswith(LEAK_MARKER):
-        return None
-    return t[len(LEAK_MARKER):].strip()
-
-
 def _leaked_item_to_call(item, allowed_names=None):
-    """逐条目校验并归一为一条结构化 call（parse / salvage 共用的唯一判据副本）。
+    """逐条目校验并归一为一条结构化 call（parse 的唯一判据副本）。
 
     返回 (call|None, reason)：reason 取值 not-dict / bad-name / bad-args-type /
-    args-not-json / undeclared-name（供 salvage 的 WARN 明细；parse 只用 call，
-    任一条目失败即整体拒绝）。校验顺序与历史实现一致：dict -> name ->
-    arguments 形态/合法性 -> 声明集合。
+    args-not-json / undeclared-name（供审计日志；parse 只用 call，任一条目失败
+    即整体拒绝）。校验顺序与历史实现一致：dict -> name -> arguments 形态/合法性
+    -> 声明集合。
     """
     if not isinstance(item, dict):
         return None, "not-dict"
@@ -3030,13 +3541,42 @@ def parse_leaked_tool_calls(text, allowed_names=None):
       2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
       3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
 
-    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为空串
-    （整段都是该块）；未识别时原样返回 text。任一条目不合法即整体失败
-    （无部分还原）；「外层合法 + 条目级损坏」的部分挽救见
-    salvage_leaked_tool_calls（本函数保持严格，是其前置判据）。
+    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为最后一个 marker
+    之前的散文前缀（通常为空串）；未识别时原样返回 text。任一条目不合法即整体
+    失败，不做部分还原。
     """
-    rest = _leak_echo_rest(text)
-    if rest is None or not (rest.startswith("[") and rest.endswith("]")):
+    t = (text or "").strip()
+    # issue #36 follow-up: normalize the angle-bracket marker variant.
+    t = _normalize_leak_marker(t)
+    # issue #36：整段解析前先剥尾部 DSML 闭合标签残片。
+    t = _strip_dsml_close_tail(t)
+    # 整段被 ``` 围栏包裹时先剥壳（模型复述时常带围栏）
+    if t.startswith("```") and t.endswith("```") and len(t) > 6:
+        inner = t[3:]
+        if inner[:4].lower() == "json":
+            inner = inner[4:]
+        t = inner[:-3].strip()
+    # issue #49：模型在长会话里会写成「散文 + marker + marker + 数组 + DSML 尾」。
+    # 取**最后一个** marker 起算（前面散文作为 clean 返回，由调用方补发），
+    # 再剥掉连续重复的 marker 与尾部围栏——这些都不放松后面的严格校验。
+    _mpos = t.rfind(LEAK_MARKER)
+    if _mpos < 0:
+        return None, text
+    prefix = t[:_mpos]
+    # 前缀尾部可能残留 marker（「散文 + marker1 + marker2 + 数组」时，
+    # marker1 落在 prefix 里）——它绝不能当正文发给客户端。
+    prefix = prefix.rstrip()
+    for _mk in (LEAK_MARKER, LEAK_MARKER_ALT):
+        while prefix.endswith(_mk):
+            prefix = prefix[:-len(_mk)].rstrip()
+    t = t[_mpos:]
+    while t.startswith(LEAK_MARKER):
+        t = t[len(LEAK_MARKER):].lstrip()
+    t = _strip_dsml_close_tail(t)
+    if t.endswith(_JSON_FENCE) and len(t) > len(_JSON_FENCE):
+        t = _strip_dsml_close_tail(t[:-len(_JSON_FENCE)].rstrip())
+    rest = t.strip()
+    if not (rest.startswith("[") and rest.endswith("]")):
         return None, text
     try:
         arr = json.loads(rest)
@@ -3050,43 +3590,7 @@ def parse_leaked_tool_calls(text, allowed_names=None):
         if call is None:
             return None, text
         calls.append(call)
-    return calls, ""
-
-
-def salvage_leaked_tool_calls(text, allowed_names=None):
-    """部分挽救（2026-10-16 事故）：外层数组完整可解析时，还原合法条目、
-    丢弃损坏条目。parse 是「全合法才还原」的严格判定；本函数在其失败后兜底：
-
-      - 仅「外层完整可解析数组 + ≥1 合法条目」时生效；0 合法 -> None
-        （回落既有链：吞掉判定 / fail-open 补发，零放宽）；
-      - 不做 raw_decode 前缀提取（Extra data 混排语义保留）、不做损坏修复
-        （丢弃而非猜测）；
-      - 合法性判据与 parse 共用 `_leak_echo_rest` + `_leaked_item_to_call`
-        （判据层唯一副本纪律，见 spec leak-recovery-guards）。
-
-    返回 (calls, dropped) | None：calls 与 parse 成功时同构；dropped 为
-    [(idx, reason), ...] 明细（reason 见 `_leaked_item_to_call`），供三链路
-    WARN 观测。
-    """
-    rest = _leak_echo_rest(text)
-    if rest is None or not (rest.startswith("[") and rest.endswith("]")):
-        return None
-    try:
-        arr = json.loads(rest)
-    except Exception:
-        return None
-    if not isinstance(arr, list) or not arr:
-        return None
-    calls, dropped = [], []
-    for idx, item in enumerate(arr):
-        call, reason = _leaked_item_to_call(item, allowed_names)
-        if call is not None:
-            calls.append(call)
-        else:
-            dropped.append((idx, reason))
-    if not calls:
-        return None                 # 0 合法 -> 回落既有链（零放宽核心守卫）
-    return calls, dropped
+    return calls, prefix
 
 
 def _leak_body_offset(text):
@@ -3096,11 +3600,25 @@ def _leak_body_offset(text):
     state='body'（已越过 marker，body 为其后文本）、state='no'（显然不是）。
     流式暂存与判真共用同一套前缀规则（含 ``` 与 ```json 围栏）。
     """
-    t = (text or "").lstrip()
+    t = _normalize_leak_marker((text or "")).lstrip()
     if not t or LEAK_MARKER.startswith(t):
         return "pre", None
     if t.startswith(LEAK_MARKER):
-        return "body", t[len(LEAK_MARKER):]
+        # issue #49：模型会连写两个 marker（数组在第二个之后）——跳过重复的，
+        # 否则 hold 会被判成「body 不是数组」而在流式中途证伪、整块补发。
+        body = t[len(LEAK_MARKER):]
+        b = body.lstrip()
+        while b.startswith(LEAK_MARKER):
+            b = b[len(LEAK_MARKER):].lstrip()
+        # 重复 marker 还没打完（跨帧，如 "[assista"）——仍算候选，内容留空等下一帧。
+        # 不回 "pre" 是因为此处已越过首个 marker，语义上是 body 但"暂时没内容"。
+        if b and (LEAK_MARKER.startswith(b) or LEAK_MARKER_ALT.startswith(b)):
+            return "body", ""
+        return "body", b
+    # issue #36 后续：尖括号变体的**真前缀**（跨帧进行中）同样算 pre——
+    # 1 字符/帧时 '<' 单独到达，不能当散文放出（否则 marker 开头丢失）。
+    if LEAK_MARKER_ALT.startswith(t):
+        return "pre", None
     if not t.startswith("`"):
         return "no", None
     if len(t) < 3:
@@ -3174,7 +3692,22 @@ def _json_array_prefix_ok(text):
         if msg.startswith("Extra data"):
             # 数组已完整，尾随的只能是（可能还没打完的）``` 收尾围栏
             tail = s[pos:].strip()
-            return (not tail) or "```".startswith(tail)
+            # issue #36 follow-up: the tail may also be upstream DSML
+            # close tags (complete, or cut mid-tag by a frame boundary
+            # before the closing >). Hold those too - the stream-end
+            # parse strips them; leniency only delays, never changes
+            # the final verdict.
+            if (not tail) or "```".startswith(tail):
+                return True
+            # issue #37 follow-up：闭围栏**之后**还可能跟 DSML 尾标签。小分块时
+            # 会出现「``` + 换行 + 半截 </…」——旧逻辑直接喂给
+            # _dsml_tail_holdable，它看到开头是反引号就判 False，于是候选被
+            # 中途证伪、整块当正文补发（真·泄漏）。先剥掉完整闭围栏再看剩余。
+            if tail.startswith(_JSON_FENCE):
+                tail = tail[len(_JSON_FENCE):].strip()
+                if not tail:
+                    return True
+            return _dsml_tail_holdable(tail)
         # 语法错误点落在末尾（未闭合括号等）→ 还允许继续扩展
         return pos >= len(s) - 1
 
@@ -3190,7 +3723,7 @@ def _find_marker_split(text, allow_prefix=True):
     背景：服务端 delta 切分不可控，"散文 + marker" 可能落在同一帧，而
     _leak_prefix_hold 只认「整帧以标记开头」-> 整帧被透传 -> 泄漏。
     """
-    t = text or ""
+    t = _normalize_leak_marker(text or "")
     if not t:
         return "", ""
     best = -1
@@ -3203,7 +3736,7 @@ def _find_marker_split(text, allow_prefix=True):
     if not allow_prefix:
         return t, ""
     tail = t[-_MARKER_HOLD_WINDOW:] if len(t) > _MARKER_HOLD_WINDOW else t
-    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
+    for mk in (LEAK_MARKER, LEAK_MARKER_ALT, TOOL_RESULT_MARKER):
         for n in range(min(len(tail), len(mk) - 1), 0, -1):
             if tail.endswith(mk[:n]):
                 return t[:-n], t[-n:]
@@ -3215,7 +3748,7 @@ def _marker_starts_at(text):
     t = text or ""
     if not t:
         return True
-    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
+    for mk in (LEAK_MARKER, LEAK_MARKER_ALT, TOOL_RESULT_MARKER):
         if t.startswith(mk):
             return True
         if len(t) < len(mk) and mk.startswith(t):
@@ -3397,7 +3930,103 @@ def _frame_without_content(payload):
     return out
 
 
-def recover_leaked_tool_calls(frames, allowed_names=None):
+def _sse_fill_tool_call_ids(frames):
+    """流式出口保证：tool_call 增量的 id 必须非空（issue #47）。
+
+    上游偶尔给出**缺 id**（甚至缺 function）的增量帧，网关此前原样透传；
+    下游客户端会把 id="" 落盘，而它的会话加载器要求非空字符串 —— 一条空 id
+    （校验发生在「从 seq 0 顺序回放整份会话」的状态机里，不是跳过坏行）
+    就让整份会话报废。三层客户端都把 "" 一路放行，**只有网关出口能拦**。
+
+    规则：
+      - 上游给了 id -> 原样保留（不改写、不重新造号），并让同 index 的后续
+        分帧沿用同一个 id（下游靠 id 把 tool_call 与 tool_result 配对）；
+      - 缺 id -> 补 _new_id("call_")，**按 index 记忆**（分帧到达时换号会断链）；
+      - 非 tool_call 帧（[DONE] / 纯正文 / 非 JSON）**字节级原样透传**。
+    放在出口而不是各产出点：流式侧有多个来源（上游原生增量 / #8 泄漏回读 /
+    DSML 回放），逐个补必然漏，这是唯一合流点。
+    """
+    ids = {}          # key -> 已分配的 id
+    named = set()     # 该 key 是否已经「用掉」过一次 function.name（新调用的起点）
+
+    def _key_for(tc, pos, n_calls):
+        """tool_call 的**稳定**记忆键（issue #47 补充）。
+
+        1) 有 int index -> 用它（协议正解）；
+        2) 缺 index -> 用**帧内位置**：多调用同帧各得不同键（并行不再撞号），
+           单调用恒为 0（与 index=0 归一到同一键，避免 None/0 两套记忆）；
+        3) index 是不可哈希/畸形值（list/dict/str）-> 同样按位置，
+           **绝不让它进 dict key**（否则 TypeError 会一路冒到 socket）。
+        """
+        idx = tc.get("index")
+        if isinstance(idx, int) and not isinstance(idx, bool):
+            return ("i", idx)
+        return ("i", pos if n_calls > 1 else 0)
+
+    for raw in frames:
+        text = (raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else raw)
+        data = strip_data_prefix(text)
+        if not data or data == "[DONE]":
+            yield raw
+            continue
+        try:
+            payload = json.loads(data)
+        except Exception:
+            yield raw
+            continue
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list):
+            yield raw
+            continue
+        touched = False
+        try:
+            for ch in choices:
+                if not isinstance(ch, dict):
+                    continue
+                delta = ch.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                calls = delta.get("tool_calls")
+                if not isinstance(calls, list):
+                    continue
+                for pos, tc in enumerate(calls):
+                    if not isinstance(tc, dict):
+                        continue
+                    key = _key_for(tc, pos, len(calls))
+                    cur = tc.get("id")
+                    fn = tc.get("function")
+                    name = str((fn or {}).get("name") or "").strip() \
+                        if isinstance(fn, dict) else ""
+                    if isinstance(cur, str) and cur.strip():
+                        # 上游给了 id：原样保留；**覆盖式**记忆让后到的真 id
+                        # 收敛（旧实现 setdefault 会让后续帧回落到旧补值）。
+                        ids[key] = cur
+                        if name:
+                            named.add(key)
+                        continue
+                    # 同一 key 第二次带 name = 无 index 场景下的**另一个**调用
+                    # （串行两次调用都落在位置 0），必须换号，否则配对断裂。
+                    if name and key in named:
+                        ids[key] = _new_id("call_")
+                    new_id = ids.get(key) or _new_id("call_")
+                    ids[key] = new_id
+                    if name:
+                        named.add(key)
+                    tc["id"] = new_id
+                    touched = True
+        except Exception:
+            # 兜底：任何意外都不得让异常冒到 socket（fail-open，与其余分支一致）
+            yield raw
+            continue
+        if touched:
+            yield ("data: " + json.dumps(payload, ensure_ascii=False)
+                   + "\n\n").encode("utf-8")
+        else:
+            yield raw
+
+
+def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
     """流式回读（issue #8）：把模型逐块吐出的「marker + JSON 数组」正文恢复
     成结构化 tool_calls 增量帧；其余内容原样透传（fail-open）。
 
@@ -3408,7 +4037,7 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
       - 上游中断时暂存直接丢弃（正文未发，交给上游重试/错误帧处理）。
     """
     hold = None          # 正在暂存的候选正文（None = 未暂存）
-    hold_frames = 0      # hold 已累积的帧数（上限兜底用，issue #16）
+    hold_frames = 0      # 连续未增长的帧数（空转保护，issue #16/#36 后续）
     finished = None      # 暂存的收尾帧：(payload, 原 finish_reason)
     recovered = False
     meta = {"id": None, "model": None, "created": None}
@@ -3449,11 +4078,18 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
             continue
         if hold is not None:
             hold += piece
+            # issue #36 后续：帧上限只防**空转**（连续空帧不增长），有增长的
+            # 合法回声块（每帧 1 字符也会推进长度）交给 32KB 字符上限兜底——
+            # 否则 201 字符的合法块在 1 字符/帧下会在 200 帧处被误伤 fail-open。
             if piece:
-                # 只统计「带内容的帧」（2026-10-15）：空帧 / 纯 reasoning 帧
-                # 不是 hold 的进度，旧实现全帧计数会在 ~500 字符的回声块上
-                # 提前触发 200 帧上限 -> mid-block fail-open 泄漏。
+                hold_frames = 0
+            else:
                 hold_frames += 1
+            # issue #36：尾部 DSML 闭合标签是上游协议残片，剥掉再判候选；
+            # 只有剥掉后仍是候选时才采纳（讨论 DSML 的普通散文不被误伤）。
+            _stripped = _strip_dsml_close_tail(hold)
+            if _stripped != hold and _still_leak_candidate(_stripped):
+                hold = _stripped
             if _echo_hold_candidate(hold):
                 # issue #16 兜底：超限即 fail-open 放行（内存 + 首字延迟）。
                 if len(hold) > _HOLD_MAX_CHARS \
@@ -3479,6 +4115,15 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
                            + json.dumps(other, ensure_ascii=False)
                            + "\n\n").encode("utf-8")
                 continue
+            # issue #37 fail-closed：块虽已「证伪」（后续还有别的字/围栏/DSML
+            # 标签），但内容足以认定是**协议回声 + 内层参数非法**时，绝不能
+            # 当正文补发——直接升级为协议错误（提前判定，不等流末）。
+            if _echo_with_bad_args(hold, allowed_names):
+                raise InvalidToolArguments()
+            # issue #49 方向 C：候选被证伪 -> 整段当正文补发，这里同样留痕
+            # （形态3「marker + <terminal></terminal> 空壳」就走这条：没有 JSON
+            # 可恢复，但必须让发生率可见，而不是静默失真）。
+            _log_unrecovered_leak(hold, "stream-falsified")
             # 证伪：暂存整段补发为普通正文
             yield _leak_chunk_frame(meta, {"content": hold})
             hold = None
@@ -3524,19 +4169,6 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
 
     if hold is not None:
         calls, clean = parse_leaked_tool_calls(hold, allowed_names)
-        if calls is None:
-            # 部分挽救（2026-10-16 事故）：外层数组合法但条目级损坏时，
-            # parse 整体失败 -> 还原合法条目、丢弃损坏条目（WARN 留痕），
-            # 避免整段回声块 fail-open 泄漏为正文。
-            _salv = salvage_leaked_tool_calls(hold, allowed_names)
-            if _salv:
-                calls, _dropped = _salv
-                clean = ""
-                log("salvaged leaked tool-call echo: %d call(s) restored, "
-                    "%d dropped (%s)"
-                    % (len(calls), len(_dropped),
-                       ", ".join("idx=%d:%s" % (i, r) for i, r in _dropped)),
-                    level="WARN", tag="chat")
         if calls:
             recovered = True
             log("recovered leaked tool-call echo (%d chars / %d frames -> %d call(s))"
@@ -3550,6 +4182,19 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
                 }]})
             if clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
+        elif _echo_with_bad_args(hold, allowed_names):
+            # issue #37（fail-closed）**必须先于 #9/#11 判定**：坏参数块的外层
+            # 数组是**完整合法**的，只是后面跟着 DSML/围栏残片——这会让
+            # _leaked_partial_droppable 误判成"截断回声"并静默吞掉（正常 stop），
+            # 既不是失败语义也不是恢复。判定互斥：真截断的数组 parse 不过，
+            # 走不到这里（仍由 #9 吞掉）。
+            # issue #37（fail-closed）：能确定是工具协议回声（marker + 合法外层
+            # 数组 + 已声明工具名），只是内层 arguments 坏了——不泄漏协议、不
+            # 伪造可执行调用，也**不以普通 stop 结束**，改为协议级失败。
+            log("tool-call echo has invalid JSON arguments (%d chars) — "
+                "failing the turn closed (issue #37)" % len(hold),
+                level="WARN", tag="chat")
+            raise InvalidToolArguments()
         elif _leaked_partial_droppable(hold, allowed_names):
             # issue #9：截断的 marker+JSON 回声无法还原成结构化调用，吞掉整段，
             # 绝不把网关内部协议文本透传给终端用户。
@@ -3561,6 +4206,8 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
             log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(hold), level="WARN", tag="chat")
         else:
+            # issue #49 方向 C：认不出但**看起来就是协议回声**的，必须留痕。
+            _log_unrecovered_leak(hold, "stream")
             yield _leak_chunk_frame(meta, {"content": hold})
     if finished is not None:
         payload, fin = finished
@@ -3573,6 +4220,16 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
                + "\n\n").encode("utf-8")
     elif recovered:
         yield _leak_chunk_frame(meta, {}, "tool_calls")
+
+
+def recover_leaked_tool_calls(frames, allowed_names=None):
+    """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）。
+
+    保持同名：三条调用点（chat 主链路 / Anthropic / Responses）都不用改。
+    """
+    for frame in _sse_fill_tool_call_ids(
+            _recover_leaked_tool_calls_inner(frames, allowed_names)):
+        yield frame
 
 
 # ---------------------------------------------------------------------------
@@ -3678,14 +4335,49 @@ def _shrink_tool_result(text, keep):
     nl2 = tail.find("\n")
     if nl2 != -1 and nl2 < keep // 2:
         tail = tail[nl2 + 1:]
-    omitted = len(text) - len(head) - len(tail)
-    marker = ("\n[[qoder-proxy: 已省略 %d 字符历史工具结果；"
-              "需要完整内容请重新执行该命令]]\n" % omitted)
+    # issue #48：省略标记必须是**固定串**——带字数会让「同一条工具结果」
+    # 在不同轮次产生不同字节（内容一旦变化/重试，数字就变），直接打断上游
+    # 前缀缓存。字数信息换不来什么，去掉。
+    marker = ("\n[[qoder-proxy: 已省略中间内容；"
+              "需要完整内容请重新执行该命令]]\n")
     return head + marker + tail
+
+
+def _tool_result_scope():
+    """削减范围策略（issue #48）：返回 ("tail", N) / ("all", 0) / ("turn", 0)。
+
+    为什么需要它：旧规则 `_current_turn_start` 会随请求形态**滑动**——
+    连续工具调用时 `_cur_start=1`（全不削），用户插一句话后 `_cur_start` 跳到
+    末尾（**每条**历史工具结果全部改写成省略版）。同一条历史消息在不同轮次被
+    序列化成不同字节，上游前缀缓存从第一条被削处开始整段失效（实测命中率
+    从 95-99% 掉到 8%）。
+
+    新默认 `tail`：只保护**最后 N 条**工具结果（默认 1），更早的一律削——
+    同一结果一旦被削，字节里不再有任何随轮次变化的成分（标记已改固定串），
+    因此只有「从最后一条滑出保护窗」的那一条会变，缓存中断点被限制在一处。
+
+    环境变量 QD_TOOL_RESULT_SCOPE：
+      tail（默认） 保护最后 QD_TOOL_RESULT_KEEP_TAIL 条（默认 1）
+      all          全部削减（缓存最稳，但当轮长输出也会被截）
+      turn         旧行为（当前轮全保，形态相关——仅兼容用）
+    """
+    scope = str(os.environ.get("QD_TOOL_RESULT_SCOPE") or "tail").strip().lower()
+    if scope in ("all", "stable", "everything"):
+        return "all", 0
+    if scope in ("turn", "history", "legacy", "current"):
+        return "turn", 0
+    try:
+        n = int(os.environ.get("QD_TOOL_RESULT_KEEP_TAIL") or 1)
+    except Exception:
+        n = 1
+    return "tail", max(0, n)
 
 
 def _current_turn_start(messages):
     """返回「当前轮」起始下标（索引 >= 它的 tool 结果不削减）。
+
+    **仅 QD_TOOL_RESULT_SCOPE=turn 时使用**（issue #48：该规则随请求形态滑动，
+    会让历史工具结果在不同轮次序列化成不同字节 -> 前缀缓存每轮失效）。
 
     判定：从末尾往前找最后一条 user/system/developer 消息——它开启当前回合，
     其后的一切（assistant 工具调用 + tool 结果）都属于当前轮。找不到则返回 0
@@ -3755,7 +4447,8 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
     - auto（默认） -> 「CN 出口 + id 齐备」全模型结构化；仅当模型前缀命中
         carve-out 排除表（STRUCTURED_TOOL_HISTORY_EXCLUDE，默认空）时回退。
         INTL 维持排除：legacy 通道未实测（task-31 超时未取得结果），故 auto
-        不在 INTL 启用；回读守卫 + salvage 继续覆盖 INTL 的文本化残余路径。
+        不在 INTL 启用；回读守卫 + issue #37 fail-closed 继续覆盖 INTL
+        的文本化残余路径。
     任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
     """
     if not _tool_ids_ok(messages):
@@ -3800,7 +4493,20 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
     flat, images = [], []
     # 暴露面削减只作用于历史（当前轮的 tool 结果必须完整保留）。
     _keep = _tool_result_keep_chars()
-    _cur_start = _current_turn_start(messages) if _keep else len(messages or [])
+    # issue #48：削减范围必须**与请求形态无关**。旧规则按「当前轮起点」滑动，
+    # 用户每发一条消息就把全部历史工具结果重削一遍 -> 同一条消息在不同轮次
+    # 序列化成不同字节 -> 上游前缀缓存整段失效（实测命中率 95%+ -> 8%）。
+    # 新默认 tail：只保护最后 N 条工具结果，更早的一律削（且削后字节恒定）。
+    _scope, _tail_n = _tool_result_scope()
+    _protect = set()
+    if _keep:
+        if _scope == "turn":
+            _protect = set(range(_current_turn_start(messages) or 0,
+                                 len(messages or [])))
+        elif _scope == "tail" and _tail_n > 0:
+            _tool_idx = [i for i, m in enumerate(messages or [])
+                         if isinstance(m, dict) and m.get("role") == "tool"]
+            _protect = set(_tool_idx[-_tail_n:])
     for _idx, m in enumerate(messages or []):
         if not isinstance(m, dict):
             continue
@@ -3818,7 +4524,7 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
             if tc:
                 name = " (%s)" % tc
             body = text or ""
-            if _keep and _idx < _cur_start:
+            if _keep and _idx not in _protect:
                 body = _shrink_tool_result(body, _keep)
             if structured:
                 # 结构化直传：保留 tool 角色与配对 id；content 用空字符串而非
@@ -3879,7 +4585,17 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
             if not (keep_reasoning and isinstance(_rsn, str) and _rsn.strip()):
                 continue
         if role in ("user", "assistant"):
-            item = {"role": role, "content": text or ""}
+            if imgs:
+                # 上游只读消息 content 里的结构化 image_url parts，**不读**
+                # 顶层 image_urls / chat_context.imageUrls（实测：image_urls
+                # 填了模型仍回「我没有收到图片」，改 parts 后正确识别颜色）。
+                # 带图消息保留 parts 形态；顶层 image_urls 仍照填（兼容无害）。
+                _parts = _flatten_content(m.get("content"))
+                item = {"role": role,
+                        "content": _parts if isinstance(_parts, list)
+                        else (text or "")}
+            else:
+                item = {"role": role, "content": text or ""}
             if role == "assistant" and keep_reasoning \
                     and m.get("reasoning_content") is not None:
                 item["reasoning_content"] = m.get("reasoning_content") or ""
@@ -3936,7 +4652,12 @@ def build_qoder_body(payload, account, model_key, realm=None):
     prompt = ""
     for m in reversed(flat):
         if m["role"] == "user" and m.get("content"):
-            prompt = m["content"]
+            _c = m["content"]
+            if isinstance(_c, list):
+                _c = "\n".join(
+                    str(p.get("text") or "") for p in _c
+                    if isinstance(p, dict) and p.get("type") == "text")
+            prompt = _c
             break
 
     nid = str(uuid.uuid4())
@@ -4150,6 +4871,34 @@ def extract_session_key(headers, payload):
 # 上游瞬时故障（与客户端参数无关，值得同账号快速重试）
 TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
 TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
+
+# issue #38：上游「排队」（403 + isQueued/10605 + retryAfterSeconds）时，
+# 网关**等队列放行后重试**，而不是把排队 JSON 当错误交给客户端——客户端会把
+# 它当成请求被拒（直接结束本轮）。三档都是可调的，默认值保守：
+#   单轮最长等 QUEUE_WAIT_MAX_SECS；整次请求总预算 QUEUE_WAIT_BUDGET_SECS；
+#   最多等 QUEUE_MAX_ROUNDS 轮。超出预算仍按原错误返回（fail-open 语义不变）。
+QUEUE_MAX_ROUNDS = int(os.environ.get("QD_QUEUE_MAX_ROUNDS") or 3)
+QUEUE_WAIT_MAX_SECS = int(os.environ.get("QD_QUEUE_WAIT_MAX_SECS") or 180)
+QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 300)
+
+
+def _queue_wait_seconds(detail):
+    """从上游 403/排队响应体里解析「等多久」；不是排队信号则返回 0。
+
+    形如：{"code":"10605","message":"...","isQueued":true,
+           "retryAfterSeconds":30}
+    """
+    d = detail or ""
+    low = d.lower()
+    if "10605" not in d and "isqueued" not in low and "queue" not in low:
+        return 0
+    m = re.search(r'retryAfterSeconds\D+(\d+)', d)
+    if not m:
+        return 30                       # 排队但没给时长：按 30s 保守处理
+    try:
+        return max(1, int(m.group(1)))
+    except Exception:
+        return 30
 CHECKIN_MIN_GAP = 1.0              # 签到防风控：账号之间的最小间隔（秒）
 _CLIENT_FAULT_MARKERS = (
     "invalid_parameter_error",     # 如 Range of max_tokens 校验失败
@@ -4225,6 +4974,12 @@ def friendly_upstream_error(code, detail):
         code_i = int(code)
     except Exception:
         code_i = 502
+    # 0) issue #37：工具参数非法（确定性、可重试但不是账号问题）
+    if "invalid JSON arguments" in detail:
+        return ("上游生成的工具调用参数不是合法 JSON，本轮**未执行任何工具**；"
+                "网关已按协议返回失败，请重试该轮。上游详情：%s"
+                % (detail[:200] or "(无详情)"),
+                "invalid_tool_arguments")
     # 1) 上游内容安全审核（确定性拒绝，先于瞬时判断——重试无效）
     if any(m in detail for m in _CONTENT_POLICY_MARKERS):
         return ("上游内容安全审核未通过 (DataInspectionFailed)：输入可能含不当内容，"
@@ -4251,6 +5006,10 @@ def _to_int_status(status):
 
 def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
     """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
+    if isinstance(exc, InvalidToolArguments):
+        # issue #37：坏参数是模型生成内容的问题，**不是账号不可用**——
+        # 记录成账号冷却会让一个健康账号被无辜停用（还会解绑会话）。
+        return
     if not account or not hasattr(account, "note_error"):
         return
     status_int = _to_int_status(getattr(exc, "status", 502))
@@ -4305,6 +5064,8 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             account.note_unknown_failure("envelope HTTP %s" % status_int)
 
 def should_retry_envelope(exc, emitted_bytes, attempt):
+    # issue #37：坏参数是**模型内容问题**，不是瞬时上游故障——绝不自动重发
+    # （否则会重复计费，且下一次很可能同样非法）。客户端想重试由它自己决定。
     """流内错误信封是否值得**重开上游**再试。
 
     关键前提（access log 记 200 而业务错 418 的根因）：上游先以 HTTP200
@@ -4312,6 +5073,8 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
     层重试覆盖不到。只要 **尚未向客户端发出任何字节**、未超预算、且错误属
     瞬时类（418/5xx/provider_error，且非客户端参数错），就值得重开。
     """
+    if isinstance(exc, InvalidToolArguments):
+        return False
     if emitted_bytes:
         return False
     if attempt >= TRANSIENT_MAX_RETRIES:
@@ -4490,7 +5253,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         resp = None
         last_exc = None
         detail = ""
-        for tries in range(TRANSIENT_MAX_RETRIES + 1):
+        tries = 0                 # 瞬时故障重试计数（1s/2s 退避）
+        queue_tries = 0           # 排队等待轮次（issue #38）
+        queue_start = time.time()
+        while True:
             try:
                 sess = SESSIONS.get(account)
                 headers = sess.headers(encoded, raw_url, model_key=model_key,
@@ -4514,6 +5280,21 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 except Exception:
                     pass
                 last_exc = exc
+                # issue #38：上游排队 -> 等放行后重试同一账号（不把排队 JSON
+                # 交给客户端）。仅在预算与单轮上限内等待；超出即按原错误走
+                # 既有分类（fail-open 语义不变）。
+                qwait = _queue_wait_seconds(detail)
+                if qwait > 0 and queue_tries < QUEUE_MAX_ROUNDS \
+                        and qwait <= QUEUE_WAIT_MAX_SECS \
+                        and (time.time() - queue_start) + qwait \
+                        <= QUEUE_WAIT_BUDGET_SECS:
+                    queue_tries += 1
+                    log("upstream queued on '%s' model '%s' - waiting %ds "
+                        "(round %d/%d)"
+                        % (account.uid[:8], model, qwait, queue_tries,
+                           QUEUE_MAX_ROUNDS), level="WARN", tag="chat")
+                    time.sleep(qwait + 1)
+                    continue
                 # 429/401/403 与客户端参数错：立即进入分类，不重试
                 if exc.code in (429, 401, 403):
                     break
@@ -4525,6 +5306,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                         % (exc.code, account.uid[:8], model, tries + 1,
                            TRANSIENT_MAX_RETRIES + 1, backoff),
                         level="WARN", tag="chat")
+                    tries += 1
                     time.sleep(backoff)
                     continue
                 break
@@ -4551,7 +5333,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                                TRANSIENT_MAX_RETRIES + 1,
                                str(exc)[:120], tries + 1),
                             level="WARN", tag="chat")
-                    time.sleep(tries + 1)
+                    tries += 1
+                    time.sleep(tries)
                     continue
                 break
 
@@ -4970,22 +5753,18 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         _echo_src = _block16 or ""
         if _echo_src:
             _rec, _clean = parse_leaked_tool_calls(_echo_src, allowed_names)
-            if _rec is None:
-                # 部分挽救：与流式链路同判（外层合法 + 条目级损坏 -> 还原
-                # 合法条目、丢弃损坏条目 + WARN）。
-                _salv = salvage_leaked_tool_calls(_echo_src, allowed_names)
-                if _salv:
-                    _rec, _dropped = _salv
-                    _clean = ""
-                    log("salvaged leaked tool-call echo: %d call(s) restored, "
-                        "%d dropped (%s)"
-                        % (len(_rec), len(_dropped),
-                           ", ".join("idx=%d:%s" % (i, r)
-                                     for i, r in _dropped)),
-                        level="WARN", tag="chat")
             if _rec:
                 message["content"] = _head16 + (_clean or "")
                 tool_calls_map = {i: c for i, c in enumerate(_rec)}
+            elif _echo_with_bad_args(_echo_src, allowed_names):
+                # issue #37（fail-closed，**先于 #9/#11**）：外层数组完整合法、
+                # 只是内层参数坏了——不泄漏、不伪造调用，也不拼装成功对象：
+                # 整轮以协议错误失败（HTTP 502）。真截断的数组 parse 不过，
+                # 不会被这里抢走（仍由 #9 吞掉）。
+                log("tool-call echo has invalid JSON arguments (%d chars) — "
+                    "failing the turn closed (issue #37)" % len(_echo_src),
+                    level="WARN", tag="chat")
+                raise InvalidToolArguments()
             elif _leaked_partial_droppable(_echo_src, allowed_names):
                 # issue #9：截断的 marker+JSON 回声不还原、也不透传。
                 log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
@@ -4996,6 +5775,9 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                 log("dropped leaked tool-result echo (%d chars) — issue #11"
                     % len(_echo_src), level="WARN", tag="chat")
                 message["content"] = _head16
+            else:
+                # issue #49 方向 C：四条路径都没认出来 -> 至少留痕（非流式侧）
+                _log_unrecovered_leak(_echo_src, "aggregate")
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -5770,26 +6552,19 @@ def stream_responses_events(inner_lines, model, holder):
         leak_calls, leak_clean = (None, text_buffer)
         dropped_leak = False
         dropped_tool_echo = False
+        dropped_bad_args = False
         # issue #16-B1：散文已先发出时 any(text_parts) 为真，但缓冲本身若以
         # 标记开头（切分后剩下的回声块）仍必须走回读/吞掉判定，否则会漏。
         if not any(text_parts) or _marker_starts_at(text_buffer):
             leak_calls, leak_clean = parse_leaked_tool_calls(
                 text_buffer, holder.get("allowed_names"))
-            if leak_calls is None:
-                # 部分挽救：与 chat 流式/非流式链路同判（外层合法 + 条目级
-                # 损坏 -> 还原合法条目、丢弃损坏条目 + WARN）。
-                _salv = salvage_leaked_tool_calls(
-                    text_buffer, holder.get("allowed_names"))
-                if _salv:
-                    leak_calls, _salv_dropped = _salv
-                    leak_clean = ""
-                    log("salvaged leaked tool-call echo: %d call(s) restored, "
-                        "%d dropped (%s)"
-                        % (len(leak_calls), len(_salv_dropped),
-                           ", ".join("idx=%d:%s" % (i, r)
-                                     for i, r in _salv_dropped)),
-                        level="WARN", tag="chat")
-            if leak_calls is None and _leaked_partial_droppable(
+            # issue #37（fail-closed）**先于 #9/#11**：坏参数块的外层数组完整
+            # 合法，带 DSML/围栏残片时会被 _leaked_partial_droppable 误判成
+            # 「截断」并静默吞掉（正常完成）——那既不是失败也不是恢复。
+            if leak_calls is None and _echo_with_bad_args(
+                    text_buffer, holder.get("allowed_names")):
+                dropped_bad_args = True
+            elif leak_calls is None and _leaked_partial_droppable(
                     text_buffer, holder.get("allowed_names")):
                 dropped_leak = True
             elif leak_calls is None and _tool_echo_droppable(
@@ -5812,8 +6587,18 @@ def stream_responses_events(inner_lines, model, holder):
             log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(text_buffer), level="WARN", tag="chat")
             calls_rem, clean_rem = None, None
+        elif dropped_bad_args:
+            # issue #37（fail-closed）：不输出协议，也不走正常完成——抛错，
+            # 由 Responses 出口发 response.failed。
+            log("tool-call echo has invalid JSON arguments (%d chars) — "
+                "failing the turn closed (issue #37)" % len(text_buffer),
+                level="WARN", tag="chat")
+            raise InvalidToolArguments()
         else:
             calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
+            if not calls_rem:
+                # issue #49 方向 C：Responses 侧同样留痕（DSML 也解析不出来时）
+                _log_unrecovered_leak(clean_rem or text_buffer, "responses")
         if calls_rem:
             dsml_tool_calls.extend(calls_rem)
         if clean_rem:
@@ -6424,7 +7209,11 @@ class Handler(BaseHTTPRequestHandler):
             # 回一个空账本，把本地账本再零化一次；被跳过的号在 skipped 里可区分。
             targets, skipped = _refreshable_accounts(POOL.accounts if POOL else [])
             for a in targets:
-                a.fetch_credits()
+                res = a.fetch_credits()
+                # issue #43：手动查询已经拿到新快照 -> 清掉待刷新，别紧接着重复查
+                if (isinstance(res, dict) and res.get("ok")
+                        and CREDITS_USAGE_REFRESHER is not None):
+                    CREDITS_USAGE_REFRESHER.mark_manual(a.uid)
             return self._json(200, {"accounts": account_views(),
                                     "skipped": skipped,
                                     "refreshed": len(targets)})
@@ -6522,6 +7311,16 @@ class Handler(BaseHTTPRequestHandler):
                 realm=req_realm, range=req_range, since=req_since,
                 until=req_until,
                 bucket_seconds=(query.get("bucket") or [None])[0]))
+        if path == "/usage/daily":
+            if not self._authorized():
+                return
+            # 7 天 / 30 天堆叠柱状图：日期 × 分组（模型/区域/Key/账号）
+            req_realm = query.get("realm", [None])[0] \
+                or self.headers.get("X-Realm") or CURRENT_REALM
+            return self._json(200, usage_daily(
+                days=(query.get("days") or ["7"])[0],
+                group=(query.get("group") or ["model"])[0],
+                realm=req_realm))
         if path == "/tasks":
             if not self._authorized():
                 return
@@ -6796,7 +7595,11 @@ class Handler(BaseHTTPRequestHandler):
                     qoder_settings.panel_password_is_default(ACCOUNTS_DIR),
             })
         if path == "/panel/logout":
-            PANEL.revoke(self._panel_token())
+            # 退出登录不能只往内存黑名单里写一笔：那份 dict 重启即丢，已退出的
+            # token 会活到 TTL（7 天）结束——比改动前的「重启全清」更差。
+            # 直接换密钥：本 token 与其它浏览器的会话一起作废。本地单人面板无感，
+            # 多人/局域网场景反而更安全。
+            PANEL.revoke_all()
             return self._json(200, {"ok": True})
         # 之后所有路由都要面板会话
         if not self._panel_ok():
@@ -6806,7 +7609,10 @@ class Handler(BaseHTTPRequestHandler):
             current = str(payload.get("current") or "")
             new = str(payload.get("new") or "")
             if not qoder_settings.verify_panel_password(ACCOUNTS_DIR, current):
-                return self._error(401, "current password is wrong",
+                # issue #41：原密码错是**业务校验失败**，不是会话失效。
+                # 401 会让前端弹回登录遮罩（用户看到「登录 UI」而不是原因）；
+                # 403 保持「已登录但不允许」的语义，前端直接显示 msg。
+                return self._error(403, "当前密码不正确",
                                    "invalid_request_error")
             if len(new) < 4:
                 return self._error(400, "new password must be at least 4 characters",
@@ -7936,6 +8742,18 @@ def main():
                             free_models=free_model_names(CURRENT_REALM))
     except Exception as exc:
         log("quota limits apply failed at startup: %s" % exc, level="WARN")
+    # issue #43：余额刷新与护栏**解耦**——护栏阈值全 0 时也要能刷新「用过的号」。
+    # 默认 5 分钟合并一次，空闲不轮询（QD_CREDITS_USAGE_INTERVAL 可调）。
+    global CREDITS_USAGE_REFRESHER
+    try:
+        CREDITS_USAGE_REFRESHER = qoder_accounts.CreditsUsageRefresher(
+            POOL, log=log)
+        CREDITS_USAGE_REFRESHER.start()
+        log("credits usage refresher started (interval=%ds)"
+            % CREDITS_USAGE_REFRESHER.interval_seconds, tag="credits")
+    except Exception as exc:
+        CREDITS_USAGE_REFRESHER = None
+        log("credits usage refresher failed to start: %s" % exc, level="WARN")
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()

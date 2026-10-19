@@ -133,13 +133,18 @@ a6 = _mk("d6")
 a6.credits = dict(HEALTHY)
 _stub_json(ORG_ONLY)
 r6 = a6.fetch_credits()
-check("Q7 企业真形态（仅 orgResourcePackage）-> cap 作 size、ok=True",
-      (a6.credits or {}).get("remain") == 1879
-      and (a6.credits or {}).get("used") == 121
-      and (a6.credits or {}).get("size") == 2000 and r6.get("ok") is True,
+check("Q7 企业真形态（仅 orgResourcePackage）-> 套餐口径 0、有效余额=资源包、ok=True",
+      (a6.credits or {}).get("remain") == 0
+      and (a6.credits or {}).get("used") == 0
+      and (a6.credits or {}).get("size") == 0
+      and (a6.credits or {}).get("remain_effective") == 1879
+      and ((a6.credits or {}).get("shared") or {}).get("remain") == 1879
+      and ((a6.credits or {}).get("shared") or {}).get("size") == 2000
+      and r6.get("ok") is True,
       (a6.credits, r6))
-check("Q7b 企业资源包入 packages、无退化误报",
-      any(p.get("name") == "企业资源包" and p.get("size") == 2000
+check("Q7b 企业资源包入 packages（共享额度行，source=orgResourcePackage）、无退化误报",
+      any(p.get("source") == "orgResourcePackage" and p.get("size") == 2000
+          and p.get("remain") == 1879
           for p in (a6.credits or {}).get("packages") or [])
       and getattr(a6, "last_quota_anomaly", None) is None,
       ((a6.credits or {}).get("packages"),
@@ -151,10 +156,12 @@ MIXED = {"isQuotaExceeded": False, "expiresAt": 1792065206,
 a7 = _mk("d7")
 _stub_json(MIXED)
 r7 = a7.fetch_credits()
-check("Q8 公共+企业包并存 -> 三者相加（对齐参考实现）",
-      (a7.credits or {}).get("remain") == 1939
-      and (a7.credits or {}).get("used") == 161
-      and (a7.credits or {}).get("size") == 2100 and r7.get("ok") is True,
+check("Q8 公共+企业包并存 -> 套餐口径不变、有效余额 = 60 + 1879",
+      (a7.credits or {}).get("remain") == 60
+      and (a7.credits or {}).get("used") == 40
+      and (a7.credits or {}).get("size") == 100
+      and (a7.credits or {}).get("remain_effective") == 1939
+      and r7.get("ok") is True,
       (a7.credits, r7))
 
 with open(os.path.join(D, "d1.json"), encoding="utf-8") as fh:

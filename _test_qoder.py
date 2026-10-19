@@ -1528,17 +1528,30 @@ sys_text, flat, images = P.flatten_messages([
                                    "image_url": {"url": "data:image/png;base64,AAA"}}]},
 ])
 check("system extracted", sys_text == "base")
-check("text parts joined", flat[0]["content"] == "part1")
+# v1.4.2：带图消息的 content 保留结构化 parts（上游只读 content 里的 image_url
+# parts，不读顶层 image_urls——实测确认）。文本 part 仍在，图像 part 并存。
+check("带图消息 content 是结构化 parts（text + image_url 并存）",
+      isinstance(flat[0]["content"], list)
+      and flat[0]["content"][0] == {"type": "text", "text": "part1"}
+      and flat[0]["content"][1]["type"] == "image_url"
+      and flat[0]["content"][1]["image_url"]["url"]
+      == "data:image/png;base64,AAA", flat[0]["content"])
 check("image collected", images == ["data:image/png;base64,AAA"])
+# 无图消息仍压平为纯文本（行为不变）
+_sys_n, _flat_n, _img_n = P.flatten_messages([
+    {"role": "user", "content": [{"type": "text", "text": "plain"}]}])
+check("无图消息 content 仍为纯文本", _flat_n[0]["content"] == "plain")
 # 单 part dict 形态（issue #33 根因）：content 直接给一个 part 对象而非列表时，
 # 图像必须被收集、绝不 str() 成 Python 字面量文本——旧行为是模型收到
 # "{'type': 'image_url', ...}" 字符串且图像丢失。
 _sys_d, _flat_d, _img_d = P.flatten_messages([
     {"role": "user", "content": {"type": "image_url",
                                   "image_url": {"url": "data:image/png;base64,BBB"}}}])
-check("dict 单 part：图像收集而非字符串化",
+check("dict 单 part：图像收集且 content 为结构化 parts 而非 str() 文本",
       _img_d == ["data:image/png;base64,BBB"]
-      and "image_url" not in str(_flat_d[0].get("content") or ""))
+      and isinstance(_flat_d[0].get("content"), list)
+      and _flat_d[0]["content"][0]["image_url"]["url"]
+      == "data:image/png;base64,BBB", _flat_d[0]["content"])
 _resp_d = P._flatten_content({"type": "input_image",
                               "image_url": "data:image/png;base64,CCC"})
 check("Responses dict 单 part：保留结构化 image_url part 而非 str()",
@@ -2703,6 +2716,109 @@ check("流式：未声明工具名 -> 不吞正文，按普通文本透传",
       "".join(_f["choices"][0]["delta"].get("content") or ""
               for _f in _frames27c) == _LEAK27, _frames27c)
 
+# --- issue #36：marker + JSON 数组之后漏出 DSML 闭合标签残片 ---
+# 修复前整段被当正文补发（finish=stop、工具不执行）；修复后恢复为
+# 结构化 tool_calls（finish=tool_calls），残片零泄漏。
+_DSML_TAIL = ("</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜calls>")
+check("#36 尾部剥离：DSML 闭合标签残片被剥掉（残留换行由调用方 strip 处理）",
+      P._strip_dsml_close_tail(_LEAK27 + "\n" + _DSML_TAIL).strip() == _LEAK27)
+check("#36 尾部剥离：正文内部出现 DSML 字串不受影响（只剥尾部）",
+      P._strip_dsml_close_tail("讨论 </｜DSML｜invoke> 的正文") == "讨论 </｜DSML｜invoke> 的正文")
+_frames36 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("准备修改命令后重试：\n\n"),
+          _raw27(_LEAK27.split("\n")[0] + "\n"),
+          _raw27(_LEAK27.split("\n")[1]),
+          _raw27("\n</｜DSML｜parameter>\n"),
+          _raw27("</｜DSML｜invoke>\n"),
+          _raw27("</｜DSML｜calls>"),
+          _raw27("", "stop")]),
+    {"terminal"})]
+_c36 = [_f["choices"][0] for _f in _frames36]
+_txt36 = "".join(_d.get("delta", {}).get("content") or "" for _d in _c36)
+_calls36 = [(_d.get("delta", {}) or {}).get("tool_calls") for _d in _c36
+            if _d.get("delta", {}).get("tool_calls")]
+check("#36 流式：DSML 残片不再把回声块证伪——恢复为 tool_calls 增量",
+      not ("DSML" in _txt36 or "请求调用工具" in _txt36)
+      and len(_calls36) == 1
+      and _calls36[0][0]["function"]["name"] == "terminal"
+      and _c36[-1]["finish_reason"] == "tool_calls", _c36)
+
+# --- issue #36 后续（qingannn 二次报告）：尖括号标记变体 + DSML 标签跨帧 + 帧上限 ---
+_ALT36 = P.LEAK_MARKER_ALT
+check("ALT 常量：尖括号形态与方括号仅括号不同",
+      _ALT36 == "<" + P.LEAK_MARKER[1:-1] + ">")
+check("归一化：开头尖括号变体 -> 方括号形态",
+      P._normalize_leak_marker(_ALT36 + " rest") == P.LEAK_MARKER + " rest")
+check("归一化：中段出现不误伤（只改开头）",
+      P._normalize_leak_marker("note " + _ALT36 + " usage")
+      == "note " + _ALT36 + " usage")
+check("归一化：尖括号真前缀（跨帧进行中）判 pre",
+      P._leak_body_offset("<assistant") == ("pre", None))
+
+def _chunks36(pieces, n):
+    out = []
+    for p in pieces:
+        for i in range(0, len(p), n):
+            out.append(p[i:i + n])
+    return out
+
+def _raw36c(content=None, fin=None):
+    delta = {}
+    if content is not None:
+        delta["content"] = content
+    inner = {"id": "c36", "model": "m36", "created": 1, "choices": [
+        {"index": 0, "delta": delta, "finish_reason": fin}]}
+    return ("data: " + json.dumps(inner, ensure_ascii=False)
+            + chr(10) * 2).encode("utf-8")
+
+def _frames36c(pieces):
+    return [_raw36c(p, "stop" if i == len(pieces) - 1 else None)
+            for i, p in enumerate(pieces)]
+
+def _collect36(pieces, names=None):
+    res = []
+    for f in P.recover_leaked_tool_calls(iter(pieces),
+                                         allowed_names=names or {"terminal"}):
+        d = P.strip_data_prefix(f.decode("utf-8", "replace"))
+        if not d or d == "[DONE]":
+            continue
+        o = json.loads(d)
+        ch = (o.get("choices") or [{}])[0]
+        dd = ch.get("delta") or {}
+        res.append((dd.get("content"), dd.get("tool_calls"),
+                    ch.get("finish_reason")))
+    return res
+
+_VBAR = chr(0xFF5C)
+_DSML36 = ("</" + _VBAR * 2 + "DSML" + _VBAR * 2 + " parameter>\n"
+           + "</" + _VBAR * 2 + "DSML" + _VBAR * 2 + " invoke>\n"
+           + "</" + _VBAR * 2 + "DSML" + _VBAR * 2 + " calls>")
+_PRE36 = chr(0x51C6) + chr(0x5907) + chr(0x6838) + chr(0x5BF9) + chr(0x6587) + chr(0x4EF6) + chr(0x5185) + chr(0x5BB9) + chr(0xFF1A) + chr(10) * 2
+for _mk36 in (P.LEAK_MARKER, _ALT36):
+    for _n36 in (1, 4, 16, 64, 512):
+        _res36 = _collect36(_frames36c(_chunks36(
+            [_PRE36, _mk36 + chr(10), _CALLS27,
+             chr(10) + _DSML36], _n36)))
+        _tc36 = [c for _, c, _ in _res36 if c]
+        _tx36 = "".join(t for t, _, _ in _res36 if t)
+        _ok36 = (len(_tc36) == 1
+                 and _tc36[0][0]["function"]["name"] == "terminal"
+                 and P.LEAK_MARKER[1:-1] not in _tx36
+                 and "DSML" not in _tx36)
+        check("#36b 分片矩阵 %s/%d 帧：恢复且零泄漏"
+              % ("方括号" if _mk36 == P.LEAK_MARKER else "尖括号", _n36),
+              _ok36, _tx36[:80])
+
+check("#36b 尾巴判定：完整 DSML 标签可暂留",
+      P._dsml_tail_holdable("</" + _VBAR + "DSML" + _VBAR + "calls>"))
+check("#36b 尾巴判定：完整+半截组合可暂留（旧版 strip 卡死 + match 不中）",
+      P._dsml_tail_holdable(_DSML36[:21] + chr(10)
+                            + "</" + _VBAR * 2 + "DSML" + _VBAR * 2))
+check("#36b 尾巴判定：单字符 <（1 字符/帧边界）可暂留",
+      P._dsml_tail_holdable("<"))
+check("#36b 尾巴判定：长散文不暂留（长度护栏）",
+      not P._dsml_tail_holdable("<div " + "x" * 100))
+
 _ev27 = [f.decode() for f in P.stream_responses_events(
     iter([_raw27(_LEAK27), _raw27("", "stop")]), "m27",
     {"usage": None, "custom_names": set(), "allowed_names": {"terminal"}})]
@@ -2810,7 +2926,16 @@ check("削减：历史工具结果被截断（首尾保留 + 省略标记）",
 check("削减：信封前缀逐字节不变（历史与当前轮都是）",
       _hist29.startswith(_PREF29) and _cur29.startswith(_PREF29)
       and _short29.startswith(P.TOOL_RESULT_MARKER + " (cat)]\n"))
-check("削减：当前轮的 tool 结果全文保留", _cur29 == _PREF29 + _LONG29)
+# issue #48：默认策略改为「只保护最后 N 条工具结果」（与请求形态无关）。
+# 旧断言锁的是「当前轮 protected」——那正是缓存每轮失效的根因，已废。
+check("削减：默认只保护最后一条 tool 结果（更早的历史一律削）",
+      _cur29.startswith(_PREF29) and len(_cur29) < len(_LONG29)
+      and "已省略" in _cur29, (len(_LONG29), len(_cur29)))
+check("削减：保护窗内的最后一条结果全文保留",
+      P.flatten_messages([{"role": "user", "content": "u"},
+                          {"role": "tool", "name": "terminal",
+                           "content": _LONG29}])[1][-1]["content"]
+      == _PREF29 + _LONG29)
 check("削减：短结果不动", _short29.endswith("ok: 3 passed"))
 check("削减：完整 JSON 不削且仍可解析",
       isinstance(json.loads(P._shrink_tool_result(
@@ -3028,39 +3153,56 @@ check("Responses 流式：散文 + marker 同帧 -> 不回显 marker、散文保
 
 print()
 print("[27.95] issue #16 兜底：hold 缓冲上限（超限 fail-open 放行）")
-_BIG16 = P.LEAK_MARKER + "\n[" + "1," * 70000          # 约 140KB：超 128KB 上限
+_BIG16 = P.LEAK_MARKER + "\n[" + "1," * 70000          # 约 140KB：超 32KB 上限
 _big_out = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
     iter([_raw27(_BIG16), _raw27("2]", "stop")]), {"terminal"})]
 _big_text = "".join(f["choices"][0]["delta"].get("content") or ""
                     for f in _big_out)
 check("超限：hold 超过 _HOLD_MAX_CHARS -> fail-open 放行且内容只出现一次",
       len(_BIG16) > P._HOLD_MAX_CHARS and _big_text == _BIG16 + "2]")
-check("上限常量：128KB / 帧上限与字符上限同刻度",
-      P._HOLD_MAX_CHARS == 131072 and P._HOLD_MAX_FRAMES == P._HOLD_MAX_CHARS)
+check("上限常量：32KB / 空转帧上限 200（上游 #36b 语义）",
+      P._HOLD_MAX_CHARS == 32768 and P._HOLD_MAX_FRAMES == 200)
 _keep_frames16 = P._HOLD_MAX_FRAMES
 try:
     P._HOLD_MAX_FRAMES = 2
+    # issue #36 follow-up: the frame cap only guards against idle frames
+    # (no growth, e.g. keep-alive noise); a growing legal echo block is
+    # bounded by the 32KB char cap instead.
     _fr16 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-        iter([_raw27(P.LEAK_MARKER), _raw27("\n["), _raw27("1"), _raw27("2"),
-              _raw27("", "stop")]), {"terminal"})]
+        iter([_raw27(P.LEAK_MARKER + "\n[1"), _raw27(""),
+              _raw27(""), _raw27(""), _raw27("", "stop")]), {"terminal"})]
 finally:
     P._HOLD_MAX_FRAMES = _keep_frames16
-check("帧数兜底：超过 _HOLD_MAX_FRAMES 帧仍未证伪 -> 放行",
+check("帧数兜底：连续空转帧超 _HOLD_MAX_FRAMES -> fail-open 放行",
       "".join(f["choices"][0]["delta"].get("content") or "" for f in _fr16)
-      == P.LEAK_MARKER + "\n[12")
+      == P.LEAK_MARKER + "\n[1")
+# 有内容帧不再计入帧数上限（1 字符/帧的合法长块不受误伤——issue #36 后续）
+_calls16b = json.dumps([{"name": "terminal", "arguments": "{}"}],
+                       ensure_ascii=False)
+_fr16b = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(P.LEAK_MARKER), _raw27("\n" + _calls16b[:8]),
+          _raw27(_calls16b[8:16]), _raw27(_calls16b[16:]),
+          _raw27("", "stop")]), {"terminal"})]
+check("有增长的帧不计帧数上限：4 内容帧在 _HOLD_MAX_FRAMES=2 下仍恢复",
+      any(f["choices"][0]["delta"].get("tool_calls") for f in _fr16b)
+      and _fr16b[-1]["choices"][0]["finish_reason"] == "tool_calls")
 
 _keep_frames16b = P._HOLD_MAX_FRAMES
 try:
     P._HOLD_MAX_FRAMES = 3
     _fr16b = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-        iter([_raw27(P.LEAK_MARKER), _raw27(""), _raw27(None), _raw27(""),
-              _raw27("\n["), _raw27("1"), _raw27("2]"), _raw27("", "stop")]),
+        iter([_raw27(P.LEAK_MARKER), _raw27(""), _raw27(None),
+              _raw27("\n" + _calls16b[:8]), _raw27(_calls16b[8:16]),
+              _raw27(_calls16b[16:]), _raw27("", "stop")]),
         {"terminal"})]
 finally:
     P._HOLD_MAX_FRAMES = _keep_frames16b
 _texts16b = [f["choices"][0]["delta"].get("content") or "" for f in _fr16b]
-check("帧数兜底只统计内容帧：空帧不推进 hold_frames（2026-10-15 回归）",
-      _texts16b == [P.LEAK_MARKER + "\n[12]", ""], _texts16b)
+check("帧数兜底只统计空转帧：内容帧重置 hold_frames，块正常恢复（上游对齐）",
+      all(P.LEAK_MARKER not in t for t in _texts16b)
+      and any(f["choices"][0]["delta"].get("tool_calls") for f in _fr16b)
+      and _fr16b[-1]["choices"][0]["finish_reason"] == "tool_calls",
+      _texts16b)
 
 _LONG16 = P.LEAK_MARKER + "\n" + json.dumps(
     [{"name": "terminal",

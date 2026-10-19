@@ -373,9 +373,12 @@ _route(A.PATH_QUOTA, {"userType": "enterprise", "usageType": "credits",
                                              "cap": 2000.0, "available": True}})
 r6 = ent6.fetch_credits()
 c6 = ent6.credits or {}
-check("A6 fetch_credits 企业真形态（orgResourcePackage，cap 作 size）出站为企业 openapi",
-      r6.get("ok") is True and c6.get("remain") == 1879 and c6.get("used") == 121
-      and c6.get("size") == 2000 and _urls() == [ENT_OPENAPI + A.PATH_QUOTA],
+check("A6 fetch_credits 企业真形态（orgResourcePackage，cap 作共享 size）出站为企业 openapi",
+      r6.get("ok") is True and c6.get("remain") == 0 and c6.get("used") == 0
+      and c6.get("size") == 0 and c6.get("remain_effective") == 1879
+      and (c6.get("shared") or {}).get("remain") == 1879
+      and (c6.get("shared") or {}).get("size") == 2000
+      and _urls() == [ENT_OPENAPI + A.PATH_QUOTA],
       (r6, _urls()))
 check("A6 企业资源包入 packages 且无退化误报",
       any(p.get("name") == "企业资源包" and p.get("remain") == 1879
