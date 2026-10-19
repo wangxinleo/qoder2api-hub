@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates_for,
                             CLIENT_UA, local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.5-wangxinleo"
+VERSION = "1.5.6-wangxinleo"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3292,19 +3292,6 @@ def _dsml_tail_holdable(tail):
     return s == "<"
 
 
-# issue #37：回声块**外层数组合法、内层 arguments 非法**（未转义换行/引号、
-# 截断、尾部多余文本、非法转义）。这种块能确定是工具协议回声（marker + 数组 +
-# 已声明的工具名），只是参数坏了——绝不能当正文放出去（协议泄漏），也不能
-# 伪造一个可执行调用（会写坏文件）。统一替换为一句明确的失败说明。
-BAD_ARGS_NOTICE = ("（上游返回的工具调用参数不是合法 JSON，网关已丢弃该调用，"
-                   "未执行任何工具；请重试。）")
-
-# issue #37（fail-closed）：错误详情是**固定串**——它会写进日志与客户端响应，
-# 绝不能把实际参数、路径或正文带出去。
-BAD_ARGS_ERROR_DETAIL = ("upstream tool-call echo contains invalid JSON "
-                         "arguments; no tools were emitted")
-
-
 # issue #49 方向 C 的节流状态：一分钟最多一条 WARN，其余只计数——
 # 形态3（54 组空壳）一次会话就能刷出几十条，不节流会把日志淹掉。
 _LEAK_WARN_STATE = {"last": 0.0, "suppressed": 0, "total": 0}
@@ -3342,106 +3329,9 @@ def _log_unrecovered_leak(text, where="chat"):
         pass
 
 
-class InvalidToolArguments(UpstreamStatus):
-    """已确认是工具协议回声，但内层 arguments 不是合法 JSON（issue #37）。
-
-    fail-closed：不泄漏协议文本、不伪造可执行调用，也**不伪装成成功结束**。
-    抛到上层后由各协议的错误出口转成明确失败：
-      · chat 流式   -> data: {"error": ...} + [DONE]（不再发正常 finish）
-      · Responses   -> response.failed（不再发 response.completed）
-      · Anthropic   -> event: error（不再发 message_stop）
-      · 非流式      -> HTTP 502 + 标准错误信封
-    重试与账号冷却入口都显式排除本异常（见 should_retry_envelope /
-    _handle_envelope_account_cooldown）：它不是账号问题，也不该自动重发收费请求。
-    """
-
-    def __init__(self):
-        super(InvalidToolArguments, self).__init__(502, BAD_ARGS_ERROR_DETAIL)
-
-
 _JSON_FENCE = chr(96) * 3
 
 
-def _strip_json_fence(text):
-    """剥掉**首/尾**代码围栏残余（头部 ```[json]`、尾部 ```）。
-
-    为什么需要：流式里 `_find_marker_split` 会把开围栏切进散文，hold 只剩
-    「marker + 数组 + 换行 + 闭围栏」；旧实现只在「整串被围栏包住」时才剥，
-    于是这种形状被判成非回声 -> 当正文补发（issue #37 fail-closed 的漏检）。
-    只动首尾，不碰中段。
-    """
-    t = (text or "").strip()
-    if t.startswith(_JSON_FENCE):
-        inner = t[len(_JSON_FENCE):]
-        if inner[:4].lower() == "json":
-            inner = inner[4:]
-        t = inner.lstrip()
-    if t.endswith(_JSON_FENCE) and len(t) > len(_JSON_FENCE):
-        t = t[:-len(_JSON_FENCE)].rstrip()
-    return t
-
-
-def _echo_with_bad_args(text, allowed_names=None):
-    """这段正文是否是「工具协议回声 + 内层参数非法」？（issue #37）
-
-    判定链（全部满足才算）：
-      1) 整段是 marker（方/尖括号）+ JSON 数组（可带围栏、可带 DSML 尾标签）；
-      2) 外层数组能解析、非空，每项是 dict 且有非空字符串 name；
-      3) 声明了 tools 时，所有 name 都在声明集合里；
-      4) 至少一个 arguments 是**非空字符串但解析失败**。
-    普通散文 / 讨论 marker / 合法 JSON 示例都不会命中。
-    """
-    if not text:
-        return False
-    t = _strip_json_fence(_normalize_leak_marker((text or "").strip()))
-    # 围栏与 DSML 尾标签可能交替出现（围栏 -> DSML、DSML -> 围栏），
-    # 剥两轮直到稳定；每轮都只动**首尾**，中段正文不受影响。
-    prev = None
-    while prev != t:
-        prev = t
-        t = _strip_json_fence(_strip_dsml_close_tail(t).strip()).strip()
-    # issue #49：允许「散文 + 重复 marker」——取最后一个 marker，跳过连续重复。
-    _mpos = t.rfind(LEAK_MARKER)
-    if _mpos < 0:
-        return False
-    t = t[_mpos:]
-    while t.startswith(LEAK_MARKER):
-        t = t[len(LEAK_MARKER):].lstrip()
-    t = _strip_dsml_close_tail(t)
-    if t.endswith(_JSON_FENCE) and len(t) > len(_JSON_FENCE):
-        t = _strip_dsml_close_tail(t[:-len(_JSON_FENCE)].rstrip())
-    rest = t.strip()
-    if not (rest.startswith("[") and rest.endswith("]")):
-        return False
-    try:
-        arr = json.loads(rest)
-    except Exception:
-        return False
-    if not isinstance(arr, list) or not arr:
-        return False
-    bad = 0
-    for item in arr:
-        if not isinstance(item, dict):
-            return False
-        name = item.get("name")
-        if not isinstance(name, str) or not name.strip():
-            return False
-        if allowed_names and name.strip() not in allowed_names:
-            return False
-        if "arguments" not in item:
-            return False
-        args = item.get("arguments")
-        if isinstance(args, (dict, list)):
-            continue
-        if not isinstance(args, str):
-            return False
-        if not args.strip():
-            continue
-        try:
-            json.loads(args)
-        except Exception:
-            bad += 1
-    return bad > 0
 
 
 # issue #11：tool 角色消息被序列化进 content 时的开标记（写入侧见
@@ -3533,19 +3423,18 @@ def _leaked_item_to_call(item, allowed_names=None):
     }, ""
 
 
-def parse_leaked_tool_calls(text, allowed_names=None):
-    """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
+def _leak_echo_array(text):
+    """归一化「marker + JSON 数组」，返回 (arr, prefix) 或 None。
 
-    严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
-      1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
-      2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
-      3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
-
-    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为最后一个 marker
-    之前的散文前缀（通常为空串）；未识别时原样返回 text。任一条目不合法即整体
-    失败，不做部分还原。
+    与 #49 语义一致：取最后一个 marker、跳过连续重复 marker、剥围栏/DSML 尾；
+    只校验外层数组可解析，不校验条目。条目校验由 parse / salvage 各自完成，
+    确保判据层只有这一份归一化副本。
     """
-    t = (text or "").strip()
+    raw = text or ""
+    # 保留 hold 开头的空白：1 字符/帧时 marker 前的换行会先进入 hold，
+    # strip() 后再取 prefix 会把这些正文空白丢掉。
+    leading = raw[:len(raw) - len(raw.lstrip())]
+    t = raw.strip()
     # issue #36 follow-up: normalize the angle-bracket marker variant.
     t = _normalize_leak_marker(t)
     # issue #36：整段解析前先剥尾部 DSML 闭合标签残片。
@@ -3557,18 +3446,18 @@ def parse_leaked_tool_calls(text, allowed_names=None):
             inner = inner[4:]
         t = inner[:-3].strip()
     # issue #49：模型在长会话里会写成「散文 + marker + marker + 数组 + DSML 尾」。
-    # 取**最后一个** marker 起算（前面散文作为 clean 返回，由调用方补发），
-    # 再剥掉连续重复的 marker 与尾部围栏——这些都不放松后面的严格校验。
+    # 取**最后一个** marker 起算（前面散文作为 prefix 返回，由调用方补发），
+    # 再剥掉连续重复的 marker 与尾部围栏。
     _mpos = t.rfind(LEAK_MARKER)
     if _mpos < 0:
-        return None, text
+        return None
     prefix = t[:_mpos]
-    # 前缀尾部可能残留 marker（「散文 + marker1 + marker2 + 数组」时，
-    # marker1 落在 prefix 里）——它绝不能当正文发给客户端。
-    prefix = prefix.rstrip()
+    # 只裁掉前缀尾部残留的重复 marker；普通散文的原始空白（含跨帧暂存
+    # 的换行）必须原样保留，否则 1 字符/帧时正文会少掉尾随换行。
     for _mk in (LEAK_MARKER, LEAK_MARKER_ALT):
-        while prefix.endswith(_mk):
-            prefix = prefix[:-len(_mk)].rstrip()
+        while prefix.rstrip().endswith(_mk):
+            prefix = prefix.rstrip()[:-len(_mk)]
+    prefix = leading + prefix
     t = t[_mpos:]
     while t.startswith(LEAK_MARKER):
         t = t[len(LEAK_MARKER):].lstrip()
@@ -3577,12 +3466,33 @@ def parse_leaked_tool_calls(text, allowed_names=None):
         t = _strip_dsml_close_tail(t[:-len(_JSON_FENCE)].rstrip())
     rest = t.strip()
     if not (rest.startswith("[") and rest.endswith("]")):
-        return None, text
+        return None
     try:
         arr = json.loads(rest)
     except Exception:
+        return None
+    if not isinstance(arr, list):
+        return None
+    return arr, prefix
+
+
+def parse_leaked_tool_calls(text, allowed_names=None):
+    """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
+
+    严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
+      1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
+      2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
+      3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
+
+    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为最后一个 marker
+    之前的散文前缀（通常为空串）；未识别时原样返回 text。任一条目不合法即整体
+    失败；部分挽救见 salvage_leaked_tool_calls。
+    """
+    parsed = _leak_echo_array(text)
+    if parsed is None:
         return None, text
-    if not isinstance(arr, list) or not arr:
+    arr, prefix = parsed
+    if not arr:
         return None, text
     calls = []
     for item in arr:
@@ -3591,6 +3501,33 @@ def parse_leaked_tool_calls(text, allowed_names=None):
             return None, text
         calls.append(call)
     return calls, prefix
+
+
+def salvage_leaked_tool_calls(text, allowed_names=None):
+    """部分挽救：外层数组可解析时，保留合法条目、丢弃坏条目。
+
+    返回 (calls, dropped, prefix) | None：
+      - None：不是可识别的 marker + JSON 数组（回落既有 droppable/fail-open 链）；
+      - calls=[]：识别到回声但 0 个合法条目（含空数组）——调用方整块吞掉，
+        只补发 prefix、正常结束，不泄漏、不报错；
+      - calls 非空：calls 为合法条目，dropped 为 [(idx, reason)]，
+        prefix 为 marker 前散文。
+
+    不做损坏修复（丢弃而非猜测）；条目校验与 parse 共用 `_leaked_item_to_call`
+    （判据层唯一副本纪律，见 spec leak-recovery-guards）。
+    """
+    parsed = _leak_echo_array(text)
+    if parsed is None:
+        return None
+    arr, prefix = parsed
+    calls, dropped = [], []
+    for idx, item in enumerate(arr):
+        call, reason = _leaked_item_to_call(item, allowed_names)
+        if call is not None:
+            calls.append(call)
+        else:
+            dropped.append((idx, reason))
+    return calls, dropped, prefix
 
 
 def _leak_body_offset(text):
@@ -4115,11 +4052,6 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                            + json.dumps(other, ensure_ascii=False)
                            + "\n\n").encode("utf-8")
                 continue
-            # issue #37 fail-closed：块虽已「证伪」（后续还有别的字/围栏/DSML
-            # 标签），但内容足以认定是**协议回声 + 内层参数非法**时，绝不能
-            # 当正文补发——直接升级为协议错误（提前判定，不等流末）。
-            if _echo_with_bad_args(hold, allowed_names):
-                raise InvalidToolArguments()
             # issue #49 方向 C：候选被证伪 -> 整段当正文补发，这里同样留痕
             # （形态3「marker + <terminal></terminal> 空壳」就走这条：没有 JSON
             # 可恢复，但必须让发生率可见，而不是静默失真）。
@@ -4169,6 +4101,25 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
 
     if hold is not None:
         calls, clean = parse_leaked_tool_calls(hold, allowed_names)
+        salvaged_empty = False
+        if calls is None:
+            _salv = salvage_leaked_tool_calls(hold, allowed_names)
+            if _salv is not None:
+                calls, _dropped, clean = _salv
+                if calls:
+                    log("salvaged leaked tool-call echo: %d call(s) restored, "
+                        "%d dropped (%s)"
+                        % (len(calls), len(_dropped),
+                           ", ".join("idx=%d:%s" % (i, r)
+                                     for i, r in _dropped)),
+                        level="WARN", tag="chat")
+                else:
+                    salvaged_empty = True
+                    _why = (", ".join("idx=%d:%s" % (i, r)
+                                      for i, r in _dropped)
+                            or "empty array")
+                    log("dropped all leaked tool-call echo: %s" % _why,
+                        level="WARN", tag="chat")
         if calls:
             recovered = True
             log("recovered leaked tool-call echo (%d chars / %d frames -> %d call(s))"
@@ -4182,19 +4133,16 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                 }]})
             if clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
-        elif _echo_with_bad_args(hold, allowed_names):
-            # issue #37（fail-closed）**必须先于 #9/#11 判定**：坏参数块的外层
-            # 数组是**完整合法**的，只是后面跟着 DSML/围栏残片——这会让
-            # _leaked_partial_droppable 误判成"截断回声"并静默吞掉（正常 stop），
-            # 既不是失败语义也不是恢复。判定互斥：真截断的数组 parse 不过，
-            # 走不到这里（仍由 #9 吞掉）。
-            # issue #37（fail-closed）：能确定是工具协议回声（marker + 合法外层
-            # 数组 + 已声明工具名），只是内层 arguments 坏了——不泄漏协议、不
-            # 伪造可执行调用，也**不以普通 stop 结束**，改为协议级失败。
-            log("tool-call echo has invalid JSON arguments (%d chars) — "
-                "failing the turn closed (issue #37)" % len(hold),
-                level="WARN", tag="chat")
-            raise InvalidToolArguments()
+        elif salvaged_empty:
+            # 0 合法条目：整块吞掉，只补发 marker 前散文；不泄漏、不报错。
+            if finished is not None:
+                payload, fin = finished
+                if fin == "tool_calls":
+                    finished = (payload, "stop")
+            else:
+                yield _leak_chunk_frame(meta, {}, "stop")
+            if clean:
+                yield _leak_chunk_frame(meta, {"content": clean})
         elif _leaked_partial_droppable(hold, allowed_names):
             # issue #9：截断的 marker+JSON 回声无法还原成结构化调用，吞掉整段，
             # 绝不把网关内部协议文本透传给终端用户。
@@ -5006,10 +4954,6 @@ def _to_int_status(status):
 
 def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
     """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
-    if isinstance(exc, InvalidToolArguments):
-        # issue #37：坏参数是模型生成内容的问题，**不是账号不可用**——
-        # 记录成账号冷却会让一个健康账号被无辜停用（还会解绑会话）。
-        return
     if not account or not hasattr(account, "note_error"):
         return
     status_int = _to_int_status(getattr(exc, "status", 502))
@@ -5064,8 +5008,6 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             account.note_unknown_failure("envelope HTTP %s" % status_int)
 
 def should_retry_envelope(exc, emitted_bytes, attempt):
-    # issue #37：坏参数是**模型内容问题**，不是瞬时上游故障——绝不自动重发
-    # （否则会重复计费，且下一次很可能同样非法）。客户端想重试由它自己决定。
     """流内错误信封是否值得**重开上游**再试。
 
     关键前提（access log 记 200 而业务错 418 的根因）：上游先以 HTTP200
@@ -5073,8 +5015,6 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
     层重试覆盖不到。只要 **尚未向客户端发出任何字节**、未超预算、且错误属
     瞬时类（418/5xx/provider_error，且非客户端参数错），就值得重开。
     """
-    if isinstance(exc, InvalidToolArguments):
-        return False
     if emitted_bytes:
         return False
     if attempt >= TRANSIENT_MAX_RETRIES:
@@ -5753,18 +5693,33 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         _echo_src = _block16 or ""
         if _echo_src:
             _rec, _clean = parse_leaked_tool_calls(_echo_src, allowed_names)
+            _salvaged_empty = False
+            if _rec is None:
+                _salv = salvage_leaked_tool_calls(_echo_src, allowed_names)
+                if _salv is not None:
+                    _rec, _dropped, _clean = _salv
+                    if _rec:
+                        log("salvaged leaked tool-call echo: %d call(s) "
+                            "restored, %d dropped (%s)"
+                            % (len(_rec), len(_dropped),
+                               ", ".join("idx=%d:%s" % (i, r)
+                                         for i, r in _dropped)),
+                            level="WARN", tag="chat")
+                    else:
+                        _salvaged_empty = True
+                        _why = (", ".join("idx=%d:%s" % (i, r)
+                                          for i, r in _dropped)
+                                or "empty array")
+                        log("dropped all leaked tool-call echo: %s" % _why,
+                            level="WARN", tag="chat")
             if _rec:
                 message["content"] = _head16 + (_clean or "")
                 tool_calls_map = {i: c for i, c in enumerate(_rec)}
-            elif _echo_with_bad_args(_echo_src, allowed_names):
-                # issue #37（fail-closed，**先于 #9/#11**）：外层数组完整合法、
-                # 只是内层参数坏了——不泄漏、不伪造调用，也不拼装成功对象：
-                # 整轮以协议错误失败（HTTP 502）。真截断的数组 parse 不过，
-                # 不会被这里抢走（仍由 #9 吞掉）。
-                log("tool-call echo has invalid JSON arguments (%d chars) — "
-                    "failing the turn closed (issue #37)" % len(_echo_src),
-                    level="WARN", tag="chat")
-                raise InvalidToolArguments()
+            elif _salvaged_empty:
+                # 0 合法条目：整块吞掉，只保留 marker 前散文；正常结束。
+                message["content"] = _head16 + (_clean or "")
+                if finish == "tool_calls":
+                    finish = "stop"
             elif _leaked_partial_droppable(_echo_src, allowed_names):
                 # issue #9：截断的 marker+JSON 回声不还原、也不透传。
                 log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
@@ -6552,19 +6507,32 @@ def stream_responses_events(inner_lines, model, holder):
         leak_calls, leak_clean = (None, text_buffer)
         dropped_leak = False
         dropped_tool_echo = False
-        dropped_bad_args = False
+        salvaged_empty = False
         # issue #16-B1：散文已先发出时 any(text_parts) 为真，但缓冲本身若以
         # 标记开头（切分后剩下的回声块）仍必须走回读/吞掉判定，否则会漏。
         if not any(text_parts) or _marker_starts_at(text_buffer):
             leak_calls, leak_clean = parse_leaked_tool_calls(
                 text_buffer, holder.get("allowed_names"))
-            # issue #37（fail-closed）**先于 #9/#11**：坏参数块的外层数组完整
-            # 合法，带 DSML/围栏残片时会被 _leaked_partial_droppable 误判成
-            # 「截断」并静默吞掉（正常完成）——那既不是失败也不是恢复。
-            if leak_calls is None and _echo_with_bad_args(
-                    text_buffer, holder.get("allowed_names")):
-                dropped_bad_args = True
-            elif leak_calls is None and _leaked_partial_droppable(
+            if leak_calls is None:
+                _salv = salvage_leaked_tool_calls(
+                    text_buffer, holder.get("allowed_names"))
+                if _salv is not None:
+                    leak_calls, _dropped, leak_clean = _salv
+                    if leak_calls:
+                        log("salvaged leaked tool-call echo: %d call(s) "
+                            "restored, %d dropped (%s)"
+                            % (len(leak_calls), len(_dropped),
+                               ", ".join("idx=%d:%s" % (i, r)
+                                         for i, r in _dropped)),
+                            level="WARN", tag="chat")
+                    else:
+                        salvaged_empty = True
+                        _why = (", ".join("idx=%d:%s" % (i, r)
+                                          for i, r in _dropped)
+                                or "empty array")
+                        log("dropped all leaked tool-call echo: %s" % _why,
+                            level="WARN", tag="chat")
+            if leak_calls is None and _leaked_partial_droppable(
                     text_buffer, holder.get("allowed_names")):
                 dropped_leak = True
             elif leak_calls is None and _tool_echo_droppable(
@@ -6577,6 +6545,9 @@ def stream_responses_events(inner_lines, model, holder):
                  "arguments": (c.get("function") or {}).get("arguments") or "{}"}
                 for c in leak_calls)
             calls_rem, clean_rem = None, leak_clean
+        elif salvaged_empty:
+            # 0 合法条目：整块吞掉，只补发 marker 前散文；正常完成。
+            calls_rem, clean_rem = None, leak_clean
         elif dropped_leak:
             # issue #9：截断的 marker+JSON 回声 -> 不输出文本、不走 DSML 回退。
             log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
@@ -6587,13 +6558,6 @@ def stream_responses_events(inner_lines, model, holder):
             log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(text_buffer), level="WARN", tag="chat")
             calls_rem, clean_rem = None, None
-        elif dropped_bad_args:
-            # issue #37（fail-closed）：不输出协议，也不走正常完成——抛错，
-            # 由 Responses 出口发 response.failed。
-            log("tool-call echo has invalid JSON arguments (%d chars) — "
-                "failing the turn closed (issue #37)" % len(text_buffer),
-                level="WARN", tag="chat")
-            raise InvalidToolArguments()
         else:
             calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
             if not calls_rem:

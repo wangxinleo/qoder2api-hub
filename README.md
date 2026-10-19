@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.5--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.5-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.5.6--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.6-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -20,7 +20,7 @@
 - **OAuth 设备授权一键免客户端登录**：PKCE (S256) 设备流（双区 URL 参数按官方差异构造：国内带 `redirect_uri+client_id+machine_id`，国际带 `client_id+machine_id`），点击看板链接在浏览器完成授权即可自动入池；亦支持 PAT (`pt-`) 导入，jobToken 自动交换与轮换。
 - **每日签到与额度体系（双区域 · 真实领取）**：「每日领取 100 Credits」等活动**由网关直接领取**——用桌面端请求头（`Cosy-ClientType: 10` + 机器头，缺了服务端会返回空列表）列出活动 → 对 `CLAIMABLE` 的 Credits 活动 `POST /sash/api/v1/me/campaigns/{id}/claim`（官方幂等：已领返回 `replayed`，不会重复发放）；旧 sash 签到接口仅在仍开放时兜底（能力运行时探测，404 记「本区域无此接口」6 小时后自动重探）；Pro 升级包资格检查与领取、quota/usage 额度与套餐快照实时刷新。
 - **后台常驻定时调度器**：每日整点排程（09:00 / 21:00 签到 · 22:00 Token 集中保活），`drt-` / `jrt-` 按前缀路由刷新，PAT 最终兜底。
-- **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译、DSML 工具调用回退解析，以及**泄漏文本回读**（模型把历史工具调用序列化复述成正文时，流式/非流式/Responses 三链路都还原为结构化 `tool_calls`；若回声被**截断**无法还原，则按严格判据吞掉、绝不把内部标记透给用户；若外层数组完整但内层参数损坏，则按 issue #37 **协议级 fail-closed**，不执行任何部分调用；普通回复一律 fail-open 不吞正文）。
+- **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译、DSML 工具调用回退解析，以及**泄漏文本回读**（模型把历史工具调用序列化复述成正文时，流式/非流式/Responses 三链路都还原为结构化 `tool_calls`；若回声被**截断**无法还原，则按严格判据吞掉、绝不把内部标记透给用户；若外层数组完整但内层条目损坏，则**保留合法条目、丢弃坏条目**并 WARN 留痕；0 合法条目整块吞掉，不泄漏格式码、不以 error 中止回合；普通回复一律 fail-open 不吞正文）。
 - **现代化 Web 看板**：弹性指标卡片、签到与福利中心、模型能力清单、性能指标与用量透视、实时请求流水与运行日志。
 
 > ⚡ 本项目架构与交互对齐 WorkBuddy2API-Hub，上游协议替换为 Qoder COSY 签名体系。
@@ -499,7 +499,20 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 完整说明见 [Releases](https://github.com/wangxinleo/qoder2api-hub/releases)。
 
+### v1.5.6-wangxinleo
+
+**⚠️ 行为变更（回退上游 #37 fail-closed）**
+
+- **坏参数回声恢复 partial salvage**：外层数组可解析时，保留合法工具调用、丢弃坏条目（WARN 带 idx/reason），`finish_reason=tool_calls`；不再返回 `error` / 502 / `response.failed` / `event: error`。
+- **0 合法 / 空数组**：整块吞掉，只保留 marker 前散文，正常 `finish=stop`；不泄漏格式码、不中止回合。
+- **与上游 #37 有意分歧**：后续同步上游时保留 fork 的 salvage 语义；上游 fail-closed 测试不再适用。
+- 保留 #49 散文 / 双 marker、#47 `tool_call.id`、#48 前缀稳定、企业 PAT/VPC 与 `enterprise_first`。
+
+**验证**：新增 `tests/_test_echo_salvage_fork.py`（75 条：事故样本 3 还原 / 1 弃、8 分块 × 2 轮、四出口、0 合法 / 空数组吞掉、混合未声明、#49 正例）；全量 **43 suites / 1466 checks** 连续 3 轮全绿。
+
 ### v1.5.5-wangxinleo
+
+> 注：本版引入的 #37 fail-closed 已在 v1.5.6 按用户决定回退为 partial salvage。
 
 **⚠️ 行为变更（上游 #37）**
 

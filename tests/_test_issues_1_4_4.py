@@ -59,7 +59,7 @@ check("#42 守恒：input_tokens + cache_read == prompt_tokens",
       _u.get("input_tokens", 0) + _u.get("cache_read_input_tokens", 0) == 100, _u)
 
 # ---------------------------------------------------------------- #37
-print("[37] 内层 arguments 非法的协议回声")
+print("[37] 内层 arguments 非法的协议回声（v1.5.6 partial salvage）")
 _GOOD = json.dumps({"file_path": "D:/x.txt", "content": "ok"},
                    ensure_ascii=False)
 _BAD_LF = '{"file_path":"D:/x.txt","content":"line one\nline two"}'
@@ -67,66 +67,61 @@ _BAD_QUOTE = '{"file_path":"D:/x.txt","content":"say "hi""}'
 _MK = P.LEAK_MARKER
 
 
-def _echo(args):
-    return _MK + "\n" + json.dumps([{"name": "Write", "arguments": args}],
+def _echo(args, name="Write"):
+    return _MK + "\n" + json.dumps([{"name": name, "arguments": args}],
                                    ensure_ascii=False)
 
 
-check("#37 合法参数：不判为 bad-args",
-      not P._echo_with_bad_args(_echo(_GOOD), {"Write"}))
-check("#37 内层真实 LF：判为 bad-args",
-      P._echo_with_bad_args(_echo(_BAD_LF), {"Write"}))
-check("#37 内层未转义引号：判为 bad-args",
-      P._echo_with_bad_args(_echo(_BAD_QUOTE), {"Write"}))
-check("#37 内层截断（缺右花括号）：判为 bad-args",
-      P._echo_with_bad_args(_echo('{"file_path":"D:/x.txt"'), {"Write"}))
-check("#37 尾部多余文本：判为 bad-args",
-      P._echo_with_bad_args(_echo(_GOOD + " trailing"), {"Write"}))
-check("#37 未声明工具名：不判（避免把普通示例当错误）",
-      not P._echo_with_bad_args(
-          _MK + "\n" + json.dumps([{"name": "Nope",
-                                    "arguments": _BAD_LF}],
-                                  ensure_ascii=False), {"Write"}))
-check("#37 普通散文讨论 marker：不判",
-      not P._echo_with_bad_args("说明 " + _MK + " 的用法", {"Write"}))
-check("#37 合法 JSON 示例（无 marker）：不判",
-      not P._echo_with_bad_args('A JSON example: [{"content":"probe"}]',
-                                {"Write"}))
-# fail-closed（v1.5.1）：坏参数必须抛协议错误，而不是「说明 + 普通 stop」
+_salv_good = P.salvage_leaked_tool_calls(_echo(_GOOD), {"Write"})
+check("#37 合法参数：salvage 1 还原 / 0 弃",
+      _salv_good is not None and len(_salv_good[0]) == 1
+      and _salv_good[1] == [], _salv_good)
+for _label, _args in (("内层真实 LF", _BAD_LF),
+                      ("内层未转义引号", _BAD_QUOTE),
+                      ("内层截断（缺右花括号）", '{"file_path":"D:/x.txt"')):
+    _salv = P.salvage_leaked_tool_calls(_echo(_args), {"Write"})
+    check("#37 %s：0 合法 -> 丢弃（args-not-json）" % _label,
+          _salv is not None and _salv[0] == []
+          and _salv[1] == [(0, "args-not-json")], _salv)
+check("#37 内层尾部多余文本：0 合法 -> 丢弃（args-not-json）",
+      (lambda s: s is not None and s[0] == []
+       and s[1] == [(0, "args-not-json")])(
+           P.salvage_leaked_tool_calls(_echo(_GOOD + " trailing"),
+                                       {"Write"})))
+check("#37 未声明工具名：0 合法 -> 丢弃（undeclared-name）",
+      (lambda s: s is not None and s[0] == []
+       and s[1] == [(0, "undeclared-name")])(
+           P.salvage_leaked_tool_calls(_echo(_GOOD, name="Nope"),
+                                       {"Write"})))
+check("#37 普通散文讨论 marker：不识别",
+      P.salvage_leaked_tool_calls("说明 " + _MK + " 的用法", {"Write"})
+      is None)
+check("#37 合法 JSON 示例（无 marker）：不识别",
+      P.salvage_leaked_tool_calls('A JSON example: [{"content":"probe"}]',
+                                  {"Write"}) is None)
+
+# v1.5.6：坏参数不再 fail-closed；整块吞掉、finish=stop、零泄漏
 _stream = _echo(_BAD_LF)
 _frames37 = [("data: " + json.dumps(
     {"id": "c", "model": "m", "choices": [{"index": 0,
      "delta": {"content": _stream}, "finish_reason": "stop"}]},
     ensure_ascii=False) + "\n\n").encode("utf-8")]
 _out37 = []
-_raised37 = None
-try:
-    for f in P.recover_leaked_tool_calls(iter(_frames37), {"Write"}):
-        d = P.strip_data_prefix(f.decode("utf-8", "replace"))
-        if d and d != "[DONE]":
-            _out37.append(json.loads(d))
-except P.InvalidToolArguments as exc:
-    _raised37 = exc
+for f in P.recover_leaked_tool_calls(iter(_frames37), {"Write"}):
+    d = P.strip_data_prefix(f.decode("utf-8", "replace"))
+    if d and d != "[DONE]":
+        _out37.append(json.loads(d))
 _txt37 = "".join(((_o.get("choices") or [{}])[0].get("delta") or {})
                  .get("content") or "" for _o in _out37)
 _calls37 = [c for _o in _out37
             for c in (((_o.get("choices") or [{}])[0].get("delta") or {})
                       .get("tool_calls") or [])]
 _fins37 = [(_o.get("choices") or [{}])[0].get("finish_reason") for _o in _out37]
-check("#37 流末：坏参数抛 InvalidToolArguments（status 502）",
-      isinstance(_raised37, P.InvalidToolArguments)
-      and _raised37.status == 502, _raised37)
-check("#37 流末：抛出前零 tool_calls（不伪造可执行调用）",
-      _calls37 == [], _calls37)
-check("#37 流末：抛出前协议文本零泄漏（marker/arguments 都不出现）",
+check("#37 流式：坏参数不再抛错、0 tool_calls", _calls37 == [], _calls37)
+check("#37 流式：协议文本零泄漏（marker/arguments 都不出现）",
       _MK not in _txt37 and "file_path" not in _txt37, _txt37[:80])
-check("#37 流末：抛出前没有正常结束帧（不以 stop/tool_calls 结束）",
-      not any(f in ("stop", "tool_calls") for f in _fins37 if f), _fins37)
-check("#37 错误详情是固定串（不含参数/路径/正文）",
-      _raised37 is not None
-      and _raised37.detail == P.BAD_ARGS_ERROR_DETAIL
-      and "file_path" not in _raised37.detail, 
-      getattr(_raised37, "detail", None))
+check("#37 流式：整块吞掉后正常 finish=stop",
+      any(f == "stop" for f in _fins37 if f), _fins37)
 
 # ---------------------------------------------------------------- #38
 print("[38] 排队信号 -> 等待重试")

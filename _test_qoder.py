@@ -2712,9 +2712,12 @@ check("流式：以 [ 开头但被证伪 -> 原样补发正文，不改 finish",
 
 _frames27c = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
     iter([_raw27(_LEAK27), _raw27("", "stop")]), {"other_tool"})]
-check("流式：未声明工具名 -> 不吞正文，按普通文本透传",
+check("流式：未声明工具名 -> 整块吞掉，零泄漏，finish=stop",
       "".join(_f["choices"][0]["delta"].get("content") or ""
-              for _f in _frames27c) == _LEAK27, _frames27c)
+              for _f in _frames27c) == ""
+      and _frames27c[-1]["choices"][0]["finish_reason"] == "stop"
+      and P.LEAK_MARKER not in json.dumps(_frames27c, ensure_ascii=False),
+      _frames27c)
 
 # --- issue #36：marker + JSON 数组之后漏出 DSML 闭合标签残片 ---
 # 修复前整段被当正文补发（finish=stop、工具不执行）；修复后恢复为

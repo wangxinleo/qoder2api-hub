@@ -231,29 +231,31 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
-**基线（2026-10-19 · 上游 v1.4.2–v1.5.2 同步 + v1.5.5 fail-closed）**：
+**基线（2026-10-19 · 上游 v1.4.2–v1.5.2 同步 + v1.5.6 partial salvage）**：
 
 | 口径 | 数值 |
 |---|---|
-| 套件数 | **44 suites** |
-| 全部断言 | **1619 checks** |
+| 套件数 | **43 suites** |
+| 全部断言 | **1466 checks** |
 | 结果 | 0 failed / exit 0 |
 | 前端九套件小计 | **158**（19/9/23/19/20/15/31/10/12） |
 | legacy 套件 | 665（其中 4 条 SKIP，语义见 `_test_qoder.py` 的 SUMMARY 说明） |
 
 > 本版新增/变更：
-> - `_test_echo_failclosed_fork.py`（123 条）替换已退役的 `_test_echo_salvage.py`：
->   2026-10-16 事故样本（1273 字符，4 条调用、item[0] 转义损坏）在 **8 种分块 × 3 轮**
->   下均 fail-closed；chat 流式 / 非流式 / Responses / Anthropic 四出口；
->   混合批次 0 部分执行；合法回声与长会话双 marker + DSML 尾正例。
-> - 上游新增 8 个套件（`_test_issue37_fail_closed.py` 103、`_test_issue47_49.py` 22、
->   `_test_prefix_stability.py` 12、`_test_stream_tool_ids.py` 12、
->   `_test_credits_refresh.py` 27、`_test_usage_daily.py` 31、
->   `_test_panel_session_persist.py` 21、`_test_issues_1_4_4.py` 41）。
+> - `_test_echo_salvage_fork.py`（75 条）替代 v1.5.5 的 fail-closed 套件：
+>   2026-10-16 事故样本（1273 字符，4 条调用、item[0] 转义损坏）在 **8 种分块 × 2 轮**
+>   下均 **3 还原 / 1 弃**；0 合法 / 空数组整块吞掉；chat 流式 / 非流式 /
+>   Responses / Anthropic 四出口；混合未声明名；#49 正例。
+> - 移除 `_test_echo_failclosed_fork.py`、`_test_issue37_fail_closed.py`、
+>   `manual_issue37_e2e.py`（v1.5.6 不再采用上游 #37 fail-closed）。
+> - 上游保留套件：`_test_issue47_49.py` 22、`_test_prefix_stability.py` 12、
+>   `_test_stream_tool_ids.py` 12、`_test_credits_refresh.py` 27、
+>   `_test_usage_daily.py` 31、`_test_panel_session_persist.py` 21、
+>   `_test_issues_1_4_4.py` 39（#37 段改写为 salvage 语义）。
 > - 额度口径对齐上游：`remain/size` 只算套餐，`shared` 单列，护栏/汇总/面板走
 >   `remain_effective`；企业资源包在 packages 中沿用「企业资源包」名称。
 > - 环境里若存在 `NO_PROXY=127.0.0.1` 类变量，`_test_proxy_policy.py` 的 3 条
->   「死代理必失败」断言会误报（与代码无关）；`env -u NO_PROXY -u no_proxy` 后 44/44 全绿。
+>   「死代理必失败」断言会误报（与代码无关）；`env -u NO_PROXY -u no_proxy` 后 43/43 全绿。
 
 **基线（2026-10-16 · 企业优先派单 + 轮询公平性修复）**：
 
