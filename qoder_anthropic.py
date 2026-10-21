@@ -31,8 +31,10 @@ EFFORT_RANK = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4,
                "xhigh": 5, "max": 6}
 _EFFORT_ORDER = tuple(sorted(EFFORT_RANK, key=lambda k: EFFORT_RANK[k]))
 # budget_tokens 断点 -> 档位（设计文档 §4.2）
+# issue #62：原来最高只到 high，budget 传多大都够不到 max。补一档：
+# <=1024 minimal / <=4096 low / <=16384 medium / <=32768 high / 更大 max。
 BUDGET_STEPS = ((1024, "minimal"), (4096, "low"), (16384, "medium"),
-                (None, "high"))
+                (32768, "high"), (None, "max"))
 _STOP_REASON = {"stop": "end_turn", "length": "max_tokens",
                 "tool_calls": "tool_use", "function_call": "tool_use"}
 
@@ -119,6 +121,33 @@ def _tool_choice_to_chat(tc):
     return "auto"
 
 
+def msg_system_mode():
+    """messages 内 system 的处理方式（issue #55）。
+
+    inline（默认）：把它就地降级成一条 user 消息 —— 信息不丢，但**不污染**最前面的
+                    system 前缀，缓存前缀因此逐轮稳定。
+    merge         ：旧行为（合并进最前面的 system）。会用「每轮都变的动态内容」
+                    污染缓存前缀，长会话命中率可从 92% 掉到 15%，仅兼容保留。
+    drop          ：直接丢弃（不推荐，会丢信息）。
+    环境变量 QD_ANTHROPIC_MSG_SYSTEM 控制。
+    """
+    raw = str(os.environ.get("QD_ANTHROPIC_MSG_SYSTEM") or "").strip().lower()
+    if raw in ("merge", "top", "legacy"):
+        return "merge"
+    if raw in ("drop", "off", "none"):
+        return "drop"
+    return "inline"
+
+
+def count_msg_system(payload):
+    """messages 里有几条 system（指纹用；issue #55）。"""
+    n = 0
+    for m in (payload or {}).get("messages") or []:
+        if isinstance(m, dict) and m.get("role") == "system":
+            n += 1
+    return n
+
+
 def system_prompt_of(payload):
     """system 三形态合并（顶层字符串 / 顶层数组 / messages 内 system）。
 
@@ -135,11 +164,16 @@ def system_prompt_of(payload):
         t = _text_of_blocks(sysv)
         if t.strip():
             parts.append(t)
-    for m in payload.get("messages") or []:
-        if isinstance(m, dict) and m.get("role") == "system":
-            t = _text_of_blocks(m.get("content"))
-            if t.strip():
-                parts.append(t)
+    if msg_system_mode() == "merge":
+        # 旧行为（仅 QD_ANTHROPIC_MSG_SYSTEM=merge）：合并进最前面的 system。
+        # 注意它的副作用：messages 内 system 往往是**每轮都变**的动态内容
+        # （时间、工具清单、skills、context 用量），合并后缓存前缀逐轮不同，
+        # 上游前缀缓存从第 0 字节就匹配失败（issue #55 实测 92% -> 14.7%）。
+        for m in payload.get("messages") or []:
+            if isinstance(m, dict) and m.get("role") == "system":
+                t = _text_of_blocks(m.get("content"))
+                if t.strip():
+                    parts.append(t)
     return "\n\n".join(parts)
 
 
@@ -179,19 +213,29 @@ def effort_from_anthropic(payload, catalog_meta=None, supported=None):
       · 档位表为空 -> None（保持「不猜测」语义）
     """
     th = payload.get("thinking")
+    oc = payload.get("output_config")
+    _oc_effort = None
+    if isinstance(oc, dict) and oc.get("effort"):
+        _cand = str(oc["effort"]).strip().lower()
+        _oc_effort = _cand if _cand in EFFORT_RANK else None
     if not isinstance(th, dict):
-        oc = payload.get("output_config")
-        if isinstance(oc, dict) and oc.get("effort"):
-            th = {"type": "enabled", "budget_tokens": None,
-                  "effort": oc.get("effort")}
-        else:
+        # 完全没有 thinking：只有 output_config.effort 也能决定档位
+        if not _oc_effort:
             return None
+        th = {"type": "enabled", "budget_tokens": None,
+              "effort": _oc_effort}
     if str(th.get("type") or "").lower() == "disabled":
         return None
     target = None
     if th.get("effort"):
         cand = str(th["effort"]).strip().lower()
         target = cand if cand in EFFORT_RANK else None
+    if target is None:
+        # issue #62：Claude Code 对**第三方模型名**发的是
+        #   thinking={"type":"adaptive"} + output_config={"effort":"low|medium|high|max"}
+        # adaptive 是合法 dict 但没有 effort/budget_tokens，旧实现因此跳过
+        # output_config 分支 -> 四档全部映射成 None（静默固定跑默认档=max）。
+        target = _oc_effort
     if target is None:
         budget = th.get("budget_tokens")
         if budget is None:
@@ -256,7 +300,17 @@ def messages_to_chat(payload, catalog_meta=None, supported=None):
             continue
         role = str(m.get("role") or "user")
         if role == "system":
-            continue                    # 已由 system_prompt_of 合并（不丢弃，只上提）
+            _mode = msg_system_mode()
+            if _mode == "merge":
+                continue                # 旧行为：已由 system_prompt_of 上提合并
+            if _mode == "drop":
+                continue                # 显式丢弃
+            # inline（默认，issue #55）：**就地**降级成 user，位置不变。
+            # 这样动态内容既没丢，也不会被抬到最前面把缓存前缀换成每轮不同的字节。
+            _txt = _text_of_blocks(m.get("content"))
+            if _txt.strip():
+                messages.append({"role": "user", "content": _txt})
+            continue
         content = m.get("content")
         if isinstance(content, str):
             blocks = [{"type": "text", "text": content}]

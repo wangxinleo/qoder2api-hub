@@ -5,6 +5,7 @@ accounts/*
 
 # 运行时数据：请求流水与指标快照
 usage/
+backups/
 
 # ---- Python 运行产物 ----
 __pycache__/
@@ -14,6 +15,7 @@ __pycache__/
 # ---- 本地工具 / 临时文件 ----
 .mimosa/
 .team/
+qoder-proxy.pid
 
 # ---- 自动提取的原生组件（体积大、平台相关，由 _install_umid.py 生成）----
 umid/

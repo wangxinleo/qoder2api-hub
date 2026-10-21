@@ -64,8 +64,13 @@ REALM_CONFIGS = {
         "openapi": "https://openapi.qoder.sh",
         # 推理主机取自 0.4.3 客户端的 endpoint 缓存/内置候选（api1 主选，
         # api2/api3 为官方故障切换域名）：api1 连不上时按顺序切换。
-        "gateway": "https://api1.qoder.sh",
-        "gateway_fallbacks": ("https://api2.qoder.sh", "https://api3.qoder.sh"),
+        # issue #64（逆向官方 0.4.8 的 endpoint 缓存）：国际版把推理与“安全推理”
+        # 拆成两个集群——inference=api3、securityInference=api2；api1 已不在官方
+        # 候选首位（本机实测也常年超时）。这里按官方顺序对齐：api3 主、api2/api1 备。
+        "gateway": os.environ.get("QD_INTL_GATEWAY") or "https://api3.qoder.sh",
+        "gateway_fallbacks": ("https://api2.qoder.sh", "https://api1.qoder.sh"),
+        # 官方另有 securityInference 用途端点（intl=api2）；网关不主动调用，仅记录。
+        "security_inference": "https://api2.qoder.sh",
         "website": "https://qoder.com",
         "client_id": "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
         "redirect_uri": "qoder://aicoding.aicoding-agent/login-success",
@@ -307,7 +312,7 @@ def run_runtime_info(realm, account_id=""):
         _runtime_info_warn(
             "exec:" + type(exc).__name__,
             "无法执行 %s：%s: %s（组件存在但跑不起来；Docker/alpine 需要 "
-            "gcompat libstdc++ libgcc 兼容层，见 README 已知限制）"
+            "gcompat libstdc++ libgcc 兼容层，见 docs/troubleshooting.md 已知限制）"
             % (exe, type(exc).__name__, exc))
     except Exception as exc:
         # 其它失败（超时 / 输出不是 JSON / 非 OSError 异常）
@@ -857,6 +862,14 @@ def normalize_epoch(value):
     return int(number)
 
 
+def shared_unlimited(credits):
+    """共享池是否是「不设上限」（cap=-1，issue #67）。"""
+    if not isinstance(credits, dict):
+        return False
+    shared = credits.get("shared")
+    return bool(isinstance(shared, dict) and shared.get("unlimited"))
+
+
 def effective_remain(credits):
     """有效余额 = 套餐 remain + 可用的共享池 remain（issue #39）。
 
@@ -1172,7 +1185,7 @@ def _retryable(exc):
 # 现建 opener——没有「首次请求固化」，用户中途开关代理立即生效。
 #
 # 依赖系统代理才能上网的用户：设 HTTPS_PROXY=http://127.0.0.1:7897 即可恢复
-# （README「系统代理（Windows）」节有完整说明）；TUN / fake-ip 型代理（Clash
+# （docs/deployment.md「出口代理」节有完整说明）；TUN / fake-ip 型代理（Clash
 # 等）在网络层透明转发，无需任何设置。
 _PROXY_SCHEMES = (("https", ("HTTPS_PROXY", "https_proxy")),
                   ("http", ("HTTP_PROXY", "http_proxy")),
@@ -1207,6 +1220,24 @@ def _opener_for_request():
     """
     proxies = _proxy_map_from_env()
     return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
+def upstream_clock_skew(timeout=4.0):
+    """用上游 Date 头测本机时钟漂移（秒）。无鉴权、只发 HEAD、走代理感知 opener。
+
+    issue #64：COSY 签名带时间戳，容器时钟漂移会直接 401；这是「容器里莫名失效」
+    的常见原因，必须在启动自检里看得见。失败返回 None（fail-open）。
+    """
+    from email.utils import parsedate_to_datetime
+    try:
+        req = urllib.request.Request("https://openapi.qoder.com.cn/", method="HEAD")
+        with _opener_for_request().open(req, timeout=timeout) as resp:
+            date_hdr = resp.headers.get("Date")
+        if not date_hdr:
+            return None
+        return int(parsedate_to_datetime(date_hdr).timestamp() - time.time())
+    except Exception:
+        return None
 
 
 def http_json(url, data=None, method=None, headers=None, timeout=30,
@@ -1244,6 +1275,8 @@ class Account(object):
         self.path = path
         self.uid = str(data.get("uid") or "")
         self.nickname = str(data.get("nickname") or "")
+        # issue #69：账号备注（纯展示，不参与任何判定）
+        self.note = str(data.get("note") or "")
         self.domain = str(data.get("domain") or "")
         self.realm = str(data.get("realm") or detect_realm_from_domain(self.domain))
         if self.realm not in REALM_CONFIGS:
@@ -1273,6 +1306,12 @@ class Account(object):
         self.credits_refresh_error = ""
         self.credits_refresh_failures = 0
         self.credits_refresh_next = 0.0
+        # issue #56：团队/企业账号的自用保护（并发闸门 + 最小间隔 + 客户端统计）。
+        # 全部是**内存态**，不落盘，不影响凭证文件格式。
+        self._team_lock = threading.Lock()
+        self.team_leases = {}
+        self.team_last_start = 0.0
+        self.team_client_ips = {}
         # issue #40 后续：最近一次「上游返回全 0 退化体」的降级标记（面板显示 0*）
         self.credits_degraded = data.get("creditsDegraded") or None
         # ---- task-61：账号级预算护栏状态（默认全关；计数 None = 未知 -> fail-open）----
@@ -1351,6 +1390,7 @@ class Account(object):
             "organizationId": self.organization_id,
             "organizationName": self.organization_name,
             "enterpriseDomain": self.enterprise_domain,
+            "note": self.note,
         }
 
     def public(self):
@@ -1414,6 +1454,10 @@ class Account(object):
             "enterpriseDomain": self.enterprise_domain,
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": derive_id(self.uid, "session"),
+            # issue #74：#69 只给 to_dict（写文件/导出）加了 note，public()
+            # （面板 /accounts 的数据源）漏了——保存后当场能看见，15 秒后
+            # 轮询覆盖就消失。纯展示字段，加进来没有副作用。
+            "note": self.note,
         }
 
     def save(self, directory):
@@ -1481,6 +1525,10 @@ class Account(object):
             return False
         # issue #39：团队账号「套餐已用满 + 共享池仍有余额」按有效余额判定，
         # 否则共享额度白有、账号被误停。
+        if shared_unlimited(cred):
+            # issue #67：组织共享池 cap=-1（不设上限）——地板护栏不该拦，
+            # 而且必须是**显式**语义，不能靠「数字很大所以碰巧没触发」。
+            return False
         remain = effective_remain(cred)
         if remain is None:
             return False
@@ -1687,6 +1735,11 @@ class Account(object):
             return False
         cred = self.credits
         # issue #39：团队账号可能套餐 remain=0 但共享池仍有余额——按有效余额解封。
+        if shared_unlimited(cred):
+            # issue #67：无限共享池 = 有可用额度，402 停放应立即解除。
+            self.balance_until = 0.0
+            self.balance_reason = ""
+            return True
         remain = effective_remain(cred)
         try:
             if remain is None or float(remain) <= 0:
@@ -1824,7 +1877,12 @@ class Account(object):
         h = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
-            "User-Agent": CLIENT_UA,
+            # UA 必须与所属区域的官方客户端一致。此前这里用全局 CLIENT_UA
+            # （Go 语言 HTTP 客户端的默认值 "Go-http-client/2.0"），而 Qoder
+            # 官方客户端是 Electron/Node 应用，绝不可能发出这个 UA —— 等于在
+            # 每个 openapi 请求上自报「我是脚本」。REALM_CONFIGS 里本来就有
+            # 官方 UA（CN: QoderWork/1.1.64，INTL: Qoder/1.1.64），直接用。
+            "User-Agent": cfg.get("ua") or CLIENT_UA,
             "Authorization": "Bearer " + self.access_token,
             "X-Request-ID": generate_request_id(self.uid),
             "X-Machine-ID": derive_id(self.uid, "machine"),
@@ -1950,7 +2008,8 @@ class Account(object):
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": CLIENT_UA,
+            # 与 headers() 同口径：token 刷新同样要发官方客户端 UA。
+            "User-Agent": get_realm_config(self.realm).get("ua") or CLIENT_UA,
         }
         try:
             data = http_json(url, data=json.dumps(payload).encode(), method="POST",
@@ -2751,6 +2810,8 @@ class Account(object):
                 shared = {
                     "remain": int(_num(_src, "remaining")),
                     "used": int(_num(_src, "used")),
+                    # issue #67：cap=-1 是「不设上限」的哨兵值，不是真实额度；
+                    # remaining 往往只是占位填数（used 恒 0、同组织各账号回显一致）。
                     "size": int(_num(_src, "cap") or _num(_src, "total")),
                     # 缺键 = "没声明不可用" = 可用（与原 bool(_src.get("available", True)) 等价）；
                     # 显式 null / "false" / 0 = 不可用。写成 .get(k, True) + 默认 True
@@ -2760,6 +2821,9 @@ class Account(object):
                     "source": _key,
                     **_expiry_of(_src),
                 }
+                if shared["size"] < 0:
+                    # 无限池：display 与护栏都不应把占位的 remaining 当余额
+                    shared["unlimited"] = True
                 break
             if isinstance(_src, (int, float)) and not isinstance(_src, bool):
                 shared = {"remain": int(_src), "used": 0, "size": int(_src),
@@ -2789,7 +2853,8 @@ class Account(object):
         # ——有效余额 = 套餐 remain + 可用的共享 remain。护栏与汇总按它判断，
         # 否则「套餐用满但共享池还有 952」会被误判为余额耗尽。
         _shared_avail = (shared.get("remain") or 0) \
-            if (shared and shared.get("available", True)) else 0
+            if (shared and shared.get("available", True)
+                and not shared.get("unlimited")) else 0
         remain_effective = int(remain + _shared_avail)
         self.credits = {
             "remain": remain,
@@ -3845,7 +3910,7 @@ class AccountPool(object):
             # URL 校验由 http_json 内部执行、失败仍由外层 except 兜底。
             ui = http_json(ui_url, method="GET", headers={
                 "Accept": "application/json",
-                "User-Agent": CLIENT_UA,
+                "User-Agent": cfg.get("ua") or CLIENT_UA,
                 "Authorization": "Bearer " + token,
             }, timeout=15, retries=1)
             uid = str(ui.get("id") or uid)
@@ -3905,7 +3970,7 @@ class AccountPool(object):
                              method="POST",
                              headers={"Content-Type": "application/json",
                                       "Accept": "application/json",
-                                      "User-Agent": CLIENT_UA},
+                                      "User-Agent": cfg.get("ua") or CLIENT_UA},
                              timeout=30)
             token = data.get("token") or ""
         except Exception as exc:
@@ -3921,7 +3986,7 @@ class AccountPool(object):
         try:
             ui = http_json(base + PATH_USERINFO, method="GET",
                            headers={"Accept": "application/json",
-                                    "User-Agent": CLIENT_UA,
+                                    "User-Agent": cfg.get("ua") or CLIENT_UA,
                                     "Authorization": "Bearer " + token},
                            timeout=15, retries=2)
             uid = str(ui.get("id") or "")

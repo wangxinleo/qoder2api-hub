@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.6--wangxinleo-2496ED?style=flat-square" alt="Version 1.5.6-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.6.1--wangxinleo-2496ED?style=flat-square" alt="Version 1.6.1-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -14,7 +14,7 @@
 - **开箱即用**：双击批处理脚本（Windows）或运行 `./start-qoder-proxy.sh`（Linux / macOS）即启；亦支持 Docker 容器化部署，零外部 pip 依赖。
 - **本机已登录凭证一键入池（双区）**：只读探测桌面 App（`auth.v1.dat`，os_crypt/DPAPI 解密）与 Qoder CLI（`~/.qoder*/.auth/user`，AES-128-CBC）两类官方存储，看板两步确认导入，永不静默采用。
 - **模型清单完全跟官方走（双区不同、以官方此刻为准）**：三源优先级 —— 动态 `/algo/api/v2/model/list`（COSY 签名，**GET 需携带与签名一致的 `{}` body，否则 403**）> 本机官方客户端模型目录缓存（`~/.qoder*/.models/<uid>/catalog-v6`，QMC/HKDF+AES-256-GCM 解密）> 双区官方快照文件（`qoder_catalog_intl.json`/`qoder_catalog_cn.json`，`python _refresh_catalog.py` 一键随客户端更新）；清单**以动态源返回的集合为准**（官方桌面版此刻显示什么这里就显示什么，如国际版动态 15 条就不多塞静态独有的 `smodel/cmodel`）。**逐字段忠实保留**：`id` = **官方模型名**（如 `Qwen3.8-Max`，客户端唯一需要填的值；`upstream_key`/`aliases` 同时给出 key、`key (Name)` 与人类别名等全部可填形式）、官方桌面版介绍文案（`description`，取自客户端 dynamic-text）、本地化名（`name_local`，如 Ultimate→极致）、`context_config` 多窗口（200K 默认/400K/1M）、`thinking_config` 思考档位（low/medium/high/xhigh/max + 默认标注 + 可关闭）、**峰谷价**（`price_factor_peak` 促销前倍率 → `price_factor_valley` 谷时倍率 + `off_peak` 时段窗口 22:00-08:00 与官方错峰文案）、`is_free/is_new`；官方 `enable=false` 条目不过滤，附**官方原文禁用原因**（`disabled_reason = "需要升级或购买千问官方套餐开放"`，并透传上游 `disabled_message_key`）。**最大输出**：官方 catalog 与动态接口原始响应均无此字段，故不再输出/展示任何编造值。
-- **双区域独立路由**：支持 🌐 国际版 (qoder.com / api1.qoder.sh，备用 api2/api3 自动故障切换) 与 🇨🇳 国内版 (qoder.com.cn / gateway.qoder.com.cn) 独立配置与管理，区域独占模型（如国内 `q37fmodel`/`glm-5.2`、国际 `smodel`/`ultimate`）自动路由到归属出口并拦截错配 Key，看板一键切换且状态落盘持久化。
+- **双区域独立路由**：支持 🌐 国际版 (qoder.com / api3.qoder.sh 主用，api2/api1 备用自动故障切换) 与 🇨🇳 国内版 (qoder.com.cn / gateway.qoder.com.cn) 独立配置与管理，区域独占模型（如国内 `q37fmodel`/`glm-5.2`、国际 `smodel`/`ultimate`）自动路由到归属出口并拦截错配 Key，看板一键切换且状态落盘持久化。
 - **COSY 签名推理链路**：RSA 包裹 AES 会话密钥 + MD5 请求签名 + 自定义 Base64 请求体编码，纯标准库实现（含 AES-128/256、RSA-PKCS1v15、GCM、DPAPI、QMC 纯 Python 实现，Docker alpine 下同样零依赖），逆向对齐官方桌面/CLI 客户端协议。
 - **稳定物理设备指纹隔离 (`derive_id`)**：以账号自身 UID 稳定哈希派生专属 `cosy-machineid` / `cosy-machinetoken` / 会话标识，同一账号长期固定在同一台虚拟物理设备，天然防多号关联风控。
 - **OAuth 设备授权一键免客户端登录**：PKCE (S256) 设备流（双区 URL 参数按官方差异构造：国内带 `redirect_uri+client_id+machine_id`，国际带 `client_id+machine_id`），点击看板链接在浏览器完成授权即可自动入池；亦支持 PAT (`pt-`) 导入，jobToken 自动交换与轮换。
@@ -59,7 +59,7 @@
 > python _diag_gateway.py --chat   # 端口 → /health → /v1/models → 真实流式，逐项报出断在哪
 > python _diag_campaign.py         # 签到/活动链路体检（含本机虚拟化状态，中文输出）
 > ```
-> - **生命周期就是那个窗口**（刻意的设计）：窗口开着网关就活着，**关掉窗口（或 Ctrl+C）网关即停**，不会有后台残留进程；下次要用重新运行启动脚本即可。
+> - **Windows 启动脚本为分离启动**：关掉启动窗口网关继续运行，用 `stop-qoder-proxy.bat` 按 PID 精确停止；Linux / macOS 脚本仍在前台运行，Ctrl+C 或关闭终端即停。
 > - 判别口诀：日志时间戳停在某一刻、此后再无 `POST /v1/chat/completions` = 网关已停；重新运行启动脚本即可恢复。
 
 > ℹ️ 默认端口 **8790**（8788 被 `mimo-api-proxy.mjs` 占用，8789 为 wb-proxy 默认）。改端口：`start-qoder-proxy.bat 8791` / `./start-qoder-proxy.sh 8791`。
@@ -92,7 +92,7 @@
 
 - **添加与在线生成**：看板「设置」页，输入名称 + 一键生成随机 Key；
 - **出口自由绑定**：
-  - 🌐 **国际版出口**：该 Key 流量强制走 `api1.qoder.sh`（连不上自动切 api2/api3）
+  - 🌐 **国际版出口**：该 Key 流量强制走 `api3.qoder.sh`（连不上自动切 api2/api1）
   - 🇨🇳 **国内版出口**：该 Key 流量强制走 `gateway.qoder.com.cn`
   - **跟随面板切换**：未绑定出口的 Key 实时跟随看板顶部全局出口
 - **状态管理**：单独启停、一键删除，删除即刻失效；配置持久化到 `accounts/settings.json`；
@@ -215,7 +215,7 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 **客户端版本对齐（0.4.3 双区桌面端）**：协议常量按官方客户端当前版本逐项核对——
 
 - `cosy-version` = **1.1.64**（更新自旧 CLI 的 `0.1.43`；取自 0.4.3 内置 `qoder-agent-sdk`/`qoder-cn-agent-sdk` 的版本常量，实测模型列表与推理均正常）；
-- 国际版推理主机 = **`api1.qoder.sh`**（客户端 endpoint 缓存里的主选；`api2`/`api3` 为官方故障切换域名，网关同样按序切换，单个域名故障不再拖垮全部请求）；
+- 国际版推理主机 = **`api3.qoder.sh`**（官方客户端 endpoint 缓存的当前主选；`api2`/`api1` 为故障切换域名，网关同样按序切换，单个域名故障不再拖垮全部请求）；
 - 国内版主机 `gateway.qoder.com.cn`、双区 `openapi` 基址、`/algo/api/v2/service/pro/sse/agent_chat_generation`（推理）、`/algo/api/v2/model/list`（模型清单）、`/api/v1/deviceToken|jobToken/*`、`/api/v1/userinfo`、`/api/v2/quota/usage`、`/api/v2/user/plan`、`/sash/api/v1/me/*`（签到/活动平台）**均与新客户端一致**，无变化；
 - COSY RSA 公钥与新客户端内置 PEM **逐字节相同**；官方模型目录快照已用新版客户端缓存刷新（价格倍率/上下文/思考默认档等）。
 
@@ -275,7 +275,8 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 双区域统一方案：以账号 UID + 业务盐单向 MD5 派生固定 `machineId` / `sessionId` / `machineType` / `machineToken`，COSY 签名头逐请求携带：
 
 - **同一账号长期稳定**：出站请求永远来自同一台虚拟物理设备，规避机器码漂移风控；
-- **多账号天然隔离**：不同账号机器码彼此独立，阻断跨账号关联检测。
+- **多账号天然隔离**：不同账号机器码彼此独立，阻断跨账号关联检测；
+- **出站形态对齐官方（v1.6.1 合并起）**：设备码改为 UUIDv4 形状，UA 按区域取官方值，`X-Request-ID` 每请求随机。存量号池升级前可设 `QD_DEVICE_ID_LEGACY=1` 保持旧的 32 位 hex 形态，避免上游把现有账号视为换设备。
 
 ### 3. 每日签到、额度与 Pro 福利包（双区域 · 真实领取）
 
@@ -498,6 +499,18 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/wangxinleo/qoder2api-hub/releases)。
+
+### v1.6.1-wangxinleo
+
+**同步上游 v1.5.3–v1.6.1（30 个提交）**
+
+- **协议与工具调用**：#50/#51/#52 启动/DSML/网络错误、#55 system 前缀稳定、#59 图片体积与 413、#60 未转义引号抢救、#62 adaptive thinking、#63 工具类型过滤、#70 排程、#71 信封排队、#72 marker-only fail-closed。
+- **风控与账号**：#56 团队号保护、#61 出站身份形态、v1.5.10 流量守卫/风控遥测/国际版 `api3` 主用、#67 组织共享额度去重、#69/#74 账号与 Key 备注。
+- **面板与运维**：v1.5.13 一键更新（固定拉取本 fork release）、可配置排程与 24 小时圆环、README 拆分至 `docs/` 并新增 `CHANGELOG.md`。
+- **保留 fork 语义**：企业 PAT/VPC、`enterprise_first`、CN 全模型结构化工具历史、坏参数 partial salvage、看板企业 UI。
+- **升级注意**：出站设备码改为 UUIDv4；存量号池可设 `QD_DEVICE_ID_LEGACY=1`。国际版推理主机改为 `api3.qoder.sh` 主用。
+
+**验证**：全量 **59 suites / 1789 checks / 0 failed**；根级 `_test_qoder.py` 678 passed / 4 skipped。
 
 ### v1.5.6-wangxinleo
 

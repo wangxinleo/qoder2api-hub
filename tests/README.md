@@ -231,17 +231,29 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
-**基线（2026-10-19 · 上游 v1.4.2–v1.5.2 同步 + v1.5.6 partial salvage）**：
+**基线（2026-10-21 · 上游 v1.5.3–v1.6.1 同步）**：
 
 | 口径 | 数值 |
 |---|---|
-| 套件数 | **43 suites** |
-| 全部断言 | **1466 checks** |
+| 套件数 | **59 suites** |
+| 全部断言 | **1789 checks** |
 | 结果 | 0 failed / exit 0 |
 | 前端九套件小计 | **158**（19/9/23/19/20/15/31/10/12） |
-| legacy 套件 | 665（其中 4 条 SKIP，语义见 `_test_qoder.py` 的 SUMMARY 说明） |
+| legacy 套件 | 682（其中 4 条 SKIP，语义见 `_test_qoder.py` 的 SUMMARY 说明） |
 
-> 本版新增/变更：
+> 本版新增/变更（v1.6.1 合并）：
+> - 合入上游 #69 备注、#70 排程、#71 信封排队、#72 marker-only fail-closed、
+>   #67 组织共享额度、#55/#62/#63 协议修复、v1.5.13 一键更新等套件。
+> - #72 仅对 marker-only（无 arguments 可 salvage）fail-closed；坏参数仍按
+>   fork v1.5.6 语义 partial salvage，`_test_echo_salvage_fork.py` 75 条保持。
+> - CN 结构化工具历史仍为全模型 carve-out（`STRUCTURED_TOOL_HISTORY_EXCLUDE=()`）；
+>   上游 `_test_issue55_system_prefix.py` / `_test_issue60_followup.py` 的 Kimi 断言
+>   已按 fork 语义适配。
+> - 一键更新器固定拉取 `wangxinleo/qoder2api-hub` release，避免覆盖回上游。
+> - 环境里若存在 `NO_PROXY=127.0.0.1` 类变量，`_test_proxy_policy.py` 的 3 条
+>   「死代理必失败」断言会误报（与代码无关）；`env -u NO_PROXY -u no_proxy` 后全绿。
+>
+> 历史变更（v1.5.6）：
 > - `_test_echo_salvage_fork.py`（75 条）替代 v1.5.5 的 fail-closed 套件：
 >   2026-10-16 事故样本（1273 字符，4 条调用、item[0] 转义损坏）在 **8 种分块 × 2 轮**
 >   下均 **3 还原 / 1 弃**；0 合法 / 空数组整块吞掉；chat 流式 / 非流式 /
