@@ -231,6 +231,23 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
+**基线（2026-10-23 · 上游 v1.6.5–v1.6.13 同步）**：
+
+| 口径 | 数值 |
+|---|---|
+| 套件数 | **74 suites** |
+| 全部断言 | **2045 checks** |
+| 结果 | 0 failed / exit 0 |
+| 合并前基线 | 62 suites / 1872 checks |
+
+> 本版新增/变更（v1.6.13 合并）：
+> - 合入上游 #79/#81/#83/#84/#85/#86/#87 与 v1.6.9 签到/洞察套件（+12 suites）。
+> - 上游 `_test_issue79_structured_realm.py` 的「CN 非白名单模型 → False」按 fork
+>   「CN 全模型结构化」语义改为 True；`realm=None → False` 的回归本体不变。
+> - `_test_dashboard_enterprise_pat.js` 夹具注入上游新增 `checkinBadge` / `creditsDeltaChip`，
+>   并新增「企业徽标 + 签到/积分 chip 共存」断言（冲突合并回归）。
+> - 全量在 `env -u NO_PROXY -u no_proxy` 下运行。
+
 **基线（2026-10-21 · 上游 v1.5.3–v1.6.1 同步）**：
 
 | 口径 | 数值 |
