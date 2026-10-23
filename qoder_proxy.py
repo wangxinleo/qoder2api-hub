@@ -61,7 +61,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates_for,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.4-wangxinleo"
+VERSION = "1.6.13-wangxinleo"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -657,8 +657,19 @@ def _persist_usage(row, summary, fail_label):
         log("%s: %s" % (fail_label, exc))
 
 
-def record_error(model, status, message, elapsed_ms=None):
-    """Count a failed request and append it to the log so errors are visible."""
+def record_error(model, status, message, elapsed_ms=None,
+                 stream=None, account=None, key_id=None):
+    """Count a failed request and append it to the log so errors are visible.
+
+    后三个参数与 record_usage 同构，全是**可选**：不传就一个键都不写，行格式
+    与改动前逐字节一致（老调用路径与历史日志不受影响）。
+      stream   是否流式请求
+      account  出错的账号 uid（拿得到才传：open_upstream 失败时选号未成功，
+               调用点手里没有 account，传 None 即可——不能为了填字段去猜）
+      key_id   API key 标识，同 record_usage（不涉明文）
+    失败行带上账号/Key，才能看出「是哪个号在失败、是不是某个 Key 的客户端在
+    打」；此前失败行这三项恒为空，面板只能显示成「历史行未记录 Key」。
+    """
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -669,6 +680,12 @@ def record_error(model, status, message, elapsed_ms=None):
         "message": str(message)[:400],
         "elapsed_ms": elapsed_ms,
     }
+    if stream is not None:
+        row["stream"] = bool(stream)
+    if account:
+        row["account"] = account
+    if key_id:
+        row["key_id"] = key_id
     with _lock:
         _usage["errors"] += 1
         if elapsed_ms is not None:
@@ -2025,11 +2042,18 @@ def free_model_names(realm=None):
 def gateway_models_for_agents(realm=None):
     """面板「智能体配置」页的模型预填清单（与 /v1/models 同源裁剪）。"""
     try:
-        entries = fetch_models_merged(realm=realm) if realm else             fetch_models_merged()
+        entries = ([(mid, meta, realm) for mid, meta in fetch_models(realm=realm)]
+                   if realm else fetch_models_merged())
     except Exception:
         entries = []
     out = []
-    for e in entries if isinstance(entries, list) else []:
+    for row in entries if isinstance(entries, list) else []:
+        # fetch_models* 返回的是 (mid, meta, realm) 元组，不是 dict；
+        # 与 /v1/models 同样经 model_entry 展开成带 id / context_length 的字典。
+        try:
+            e = model_entry(row[0], row[1], realm=row[2])
+        except Exception:
+            continue
         if not isinstance(e, dict):
             continue
         mid = str(e.get("id") or "").strip()
@@ -4506,6 +4530,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                         level="WARN", tag="chat")
         if calls:
             recovered = True
+            RECOVERY_STATS["leak"] = RECOVERY_STATS.get("leak", 0) + 1
             log("recovered leaked tool-call echo (%d chars / %d frames -> %d call(s))"
                 % (len(hold), hold_frames, len(calls)), level="INFO", tag="chat")
             for i, call in enumerate(calls):
@@ -4669,6 +4694,7 @@ def _sse_recover_dsml(frames, allowed_names=None):
                 clean = _lclean
         if calls:
             recovered = True
+            RECOVERY_STATS["dsml"] = RECOVERY_STATS.get("dsml", 0) + 1
             if clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
             for i, call in enumerate(calls):
@@ -5379,10 +5405,139 @@ QUEUE_WAIT_MAX_SECS = int(os.environ.get("QD_QUEUE_WAIT_MAX_SECS") or 180)
 QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 600)
 QUEUE_WAIT_JITTER_SECS = float(os.environ.get("QD_QUEUE_WAIT_JITTER") or 2.0)
 
+# issue #87：排队「可见」还是「快速失败」——
+#   visible（默认）：流式请求**先发响应头**，排队期间持续发心跳 + 排队提示帧，
+#                    客户端能看到「上游排队中（已等待 Ns）」；超预算发中文错误帧；
+#   fast          ：不等，立即 503 + Retry-After + 中文原因（客户端自己重试）；
+#   wait          ：旧行为（在 open_upstream 内静默 sleep，客户端零字节——就是
+#                    「卡住」的来源，保留仅为兼容）。
+QUEUE_MODE = (os.environ.get("QD_QUEUE_WAIT_MODE") or "visible").strip().lower()
+if QUEUE_MODE not in ("visible", "fast", "wait"):
+    QUEUE_MODE = "visible"
+
+
+def queue_mode():
+    """当前排队策略（visible / fast / wait）。"""
+    return QUEUE_MODE
+
+
+QUEUE_MSG_WAIT_ZH = "上游模型排队中（10605 / RESOURCE_LIMIT）：已等待 %d 秒，仍在队列中"
+QUEUE_MSG_FAIL_ZH = ("上游模型排队超时（已等待 %d 秒，上限 %d 秒）：请稍后重试，"
+                     "或换一个模型/区域。这不是你的 Key、账号或网络问题。")
+
+
+def visible_queue_acquire(seed_exc, reopen, emit, budget_secs=None, started=None):
+    """visible 模式（issue #87）：在**已建立的流**里等待排队并持续报告进度。
+
+    - emit("queue", info)   ：每轮发一次排队状态（客户端可见「已等待 Ns」）
+    - emit("timeout", info) ：超出预算，info 里有中文原因
+    - emit("error", info)   ：排队后重试遇到其它错误
+    返回 reopen() 的结果；超预算或失败返回 None（调用方负责收尾）。
+    """
+    budget = int(QUEUE_WAIT_BUDGET_SECS if budget_secs is None else budget_secs)
+    start = (time.time() - float(getattr(seed_exc, "waited", 0) or 0)
+             if started is None else started)
+    exc = seed_exc
+    while True:
+        waited = int(max(0, time.time() - start))
+        emit("queue", {"queued": True, "waited_seconds": waited,
+                       "wait_seconds": int(exc.retry_after),
+                       "budget_seconds": budget,
+                       "message": QUEUE_MSG_WAIT_ZH % waited})
+        if time.time() + exc.retry_after > start + budget:
+            emit("timeout", {"waited_seconds": waited, "budget_seconds": budget,
+                             "code": "upstream_queued",
+                             "message": QUEUE_MSG_FAIL_ZH % (waited, budget)})
+            return None
+        time.sleep(min(int(exc.retry_after), 60) + 1
+                   + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
+        try:
+            return reopen()
+        except UpstreamQueued as exc2:
+            exc = exc2
+        except Exception as exc3:
+            emit("error", {"message": "排队等待后重试失败：%s" % str(exc3)[:160],
+                           "code": "upstream_queued_retry_failed"})
+            return None
+
+
+class UpstreamQueued(UpstreamStatus):
+    """上游 10605 排队（issue #87）。
+
+    携带 retryAfterSeconds，供 fast（立即返回 503）与 visible（流内等待）使用；
+    继承 UpstreamStatus 以保证既有 except 分支不会把它当未知错误。
+    """
+
+    def __init__(self, retry_after, detail="", waited=0):
+        retry_after = int(retry_after or 0)
+        # 503 而不是 403：排队是「暂时不可用」，客户端应当重试而不是放弃
+        super(UpstreamQueued, self).__init__(503, detail or "10605 queued")
+        self.retry_after = max(1, retry_after)
+        self.detail = detail or ""
+        self.waited = int(waited)
+
+
+
+_QUALITY_CACHE = {"at": 0.0, "data": None}
+
+
+def quality_snapshot(limit=500, ttl=30.0):
+    """面板质量指标（issue #87）：TTFT p50/p90、输出速度、排队率、回读命中。
+
+    数据来自 usage/usage.jsonl 尾部（跳过没有 account 的测试夹具行），
+    30 秒缓存，避免面板轮询把 JSON 解析做满。
+    """
+    now = time.time()
+    if _QUALITY_CACHE["data"] and now - _QUALITY_CACHE["at"] < ttl:
+        return _QUALITY_CACHE["data"]
+    ttfts, tps = [], []
+    rows = 0
+    try:
+        with open(USAGE_LOG, encoding="utf-8", errors="ignore") as fh:
+            tail = fh.readlines()[-limit:]
+        for line in tail:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if not r.get("account"):
+                continue          # 测试夹具 / 无账号行不计入
+            rows += 1
+            if isinstance(r.get("ttft_ms"), (int, float)):
+                ttfts.append(float(r["ttft_ms"]))
+            if r.get("completion_tokens") and r.get("gen_ms"):
+                tps.append(float(r["completion_tokens"])
+                           / max(0.001, float(r["gen_ms"]) / 1000.0))
+    except Exception:
+        pass
+
+    def _pct(values, p):
+        if not values:
+            return None
+        values = sorted(values)
+        return round(values[min(len(values) - 1, int(len(values) * p))], 1)
+
+    data = {
+        "requests": rows,
+        "ttft_p50_ms": _pct(ttfts, 0.5),
+        "ttft_p90_ms": _pct(ttfts, 0.9),
+        "tps_p50": round(tps and sorted(tps)[len(tps) // 2], 1) if tps else None,
+        "queue_total": int(RISK_STATS.get("queue") or 0),
+        "queue_rate": (round((RISK_STATS.get("queue") or 0) / rows, 4)
+                       if rows else None),
+        "recovery": {"leak": int(RECOVERY_STATS.get("leak") or 0),
+                     "dsml": int(RECOVERY_STATS.get("dsml") or 0)},
+        "queue_mode": queue_mode(),
+    }
+    _QUALITY_CACHE.update({"at": now, "data": data})
+    return data
+
 
 # issue #64：风控/排队信号计数（只读观测，供 /health 与面板排查）。
 RISK_STATS = {"queue": 0, "rate": 0, "rejected": 0, "version_gate": 0,
               "last": None}
+# issue #87：回读命中计数（面板「回读命中率」用）——leak=文本复述、dsml=原生标记
+RECOVERY_STATS = {"leak": 0, "dsml": 0}
 _RISK_LOCK = threading.Lock()
 
 
@@ -5591,6 +5746,12 @@ def friendly_upstream_error(code, detail):
         code_i = int(code)
     except Exception:
         code_i = 502
+    # issue #87：排队（fast 模式在这里统一给出中文原因，所有入口共用）
+    if ("10605" in detail or "isQueued" in detail
+            or "RESOURCE_LIMIT" in detail) and _to_int_status(code) in (403, 503):
+        return ("上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试，"
+                "或换一个模型/区域。这不是你的 Key、账号或网络问题。"
+                "上游详情：%s" % (detail[:160] or "(无详情)"), "upstream_queued")
     # issue #64：版本过低是硬门控（官方客户端会自己升级，网关只能提示）
     if "430" in str(code):
         return ("客户端/网关版本过低（430）：上游要求升级后才能继续。"
@@ -5704,8 +5865,18 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             account.note_unknown_failure("envelope HTTP %s" % status_int)
 
 def _alt_realm_ready(realm, model=""):
-    """另一个区是否还有可用账号（issue #71 跨区 failover 用）。"""
-    other = "intl" if realm == "cn" else "cn"
+    """另一个区是否还有可用账号（issue #71 跨区 failover 用）。
+
+    issue #83：`realm` 可能是 None（#76 起入口不再把「未指定」折叠成当前区）。
+    旧实现 `"intl" if realm == "cn" else "cn"` 会把 None 当成「非 cn」-> 返回 cn，
+    于是「切到 cn -> 又排队 -> 再切 cn」无限循环（现场日志刷屏、请求永不结束）。
+    现在先把 None 解析成**实际出口**，再取另一区；解析结果与目标相同就返回空。
+    """
+    base = realm or detect_model_realm(model) or CURRENT_REALM
+    base = base if base in ("cn", "intl") else "cn"
+    other = "intl" if base == "cn" else "cn"
+    if not other or other == base:
+        return ""
     try:
         return other if _realm_ready_total(other, model) > 0 else ""
     except Exception:
@@ -6158,7 +6329,8 @@ def _chat_chunks_iter(obj, model):
             for c in _chat_chunks(obj, model)]
 
 
-def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
+def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
+                  only_account=None, on_queue=None):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
 
     usage_ctx：可选**出参** dict。传入时回填本次请求的推理档位审计信息
@@ -6179,6 +6351,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     全部账号失败后抛 RateLimited 或最后一个错误。
     """
     model = str(payload.get("model") or "")
+    if only_account is not None and not target_realm:
+        # issue #86：钉死账号时区域跟随该账号（自动路由可能把它换掉）
+        target_realm = getattr(only_account, "realm", "") or None
     realm = target_realm or detect_model_realm(model) or CURRENT_REALM
     if not target_realm:
         # 步2：只在**用户没显式指定**时，按账号可用性兜底换区
@@ -6195,7 +6370,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     # task 10-16（R3）：这里原为 `POOL.pick(realm=realm)`，但代表号只用于请求体
     # 的占位 aliyun_user_type（发送前会被真实服务号覆写）——pick 会白耗一格轮询
     # cursor，偶数池下固定一半账号服务数恒 0（根因见 tests/_test_alloc_parity.py）。
-    representative = None
+    # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）。
+    representative = only_account
     body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
@@ -6221,7 +6397,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(body_obj.get("messages") or [])))
 
-    total = _realm_ready_total(realm, model)   # #29：与冷却函数共用同一口径
+    # issue #86：钉死账号按单账号池处理（冷却压到 3s、不跨号轮换）
+    total = 1 if only_account is not None else _realm_ready_total(realm, model)
     tried = set()
     last_error = None
     last_429 = None
@@ -6241,8 +6418,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
     for _ in range(total + 2):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                        exclude=tried, model=model) if POOL else None
+        if only_account is not None:
+            # issue #86：账号测试必须落在被点的那个号上，不能走会话粘性/轮询
+            account = only_account if only_account.uid not in tried else None
+        else:
+            account = POOL.pick_for_session(realm=realm, session_key=session_key,
+                                            exclude=tried, model=model) if POOL else None
         if account is None:
             if not waited_cool:
                 wait = _short_error_cooldown_wait(realm, model,
@@ -6255,7 +6436,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                     time.sleep(wait + 0.25)
                     continue     # 冷却到期后重新 pick，服务该请求
             break
-        if account.realm != realm:
+        if account.realm != realm and only_account is None:
             if session_key and POOL:
                 POOL.affinity.unbind(session_key)
             continue
@@ -6308,10 +6489,28 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 # 交给客户端）。仅在预算与单轮上限内等待；超出即按原错误走
                 # 既有分类（fail-open 语义不变）。
                 qwait = _queue_wait_seconds(detail)
-                if qwait > 0 and queue_tries < QUEUE_MAX_ROUNDS \
-                        and qwait <= QUEUE_WAIT_MAX_SECS \
-                        and (time.time() - queue_start) + qwait \
-                        <= QUEUE_WAIT_BUDGET_SECS:
+                _can_wait = (qwait > 0 and queue_tries < QUEUE_MAX_ROUNDS
+                             and qwait <= QUEUE_WAIT_MAX_SECS
+                             and (time.time() - queue_start) + qwait
+                             <= QUEUE_WAIT_BUDGET_SECS)
+                # issue #87：visible 模式由调用方（流式 handler）提供 on_queue，
+                # 它在**流内**发心跳+排队提示；fast 模式直接抛给 handler 返回 503。
+                if _can_wait and on_queue is not None:
+                    queue_tries += 1
+                    log("upstream queued on '%s' model '%s' - waiting %ds "
+                        "(round %d/%d, visible)"
+                        % (account.uid[:8], model, qwait, queue_tries,
+                           QUEUE_MAX_ROUNDS), level="WARN", tag="chat")
+                    try:
+                        on_queue(qwait, detail, queue_tries, QUEUE_MAX_ROUNDS)
+                    except Exception:
+                        pass
+                    time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
+                    continue
+                if qwait > 0 and queue_mode() != "wait":
+                    raise UpstreamQueued(qwait, detail,
+                                         int(time.time() - queue_start))
+                if _can_wait:
                     queue_tries += 1
                     log("upstream queued on '%s' model '%s' - waiting %ds "
                         "(round %d/%d)"
@@ -7100,6 +7299,28 @@ def _unwrap_custom_input(args):
     return args
 
 
+_RESPONSES_IGNORED_ONCE = set()
+
+
+def _note_ignored_responses(payload):
+    """issue #87：把当前**未实现**的 Responses 专有字段显式记下来。
+
+    客户端（Codex 等）会带 store / previous_response_id / include / text 等字段，
+    我们目前按「无状态 + 全量历史」处理。静默忽略会让排查毫无线索，这里每个
+    字段只告警一次（不改变行为，只是让现象可解释）。
+    """
+    try:
+        for key in ("store", "previous_response_id", "include", "text",
+                    "truncation", "metadata", "service_tier", "background"):
+            if payload.get(key) is None or key in _RESPONSES_IGNORED_ONCE:
+                continue
+            _RESPONSES_IGNORED_ONCE.add(key)
+            log("responses: field %r is not implemented - ignored (issue #87)"
+                % key, level="WARN", tag="chat")
+    except Exception:
+        pass
+
+
 def responses_to_chat(payload):
     """Translate a Responses API request body into a Chat Completions body."""
     messages = []
@@ -7275,6 +7496,12 @@ def responses_to_chat(payload):
         chat["tool_choice"] = payload["tool_choice"]
     if payload.get("parallel_tool_calls") is not None:
         chat["parallel_tool_calls"] = payload["parallel_tool_calls"]
+    else:
+        # Responses 语义默认允许并行工具调用（显式传出，避免上游按串行处理）
+        chat["parallel_tool_calls"] = True
+    if isinstance(payload.get("stream_options"), dict):
+        chat["stream_options"] = payload["stream_options"]
+    _note_ignored_responses(payload)
     return chat
 
 
@@ -7924,6 +8151,8 @@ class Handler(BaseHTTPRequestHandler):
         “一直重连 / 连不上”。改为 chunked 后，流结束发 0 长度的终止块，
         连接保持 keep-alive，可安全复用。
         """
+        if getattr(self, "_chunked", False):
+            return          # 幂等：排队可视化会提前开流，后续调用不能重复发头
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -7965,9 +8194,63 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self._chunked = False
 
-    def _json(self, code, obj):
+    def _queue_notice(self, flavor, info):
+        """排队提示帧（issue #87 visible 模式）。
+
+        先用 SSE 注释心跳保活，再发一条**客户端可读**的排队状态：
+        chat 走 `qoder_queue` 字段；responses 走 `response.qoder_queue` 事件；
+        anthropic 走 `ping` 事件（带 qoder_queue 附加字段，客户端会忽略未知键）。
+        """
+        self._sse_write(b": ping\n\n")
+        body = json.dumps(info, ensure_ascii=False)
+        if flavor == "anthropic":
+            self._sse_write(("event: ping\ndata: "
+                             + json.dumps({"type": "ping", "qoder_queue": info},
+                                          ensure_ascii=False) + "\n\n").encode("utf-8"))
+        elif flavor == "responses":
+            self._sse_write(("event: response.qoder_queue\ndata: "
+                             + json.dumps({"type": "response.qoder_queue",
+                                           "sequence_number": 0,
+                                           "qoder_queue": info},
+                                          ensure_ascii=False) + "\n\n").encode("utf-8"))
+        else:
+            self._sse_write(("data: " + json.dumps(
+                {"id": "chatcmpl-qoder-queue",
+                 "object": "chat.completion.chunk",
+                 "created": int(time.time()),
+                 "model": info.get("model") or "",
+                 "choices": [{"index": 0, "delta": {"content": ""},
+                              "finish_reason": None}],
+                 "qoder_queue": info}, ensure_ascii=False) + "\n\n").encode("utf-8"))
+
+    def _queue_error_frame(self, flavor, message, waited, budget):
+        """排队超预算（visible 模式）：给明确的中文错误，而不是静默断开。"""
+        info = {"message": message, "waited_seconds": int(waited),
+                "budget_seconds": int(budget), "code": "upstream_queued"}
+        if flavor == "anthropic":
+            self._sse_write(("event: error\ndata: " + json.dumps(
+                {"type": "error", "error": {"type": "overloaded_error",
+                                            "message": message},
+                 "qoder_queue": info}, ensure_ascii=False) + "\n\n").encode("utf-8"))
+        elif flavor == "responses":
+            self._sse_write(("event: response.failed\ndata: " + json.dumps(
+                {"type": "response.failed",
+                 "response": {"status": "failed",
+                              "error": {"code": "upstream_queued",
+                                        "message": message}},
+                 "qoder_queue": info}, ensure_ascii=False) + "\n\n").encode("utf-8"))
+        else:
+            self._sse_write(("data: " + json.dumps(
+                {"error": {"message": message, "type": "upstream_queued",
+                           "code": 503}, "qoder_queue": info},
+                ensure_ascii=False) + "\n\n").encode("utf-8"))
+            self._sse_write(b"data: [DONE]\n\n")
+
+    def _json(self, code, obj, extra_headers=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
+        for _k, _v in (extra_headers or {}).items():
+            self.send_header(str(_k), str(_v))
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         realm_used = getattr(self, "realm_used", "") or ""
@@ -7982,9 +8265,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, code, message, err_type="server_error"):
+    def _error(self, code, message, err_type="server_error", retry_after=None):
+        extra = {"Retry-After": int(retry_after)} if retry_after else None
         self._json(code, {"error": {"message": message, "type": err_type,
-                                    "code": code}})
+                                    "code": code}}, extra_headers=extra)
+
+    def _unknown_path_error(self, path):
+        """404，并针对最常见的「接入地址填错」给出可执行提示。
+
+        聚合网关（new-api / one-api 等）配渠道时最常见的两类错：
+          · base URL 里已经带了 /v1，客户端又拼一次 -> /v1/v1/chat/completions；
+          · 把 OpenAI 的路径整段填进 base URL -> /v1/chat/completions/v1/chat/completions。
+        这两类以前只会得到一句 not found，很难自证；现在直接把原因写进错误体并记 WARN。
+        """
+        p = str(path or "")
+        hint = ""
+        if p.count("/v1") > 1:
+            hint = ("base URL 里已经带了 /v1，客户端又拼了一次；把渠道地址填成 "
+                    "http://<host>:8790（不带 /v1）即可")
+        elif p.rstrip("/").endswith("/v1/chat/completions") and p.count("/") > 3:
+            hint = "base URL 填成了完整接口路径；只需填 http://<host>:8790"
+        try:
+            log("404 unknown path: %s%s"
+                % (p, (" — " + hint) if hint else ""),
+                level="WARN", tag="http")
+        except Exception:
+            pass
+        return self._error(404, "not found: %s%s" % (p, (" — " + hint) if hint else ""),
+                           "invalid_request_error")
 
     def _rate_limited(self, exc):
         """429 with Retry-After, so clients back off instead of hammering."""
@@ -8309,6 +8617,7 @@ class Handler(BaseHTTPRequestHandler):
                 "api_key_required": bool(API_KEY),
                 "risk": risk_snapshot(),
                 "env": env_report(),
+                "quality": quality_snapshot(),
             }
             if self._key_ok():
                 info.update({
@@ -8739,7 +9048,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"id": wanted,
                                             "key": entry.get("key") or ""})
             return self._error(404, "no such key", "invalid_request_error")
-        return self._error(404, "not found", "invalid_request_error")
+        return self._unknown_path_error(path)
 
     def _dashboard(self):
         try:
@@ -8966,7 +9275,7 @@ class Handler(BaseHTTPRequestHandler):
                 PANEL.revoke_all()
             token = PANEL.create()
             return self._json(200, {"ok": True, "token": token})
-        return self._error(404, "not found", "invalid_request_error")
+        return self._unknown_path_error(path)
 
     def _handle_accounts(self, path, payload):
         """Account-management endpoints (dashboard uses these)."""
@@ -9090,34 +9399,34 @@ class Handler(BaseHTTPRequestHandler):
             # 账号面板的「每日签到」按钮：**只做每日签到领积分**——Credits 类活动
             # （如"每天领 100 Credits"，旧 sash 接口兜底），不领券/兑换码类活动，
             # 也不领 Pro 福利包（那些走签到与福利中心的按钮）。
+            #
+            # 并发：签到是「每账号一次上游往返」，串行时 N 个账号 = N 个 RTT +
+            # N 次间隔，面板上就是「点了没反应」。现在默认 3 并发
+            # （QD_CHECKIN_CONCURRENCY 1–8），启动前加 0~0.8s 抖动错开。
             import qoder_tasks
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
-            results = []
-            last_at = None
-            for account in targets:
-                if account is None:
-                    continue
-                if not account.enabled or not account.access_token:
-                    continue            # 跳过的账号不占用防风控等待
-                if last_at is not None:
-                    # 账号之间保持 >= CHECKIN_MIN_GAP（与 qoder_tasks.py 声明的
-                    # >=1.0s 一致）；try/finally 让失败路径同样计时间隔。
-                    idle = CHECKIN_MIN_GAP - (time.time() - last_at)
-                    if idle > 0:
-                        time.sleep(idle)
-                try:
-                    res = qoder_tasks.run_checkin(account, gap=CHECKIN_MIN_GAP,
-                                                  only_daily=True)
-                finally:
-                    last_at = time.time()
+            targets = [a for a in targets
+                       if a is not None and a.enabled and a.access_token]
+            results = [None] * len(targets)
+
+            def _one(idx, account):
+                # 首个任务立即开始，其余 0~0.3s 错开（避免机器枪特征又不拖慢整批）
+                if idx:
+                    try:
+                        time.sleep(random.uniform(0, 0.3))
+                    except Exception:
+                        pass
+                res = qoder_tasks.run_checkin(account, gap=CHECKIN_MIN_GAP,
+                                              only_daily=True)
                 qoder_activity.record(
                     USAGE_DIR, "checkin", bool(res.get("ok")),
                     uid=account.uid, nickname=account.nickname,
                     realm=getattr(account, "realm", "") or "",
                     detail=(res.get("msg") or res.get("reason") or ""),
                     amount=res.get("earned_credit") or 0)
-                results.append({
+                return {
                     "uid": account.uid,
                     "nickname": account.nickname,
                     "ok": bool(res.get("ok")),
@@ -9125,18 +9434,37 @@ class Handler(BaseHTTPRequestHandler):
                     "msg": (res.get("logs") or [""])[-1],
                     "logs": res.get("logs") or [],
                     "credits": res.get("credits"),
-                    # issue #20：透传 qoder_tasks 的精确结论（前端一直在读
-                    # message / claimed / next_available_*，此前永远 undefined）。
-                    # 新增而非替换：msg/logs/credits 原样保留。naonao 的契约
-                    # （qoder_tasks 活动平台路径）保证 claimed 是**字符串列表**；
-                    # 老路径（旧 sash 兜底）不带该键 -> 这里统一给 []，
-                    # 让前端只需 Array.isArray 判定，不用再判 None。
-                    # message / next_available_* 缺失时仍为 None（不编造）。
+                    # issue #20：透传活动平台的精确结论（前端一直在读）。
                     "message": res.get("message"),
                     "claimed": res.get("claimed") or [],
                     "next_available_at": res.get("next_available_at"),
                     "next_available_note": res.get("next_available_note"),
-                })
+                }
+
+            if targets:
+                try:
+                    workers = max(1, min(8, int(
+                        os.environ.get("QD_CHECKIN_CONCURRENCY") or 3)))
+                except Exception:
+                    workers = 3
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {pool.submit(_one, i, a): i
+                               for i, a in enumerate(targets)}
+                    for fut in as_completed(futures):
+                        idx = futures[fut]
+                        try:
+                            results[idx] = fut.result()
+                        except Exception as exc:
+                            acc = targets[idx]
+                            results[idx] = {
+                                "uid": acc.uid, "nickname": acc.nickname,
+                                "ok": False, "earned_credit": 0,
+                                "msg": "签到异常: %s" % str(exc)[:120],
+                                "logs": [], "credits": None,
+                                "message": None, "claimed": [],
+                                "next_available_at": None,
+                                "next_available_note": None}
+            results = [r for r in results if r]
             qoder_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
             return self._json(200, {"results": results,
                                     "accounts": account_views()})
@@ -9245,7 +9573,10 @@ class Handler(BaseHTTPRequestHandler):
             }
             t0 = time.time()
             try:
-                resp, acc, _ = open_upstream(test_payload, target_realm=acc_realm(account))
+                # issue #86：必须测试被点的那个号（此前会落到池里任意账号）
+                resp, acc, _ = open_upstream(
+                    test_payload, target_realm=acc_realm(account),
+                    only_account=account)
                 with resp:
                     chat_obj = aggregate_stream(resp, test_model, None)
                 wall_ms = int((time.time() - t0) * 1000)
@@ -9255,7 +9586,7 @@ class Handler(BaseHTTPRequestHandler):
                               or "OK").strip()
                 if len(reply_text) > 80:
                     reply_text = reply_text[:77] + "..."
-                account.clear_error()
+                acc.clear_error()      # 清的是**实际**被测账号（issue #86）
                 log("account test: uid=%s model=%s wall=%dms ok=True"
                     % (account.uid[:8], test_model, wall_ms), tag="accounts")
                 return self._json(200, {"ok": True, "uid": account.uid,
@@ -9392,8 +9723,13 @@ class Handler(BaseHTTPRequestHandler):
             n_msg_system=qoder_anthropic.count_msg_system(payload))
         t_start = time.time()
         # ---- 形态决策单点：在这里算唯一一次，随 chat_req 下传 ----
+        # issue #79：realm 未显式指定时（#76 起入口传 None），形态判定必须和
+        # open_upstream 用同一个兜底 —— auto 模式要求 realm == "cn"，None 会让
+        # DeepSeek / Qwen 等白名单永远不生效，历史工具调用回退文本化并被模型复述。
+        _realm_for_shape = (req_realm or detect_model_realm(model)
+                            or CURRENT_REALM)
         chat_req["_qd_structured"] = structured_tool_history_enabled(
-            model=model, model_key=model_key, realm=req_realm,
+            model=model, model_key=model_key, realm=_realm_for_shape,
             messages=chat_req.get("messages"))
         holder = {"usage": None,
                   "allowed_names": _tool_names_from_payload(chat_req)}
@@ -9401,6 +9737,9 @@ class Handler(BaseHTTPRequestHandler):
             % (model, want_stream, len(chat_req.get("messages") or []),
                chat_req.get("reasoning_effort"),
                bool(chat_req.get("_qd_structured"))))
+        # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
+        # 而选号成功前它就是 None。必须在任何可能抛异常的语句之前。
+        account = None
         try:
             usage_ctx = {}
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
@@ -9414,14 +9753,20 @@ class Handler(BaseHTTPRequestHandler):
             self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             return self._rate_limited(exc)
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等本地拦下的错误——明确状态码，
             # 不进账号冷却/重试链路（上游根本没收到这个请求）。
             _code = _to_int_status(exc.status)
             record_error(model, _code, exc.detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
             return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
@@ -9432,13 +9777,19 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     detail = ""
             record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             msg, etype = friendly_upstream_error(exc.code, detail)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -9481,7 +9832,10 @@ class Handler(BaseHTTPRequestHandler):
                     _handle_envelope_account_cooldown(account, exc, model=model,
                                                       session_key=session_key)
                     wall = int((time.time() - t_start) * 1000)
-                    record_error(model, exc.status, exc.detail, elapsed_ms=wall)
+                    record_error(model, exc.status, exc.detail,
+                                 elapsed_ms=wall, stream=True,
+                                 account=account.uid if account else None,
+                                 key_id=self._key_id_for_usage())
                     msg, _ = friendly_upstream_error(_to_int_status(exc.status),
                                                      exc.detail)
                     log("anthropic upstream status %s: %s"
@@ -9507,14 +9861,20 @@ class Handler(BaseHTTPRequestHandler):
                     holder, account)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 msg, etype = friendly_upstream_error(_to_int_status(exc.status),
                                                      exc.detail)
                 return self._error(
                     exc.status if str(exc.status).isdigit() else 502, msg, etype)
             except Exception as exc:
                 record_error(model, 502, str(exc),
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             result = qoder_anthropic.chat_to_messages(chat_obj, model=model)
@@ -9623,6 +9983,10 @@ class Handler(BaseHTTPRequestHandler):
                sorted(custom_names) or "-"))
         holder = {"usage": None, "custom_names": custom_names,
                   "allowed_names": _tool_names_from_payload(chat_req)}
+        # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
+        # 而选号成功前它就是 None。放在 try 内、open_upstream 之前也行 —— 只要
+        # 在**任何可能抛异常的语句之前**（_request_realm 也不保证不抛）。
+        account = None
         try:
             req_realm = self._request_realm()
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
@@ -9635,17 +9999,54 @@ class Handler(BaseHTTPRequestHandler):
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
+        except UpstreamQueued as exc:
+            # issue #87：排队——visible 在流内等待并持续报告进度；
+            # fast / 非流式直接 503 + Retry-After + 中文原因。
+            _msg, _et = friendly_upstream_error(503, exc.detail)
+            if not want_stream or queue_mode() != "visible":
+                return self._error(503, _msg, _et, retry_after=exc.retry_after)
+            self._sse_begin()
+            _q0 = time.time()
+
+            def _emit_q(kind, info):
+                info = dict(info or {})
+                info["model"] = chat_req.get("model") or ""
+                if kind == "queue":
+                    self._queue_notice("responses", info)
+                else:
+                    self._queue_error_frame(
+                        "responses", info.get("message") or _msg,
+                        info.get("waited_seconds") or int(time.time() - _q0),
+                        info.get("budget_seconds") or QUEUE_WAIT_BUDGET_SECS)
+
+            _got = visible_queue_acquire(
+                exc,
+                lambda: open_upstream(chat_req, session_key=session_key,
+                                      target_realm=req_realm,
+                                      usage_ctx=usage_ctx),
+                _emit_q, started=_q0)
+            if _got is None:
+                self._sse_end()
+                return
+            upstream, account, _ = _got
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             t = time.time() - t_start
             record_error(model, 429, exc.detail[:200],
-                         elapsed_ms=int(t * 1000))
+                         elapsed_ms=int(t * 1000), stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             return self._rate_limited(exc)
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
             # 明确状态码 + 可读文案，且不进入账号冷却/重试链路。
             _code = _to_int_status(exc.status)
             record_error(model, _code, exc.detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
             return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
@@ -9658,13 +10059,19 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     detail = ""
             record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             msg, etype = friendly_upstream_error(exc.code, detail)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -9679,6 +10086,8 @@ class Handler(BaseHTTPRequestHandler):
                 attempts = 0
                 cur = upstream
                 pump_exc = None
+                # issue #83: cross-realm failover at most once per request
+                _switched71 = False
                 try:
                     while True:
                         try:
@@ -9691,9 +10100,14 @@ class Handler(BaseHTTPRequestHandler):
                                     _c["n"] += 1
                                     yield item
 
+                            # issue #87：Responses 与 chat 走**同一条**回读链
+                            # （此前只有 chat/Anthropic 有，Codex 侧泄漏型工具
+                            # 调用只能等流末才被解析出来）。
                             inner = _count_src(
                                 sse_with_heartbeat(
-                                    iter_inner_sse(cur, holder=holder),
+                                    recover_leaked_tool_calls(
+                                        iter_inner_sse(cur, holder=holder),
+                                        allowed_names=_tool_names_from_payload(chat_req)),
                                     self._sse_write))
                             for frame in stream_responses_events(inner, model, holder):
                                 if first_ms is None:
@@ -9751,9 +10165,11 @@ class Handler(BaseHTTPRequestHandler):
                             # 仍不行再转成 429 + Retry-After，而不是把 403 丢给客户端。
                             _alt71 = ("" if self.headers.get("X-Realm") else
                                       _alt_realm_ready(req_realm, model))
-                            if _envelope_queue_wait(exc) > 0 and _alt71:
+                            if (_envelope_queue_wait(exc) > 0 and _alt71
+                                    and not _switched71):
                                 log("queue exhausted -> failing over to %s (issue #71)"
                                     % _alt71, level="WARN", tag="chat")
+                                _switched71 = True
                                 try:
                                     cur2, account, _ = open_upstream(
                                         chat_req, session_key=session_key,
@@ -9781,7 +10197,10 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                 if pump_exc is not None:
                     record_error(model, pump_exc.status, pump_exc.detail,
-                                 elapsed_ms=int((time.time() - t_start) * 1000))
+                                 elapsed_ms=int((time.time() - t_start) * 1000),
+                                 stream=True,
+                                 account=account.uid if account else None,
+                                 key_id=self._key_id_for_usage())
                     msg, _ = friendly_upstream_error(
                         _to_int_status(pump_exc.status), pump_exc.detail)
                     log("responses upstream status %s: %s"
@@ -9813,14 +10232,20 @@ class Handler(BaseHTTPRequestHandler):
                     holder, account)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 msg, etype = friendly_upstream_error(_to_int_status(exc.status),
                                                      exc.detail)
                 return self._error(exc.status if str(exc.status).isdigit() else 502,
                                    msg, etype)
             except Exception as exc:
                 record_error(model, 502, str(exc),
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             result = chat_to_response(chat_obj, model, custom_names)
@@ -9989,7 +10414,7 @@ class Handler(BaseHTTPRequestHandler):
                     "this gateway speaks Chat Completions and Responses. "
                     "Use /v1/chat/completions with messages=[...] instead.",
                     "invalid_request_error")
-            return self._error(404, "not found", "invalid_request_error")
+            return self._unknown_path_error(path)
         if not self._authorized():
             return
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
@@ -10024,6 +10449,9 @@ class Handler(BaseHTTPRequestHandler):
         log("chat: model=%s client_effort=%r stream=%s msgs=%d"
             % (model, effort, want_stream,
                len(payload.get("messages") or [])))
+        # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
+        # 而选号成功前它就是 None。必须在任何可能抛异常的语句之前。
+        account = None
         try:
             req_realm = self._request_realm()
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
@@ -10036,16 +10464,54 @@ class Handler(BaseHTTPRequestHandler):
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
+        except UpstreamQueued as exc:
+            # issue #87：排队——visible 在流内等待并持续报告进度；
+            # fast / 非流式给 503 + Retry-After + 中文原因。
+            _msg, _et = friendly_upstream_error(503, exc.detail)
+            if not want_stream or queue_mode() != "visible":
+                return self._error(503, _msg, _et, retry_after=exc.retry_after)
+            self._sse_begin()
+            _q0 = time.time()
+
+            def _emit_q(kind, info):
+                info = dict(info or {})
+                info["model"] = model
+                if kind == "queue":
+                    self._queue_notice("chat", info)
+                else:
+                    self._queue_error_frame(
+                        "chat", info.get("message") or _msg,
+                        info.get("waited_seconds") or int(time.time() - _q0),
+                        info.get("budget_seconds") or QUEUE_WAIT_BUDGET_SECS)
+
+            _got = visible_queue_acquire(
+                exc,
+                lambda: open_upstream(payload, session_key=session_key,
+                                      target_realm=req_realm,
+                                      usage_ctx=usage_ctx),
+                _emit_q, started=_q0)
+            if _got is None:
+                self._sse_end()
+                return
+            upstream, account, _ = _got
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             return self._rate_limited(exc)
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
             # 明确状态码 + 可读文案，且不进入账号冷却/重试链路。
             _code = _to_int_status(exc.status)
             record_error(model, _code, exc.detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
             return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
@@ -10058,13 +10524,19 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     detail = ""
             record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             msg, etype = friendly_upstream_error(exc.code, detail)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -10081,6 +10553,8 @@ class Handler(BaseHTTPRequestHandler):
                 attempts = 0
                 cur = upstream
                 pump_exc = None
+                # issue #83: cross-realm failover at most once per request
+                _switched71 = False
                 try:
                     while True:
                         try:
@@ -10140,9 +10614,11 @@ class Handler(BaseHTTPRequestHandler):
                             # 仍不行再转成 429 + Retry-After，而不是把 403 丢给客户端。
                             _alt71 = ("" if self.headers.get("X-Realm") else
                                       _alt_realm_ready(req_realm, model))
-                            if _envelope_queue_wait(exc) > 0 and _alt71:
+                            if (_envelope_queue_wait(exc) > 0 and _alt71
+                                    and not _switched71):
                                 log("queue exhausted -> failing over to %s (issue #71)"
                                     % _alt71, level="WARN", tag="chat")
+                                _switched71 = True
                                 try:
                                     cur2, account, _ = open_upstream(
                                         payload, session_key=session_key,
@@ -10171,7 +10647,10 @@ class Handler(BaseHTTPRequestHandler):
                 if pump_exc is not None:
                     exc = pump_exc
                     wall = int((time.time() - t_start) * 1000)
-                    record_error(model, exc.status, exc.detail, elapsed_ms=wall)
+                    record_error(model, exc.status, exc.detail,
+                                 elapsed_ms=wall, stream=True,
+                                 account=account.uid if account else None,
+                                 key_id=self._key_id_for_usage())
                     msg, etype = friendly_upstream_error(
                         _to_int_status(exc.status), exc.detail)
                     err = json.dumps({"error": {
@@ -10208,7 +10687,10 @@ class Handler(BaseHTTPRequestHandler):
                     holder, account)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 code = exc.status if str(exc.status).isdigit() else 502
                 try:
                     code = int(code)
@@ -10221,7 +10703,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(code, msg, etype)
             except Exception as exc:
                 record_error(model, 502, str(exc),
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             first_at = result.get("first_chunk_at")

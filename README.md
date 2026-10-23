@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.6.1--wangxinleo-2496ED?style=flat-square" alt="Version 1.6.1-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.6.13--wangxinleo-2496ED?style=flat-square" alt="Version 1.6.13-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -499,6 +499,18 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/wangxinleo/qoder2api-hub/releases)。
+
+### v1.6.13-wangxinleo
+
+**同步上游 v1.6.5–v1.6.13（14 个提交）**
+
+- **协议与稳定性**：#79 Anthropic 结构化工具历史、#83 跨区 failover 死循环与单次切区守卫、#84 未知路径诊断、#87 排队可见/快速失败 + Responses 回读与兼容。
+- **账号与签到**：v1.6.9 国际版签到修复与提速、#85 Windows 启动路径、#86 账号测试钉号、v1.6.11 今日签到徽标与积分变化。
+- **面板与指标**：用量洞察独立板块、`/health.quality` 质量指标、失败用量行字段补全、`/agents/models` 修复。
+- **保留 fork 语义**：企业 PAT/VPC（无公共回退、签到排除）、`enterprise_first` 与轮询公平性、坏参数 partial salvage、单文件自更新指向本 fork。
+- **版本线**：`VERSION = 1.6.13-wangxinleo`；镜像仍推 `ghcr.io/wangxinleo/qoder2api-hub`。
+
+**验证**：全量 **74 suites / 2045 checks / 0 failed**（合并前基线 62 suites / 1872 checks / 0 failed）。
 
 ### v1.6.1-wangxinleo
 

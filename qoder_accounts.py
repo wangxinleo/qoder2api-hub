@@ -911,6 +911,49 @@ def session_dead(msg):
     return any(m in s for m in SESSION_DEAD_MARKERS)
 
 
+_OPENAPI_404 = {}          # (realm, path) -> ts；已知该端点在此区域不存在
+_OPENAPI_404_TTL = 6 * 3600
+
+
+def openapi_missing(realm, path):
+    """该 (区域, 路径) 是否已被判定为 404（TTL 6h）。"""
+    ts = _OPENAPI_404.get((str(realm or "cn"), str(path or ""))) or 0
+    return (time.time() - ts) < _OPENAPI_404_TTL
+
+
+def mark_openapi_missing(realm, path):
+    _OPENAPI_404[(str(realm or "cn"), str(path or ""))] = time.time()
+
+
+def _machine_minimal_disabled():
+    raw = str(os.environ.get("QD_INTL_MACHINE_FALLBACK") or "").strip().lower()
+    return raw in ("0", "off", "false", "no", "disable", "disabled")
+
+
+def openapi_candidates(realm):
+    """该区域 openapi 基址候选（issue: 国际版签不到到）。
+
+    官方把业务端点都挂在 openapi 基址上；国际版历史上是 openapi.qoder.sh，
+    但该域名在部分网络/时期不可达，表现为「活动列表拿不到 -> 签到无效」。
+    这里给出候选顺序，调用方**只在连接失败或 404 时**换下一个，业务错误不重试。
+    """
+    cfg = get_realm_config(realm)
+    r = str(realm or "cn")
+    out = []
+    env = str(os.environ.get("QD_%s_OPENAPI" % r.upper()) or "").strip()
+    if env:
+        out.append(env.rstrip("/"))
+    base = str(cfg.get("openapi") or "").rstrip("/")
+    if base:
+        out.append(base)
+    domain = str(cfg.get("domain") or "").strip()
+    for host in (("https://openapi." + domain) if domain else "",
+                 str(cfg.get("website") or "").rstrip("/")):
+        if host and host not in out:
+            out.append(host)
+    return out
+
+
 def get_realm_config(realm):
     return REALM_CONFIGS.get(realm) or REALM_CONFIGS["cn"]
 
@@ -1431,6 +1474,12 @@ class Account(object):
         self.degrade_until = 0.0            # 未知错误降权窗口截止（不挡 ready）
         self.plan = str(data.get("plan") or "")
         self.last_checkin = data.get("lastCheckin") or None
+        # 面板展示：最近一次积分变化（签到 +100 / 消耗 -35）与时间
+        self.last_credits_delta = data.get("lastCreditsDelta")
+        try:
+            self.last_credits_delta_at = float(data.get("lastCreditsDeltaAt") or 0)
+        except (TypeError, ValueError):
+            self.last_credits_delta_at = 0.0
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
         # 必须落盘持久化，否则网关重启后用户就找不回兑换码了。
         self.campaign_codes = dict(data.get("campaignCodes") or {})
@@ -1481,6 +1530,8 @@ class Account(object):
             "creditsDegraded": self.credits_degraded,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
+            "lastCreditsDelta": self.last_credits_delta,
+            "lastCreditsDeltaAt": self.last_credits_delta_at,
             "campaignCodes": self.campaign_codes,
             "campaignBlockedUntil": self.campaign_blocked_until,
             "userType": self.user_type,
@@ -1543,6 +1594,10 @@ class Account(object):
             "lastCheckin": self.last_checkin,
             # 运行时探测：None=未探测（照常尝试）/ True / False（本区域无接口）
             "canCheckin": self.can_checkin(),
+            "checkedInToday": self._checkin_stamped_today(),
+            "lastCheckinDate": str(self.last_checkin or "")[:10],
+            "lastCreditsDelta": self.last_credits_delta,
+            "lastCreditsDeltaAt": self.last_credits_delta_at,
             "checkinCapability": ("unknown" if self.checkin_capability()[0] is None
                                   else ("available" if self.checkin_capability()[0]
                                         else "not_found")),
@@ -1995,7 +2050,7 @@ class Account(object):
             h["Cosy-ClientType"] = "5"
         return h
 
-    def desktop_headers(self):
+    def desktop_headers(self, minimal=False):
         """桌面端同款出站头（活动平台 /sash/... 必需）。
 
         对齐官方桌面端 0.4.8 主进程调用 `/sash/api/v1/me/campaigns` 的完整头集合
@@ -2033,7 +2088,9 @@ class Account(object):
             "cosy-clienttype": DESKTOP_CLIENT_TYPE,
             "cosy-version": desktop_version(),
         }
-        ident = native_machine_identity(self.realm, self.uid)
+        ident = native_machine_identity(self.realm, self.uid) or {}
+        # 原生桥失败时可能返回 None（容器里常见）：当空 dict 处理，
+        # 走 derived 分支，而不是崩在 ident.get。
         if ident.get("machineToken"):
             # 仅原生身份可用时发送机器头（issue #10：派生六头会被服务端判定
             # 为非官方客户端并整条过滤 CLAIMABLE 活动；详见上方 docstring）。
@@ -2049,9 +2106,16 @@ class Account(object):
                 h["cosy-machinehostname"] = MACHINE_HOSTNAME
             self.machine_headers_state = MACHINE_HEADERS_NATIVE
         else:
-            # 无原生桥：一个机器头都不发（issue #10）。状态如实登记，供
+            # 无原生桥：默认一个机器头都不发（issue #10）。状态如实登记，供
             # campaigns().machine_headers 与 INTL 已知限制提示使用。
             self.machine_headers_state = MACHINE_HEADERS_OMITTED
+            if minimal and not _machine_minimal_disabled():
+                # issue: intl 签不到到的兜底 —— 实测「只发 os+hostname」时活动列表
+                # 仍可见（六头全发才会被判定为非官方客户端）。仅在
+                # showCampaign=false 时用一次，属于「让列表回来」的最小代价。
+                h["cosy-machineos"] = MACHINE_OS
+                if MACHINE_HOSTNAME:
+                    h["cosy-machinehostname"] = MACHINE_HOSTNAME
         self.machine_identity_source = ident.get("source") or "derived"
         return h
 
@@ -2204,26 +2268,25 @@ class Account(object):
         if self.is_enterprise():
             return False, {"unavailable": True, "reason": CHECKIN_REASON_ENTERPRISE,
                            "error": ENTERPRISE_ACTIVITY_MSG}
-        cfg = get_realm_config(self.realm)
-        url = cfg["openapi"] + PATH_CHECKIN_STATUS
-        try:
-            q = http_json(url, method="GET", headers=self.headers(), timeout=15,
-                          retries=2)
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
-            if exc.code in (404, 405, 410):
+        # 国际版签不到到 —— 基址走候选（openapi.qoder.sh 在部分网络不可达），
+        # 只在连接失败 / 404 时换下一个，业务 4xx 不换。
+        q, _code, _err = self._openapi_json(PATH_CHECKIN_STATUS,
+                                            headers=self.headers(),
+                                            timeout=8, retries=1,
+                                            fallback=False)
+        if q is None:
+            body = _err or ""
+            if _code in (404, 405, 410):
+                mark_openapi_missing(self.realm, PATH_CHECKIN_STATUS)
                 self._mark_checkin_capability(
-                    False, "%s (HTTP %d)" % (CHECKIN_REASON_NOT_FOUND, exc.code))
+                    False, "%s (HTTP %d)" % (CHECKIN_REASON_NOT_FOUND, _code))
                 return False, {
                     "unavailable": True,
                     "reason": CHECKIN_REASON_NOT_FOUND,
-                    "http": exc.code,
-                    "error": "HTTP %d %s" % (exc.code, body[:160]),
+                    "http": _code,
+                    "error": "HTTP %d %s" % (_code, body[:160]),
                 }
-            if exc.code == 403:
+            if _code == 403:
                 # issue #40：403 多为**出口/WAF 拦截**（国际版该接口本来就不存在，
                 # 正常应 404）。不写能力缓存（下次仍重探），给出可读原因——
                 # 面板显示「上游拒绝访问」而不是一句裸 HTTP 403。
@@ -2235,9 +2298,7 @@ class Account(object):
                     "error": "HTTP 403 %s" % body[:160],
                 }
             return False, {"unavailable": False,
-                           "error": "HTTP %d %s" % (exc.code, body[:160])}
-        except Exception as exc:
-            return False, {"unavailable": False, "error": str(exc)}
+                           "error": "HTTP %s %s" % (_code or "?", body[:160])}
         self._mark_checkin_capability(True, "")
         last = ""
         if q.get("lastClaimedAt"):
@@ -2292,24 +2353,21 @@ class Account(object):
             # 不发起无意义的 claim，按"活动未开放"成功跳过。
             return {"ok": True, "disabled": True, "status": st.get("status"),
                     "msg": "官方签到活动未开放 (status=%s)" % (st.get("status") or "?")}
-        cfg = get_realm_config(self.realm)
-        url = cfg["openapi"] + PATH_CHECKIN_CLAIM
-        try:
-            res = http_json(url, data=b"{}", method="POST",
-                            headers=self.headers(), timeout=15, retries=1)
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
+        # 同上：基址走候选（只在连接失败/404 时换下一个）
+        res, _code, _err = self._openapi_json(PATH_CHECKIN_CLAIM, method="POST",
+                                              data=b"{}",
+                                              headers=self.headers(),
+                                              timeout=15, retries=1,
+                                              fallback=False)
+        if res is None:
+            body = _err or ""
             # 上游并发/重复领取返回 409 ALREADY_CLAIMED —— 归一化为“已签”
             if "ALREADY_CLAIMED" in body:
                 self._stamp_checkin()
                 self._refresh_credits_quietly()
                 return {"ok": True, "already": True, "msg": "今日已签到"}
-            return {"ok": False, "error": "HTTP %d %s" % (exc.code, body[:160])}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": "HTTP %s %s"
+                    % (_code or "?", body[:160])}
         if str(res.get("result") or "") == "ALREADY_CLAIMED" or res.get("success") is False and "ALREADY" in str(res.get("error") or ""):
             self._stamp_checkin()
             self._refresh_credits_quietly()
@@ -2337,35 +2395,66 @@ class Account(object):
         except Exception:
             return {"ok": False, "error": "credits refresh after checkin failed"}
 
+    def _openapi_json(self, path, method="GET", headers=None, data=None, fallback=True,
+                      timeout=15, retries=1):
+        """按 openapi 候选基址依次请求（仅连接失败/404 换下一个）。
+
+        返回 (payload|None, code, error)。业务 4xx（401/403/429）不换基址——
+        那说明地址是对的，只是这次被拒。fallback=False 时只探主基址（legacy
+        端点在国际版必然 404，多探一个基址就是白等一个 RTT）。
+        """
+        last = (None, 0, "no openapi candidate")
+        # 已知 404：直接返回（否则 intl 的 legacy 端点每次都要 0.x~10s 才失败，
+        # 签到因此慢到不可用；TTL 6h 后允许重探，端点上线仍能被发现）。
+        if openapi_missing(self.realm, path):
+            return None, 404, "cached 404 (known missing in %s)" % self.realm
+        tried = 0
+        _bases = openapi_candidates(self.realm)
+        if not fallback:
+            _bases = _bases[:1]
+        for base in _bases:
+            url = base + path
+            tried += 1
+            try:
+                return http_json(url, method=method, headers=headers,
+                                 data=data, timeout=timeout,
+                                 retries=retries), 200, ""
+            except urllib.error.HTTPError as exc:
+                body = ""
+                try:
+                    body = exc.read().decode("utf-8", "replace")
+                except Exception:
+                    pass
+                last = (None, exc.code, "HTTP %d %s" % (exc.code, body[:120]))
+                if exc.code in (404, 405, 410):
+                    if tried >= 2:
+                        mark_openapi_missing(self.realm, path)
+                        return last
+                    continue          # 首个基址 404：再试一个候选
+                return last
+            except Exception as exc:
+                last = (None, 0, "%s @ %s" % (str(exc)[:100], base))
+                continue              # 连接层失败：换下一个基址
+        return last
+
+
     def _campaigns_get(self):
-        """一次活动列表请求（桌面端头 → 401/403 回退普通头）。
+        """一次活动列表请求（桌面端头 -> 401/403 回退普通头，基址走候选）。
 
         返回 (payload|None, http_code, error_str)；payload 为服务端 JSON。
         """
         if self.is_enterprise():
             return None, 0, ENTERPRISE_ACTIVITY_MSG
-        url = get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS
-        try:
-            return http_json(url, method="GET", headers=self.desktop_headers(),
-                             timeout=15, retries=1), 200, ""
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
-            # 桌面端头被拒（401/403）时回退普通头，至少保留"能不能看到"的信息
-            if exc.code in (401, 403):
-                try:
-                    return http_json(url, method="GET", headers=self.headers(),
-                                     timeout=15, retries=1), 200, ""
-                except urllib.error.HTTPError as exc2:
-                    return None, exc2.code, ("HTTP %d (desktop) / HTTP %d (plain)"
-                                             % (exc.code, exc2.code))
-                except Exception as exc2:
-                    return None, exc.code, "HTTP %d (desktop) / %s (plain)" % (exc.code, exc2)
-            return None, exc.code, "HTTP %d %s" % (exc.code, body[:160])
-        except Exception as exc:
-            return None, 0, str(exc)
+        q, code, err = self._openapi_json(PATH_CAMPAIGNS,
+                                          headers=self.desktop_headers())
+        if q is None and code in (401, 403):
+            q2, code2, err2 = self._openapi_json(PATH_CAMPAIGNS,
+                                                 headers=self.headers())
+            if q2 is not None:
+                return q2, 200, ""
+            return None, code2, ("HTTP %d (desktop) / HTTP %d (plain)"
+                                 % (code, code2))
+        return q, code, err
 
     def campaigns(self, force=False):
         """GET /sash/api/v1/me/campaigns -> 官方活动平台状态（双区域通用）。
@@ -2389,6 +2478,22 @@ class Account(object):
                 and now - self._campaigns_cache[0] < CAMPAIGNS_TTL:
             return self._campaigns_cache[1]
         q, code, err = self._campaigns_get()
+        # issue: intl 签不到到 —— 列表被隐藏且本机无原生身份时，用「最小机器头」
+        # （只 os+hostname）再试一次；实测这一组合仍被服务端视为官方客户端。
+        if isinstance(q, dict) and not q.get("showCampaign") \
+                and getattr(self, "machine_headers_state", "") == MACHINE_HEADERS_OMITTED \
+                and not _machine_minimal_disabled():
+            try:
+                q2 = http_json(get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS,
+                               method="GET",
+                               headers=self.desktop_headers(minimal=True),
+                               timeout=15, retries=1)
+            except Exception:
+                q2 = None
+            if isinstance(q2, dict) and q2.get("showCampaign"):
+                log("campaigns: hidden list recovered with minimal machine headers "
+                    "(realm=%s)" % self.realm)
+                q, code, err = q2, 200, ""
         # 自愈条件必须与生产端同源：machine_identity_source 的合法值是
         # MACHINE_IDENTITY_NATIVE("runtime-info") 或 "derived"；"native" 仅为
         # 历史/测试桩别名。此前误用 native 字面量做等值判断，导致此分支永不命中
@@ -2963,6 +3068,11 @@ class Account(object):
             if (shared and shared.get("available", True)
                 and not shared.get("unlimited")) else 0
         remain_effective = int(remain + _shared_avail)
+        _prev_eff = None
+        try:
+            _prev_eff = (self.credits or {}).get("remain_effective")
+        except Exception:
+            _prev_eff = None
         self.credits = {
             "remain": remain,
             "remain_effective": remain_effective,
@@ -2976,6 +3086,14 @@ class Account(object):
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # 面板用：积分变化（正=进账、负=消耗）。只在数值真的变了时更新，
+        # 同日多次刷新保留最后一次，避免签到 +100 被后续刷新覆盖成 0。
+        try:
+            if _prev_eff is not None and int(_prev_eff) != int(remain_effective):
+                self.last_credits_delta = int(remain_effective) - int(_prev_eff)
+                self.last_credits_delta_at = time.time()
+        except Exception:
+            pass
         self.last_quota_anomaly = None    # 正常体：清掉上次异常标记
         self.credits_degraded = None
         # task-61：余额刷新是 402 停放的**唯一**解封路径（remain > 0 才解）。

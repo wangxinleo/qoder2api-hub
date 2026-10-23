@@ -164,12 +164,16 @@ function doEnv(init){
 
   // ------------------------------------------------- ③ 账号行企业 badge
   const row = new Function('esc', 'USAGE_BY_ACCOUNT', 'accountGuardBadge', 'fmt',
-    ROW + '; return accountRow;')(esc, {}, () => '', v => String(v ?? 0));
+    'checkinBadge', 'creditsDeltaChip',
+    ROW + '; return accountRow;')(esc, {}, () => '', v => String(v ?? 0),
+    () => '<ck-stub>', () => '<delta-stub>');
   const base = { uid: 'ent-uid-1', nickname: 'Ent One', realm: 'cn', enabled: true,
     source: 'pat', expiresIn: '23h', lastError: '', credits: null };
   const entHtml = row(Object.assign({}, base, { enterpriseDomain: 'acme' }));
   check('企业账号行渲染「企业 · acme」badge（含免签到 title 说明）',
     /企业 · acme/.test(entHtml) && /不参与每日签到\/活动/.test(entHtml), null);
+  check('企业徽标与上游签到/积分 chip 同时渲染（同步冲突合并）',
+    entHtml.includes('<ck-stub>') && entHtml.includes('<delta-stub>'), entHtml);
   const pubHtml = row(Object.assign({}, base, { enterpriseDomain: '' }));
   check('公共账号（空串）不渲染企业 badge', !/企业 ·/.test(pubHtml), pubHtml.indexOf('企业 ·'));
 

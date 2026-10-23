@@ -326,6 +326,102 @@ a:hover{text-decoration:underline}
 /* ===== 页面区块导航（wb 同款）：.main-page 两栏布局 =====
    导航项完全由页面内的 section 现场生成：标题取该 section 首个 h2 的文本
    （忽略用于显示状态的 <em>），锚点 id 由标题内容哈希得到。 */
+
+/* ================= 用量洞察（独立板块） ================= */
+#pageInsights .insight-hero{display:flex;align-items:center;justify-content:space-between;gap:14px;
+  flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:16px 18px;margin-bottom:16px;position:relative;overflow:hidden}
+#pageInsights .insight-hero::before{content:"";position:absolute;left:-10%;top:-120%;width:60%;height:300%;
+  background:radial-gradient(circle,rgba(56,189,248,.16),transparent 62%);pointer-events:none;
+  transform:rotate(12deg)}
+#pageInsights .insight-grid{display:grid;gap:14px;
+  grid-template-columns:repeat(4,minmax(0,1fr))}
+@media (max-width:1180px){#pageInsights .insight-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:640px){#pageInsights .insight-grid{grid-template-columns:minmax(0,1fr)}}
+.insight-card{position:relative;display:flex;gap:14px;align-items:flex-start;overflow:hidden;
+  background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;
+  transition:transform .22s cubic-bezier(.2,.8,.25,1),box-shadow .22s ease,border-color .22s ease}
+.insight-card::after{content:"";position:absolute;right:-38%;top:-58%;width:170px;height:170px;
+  background:radial-gradient(circle,rgba(56,189,248,.20),transparent 66%);opacity:.5;
+  transition:opacity .28s ease,transform .5s ease;pointer-events:none}
+.insight-card:hover{transform:translateY(-3px);border-color:rgba(56,189,248,.45);
+  box-shadow:0 12px 28px rgba(2,8,20,.30)}
+.insight-card:hover::after{opacity:.95;transform:translate(-6px,6px)}
+.insight-icon{flex:0 0 auto;width:44px;height:44px;border-radius:12px;display:grid;place-items:center;
+  color:var(--accent);background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.22);
+  transition:transform .3s cubic-bezier(.18,.9,.3,1.5)}
+.insight-card:hover .insight-icon{transform:scale(1.1) rotate(-5deg)}
+.insight-meta{min-width:0;flex:1}
+.insight-val{font-size:24px;font-weight:700;line-height:1.15;letter-spacing:.4px;
+  font-variant-numeric:tabular-nums;color:var(--fg)}
+.insight-lbl{font-size:12px;color:var(--dim);margin-top:3px;line-height:1.5}
+.insight-sub{font-size:11px;color:var(--dim);margin-top:7px;line-height:1.5}
+.insight-sub code{font-size:10px;background:var(--panel2);padding:1px 5px;border-radius:4px}
+.insight-bar{height:4px;border-radius:99px;background:var(--panel2);overflow:hidden;margin-top:10px}
+.insight-bar>i{display:block;height:100%;width:0;border-radius:99px;
+  background:linear-gradient(90deg,var(--accent),#22d3ee);
+  transition:width .85s cubic-bezier(.22,.85,.25,1)}
+.insight-block{margin-top:20px}
+.insight-block h2 em{font-style:normal;font-size:12px;color:var(--dim);margin-left:6px;font-weight:400}
+.insight-empty{display:flex;align-items:center;gap:10px;padding:18px 16px;color:var(--dim);
+  font-size:12px;border:1px dashed var(--line);border-radius:12px;background:var(--panel)}
+.insight-table{width:100%;border-collapse:collapse;font-size:12px}
+.insight-table thead th{position:sticky;top:0;background:var(--panel);color:var(--dim);
+  font-weight:500;font-size:11px;text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+.insight-table tbody td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+.insight-table tbody tr{transition:background .16s ease,transform .16s ease}
+.insight-table tbody tr:hover{background:var(--panel2);transform:translateX(2px)}
+.insight-table tbody tr:last-child td{border-bottom:none}
+.insight-detail{color:var(--dim);font-size:11px;max-width:420px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+@keyframes insightRowIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.insight-table tbody tr{animation:insightRowIn .34s ease both;
+  animation-delay:calc(var(--i,0) * 18ms)}
+@keyframes insightCardIn{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
+.insight-card{animation:insightCardIn .42s cubic-bezier(.2,.8,.25,1) both}
+.insight-card:nth-child(2){animation-delay:.05s}
+.insight-card:nth-child(3){animation-delay:.1s}
+.insight-card:nth-child(4){animation-delay:.15s}
+#btnInsightRefresh svg{transition:transform .5s ease}
+#btnInsightRefresh.spin svg{animation:insightSpin .8s linear infinite}
+@keyframes insightSpin{to{transform:rotate(360deg)}}
+
+
+/* 账号行：今日签到徽标 + 积分变化 */
+.ck-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 8px;white-space:nowrap;
+  border-radius:999px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);
+  transition:background .18s ease,color .18s ease,border-color .18s ease}
+.ck-badge.done{color:#34d399;border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.12)}
+.ck-badge.pending{color:#fbbf24;border-color:rgba(251,191,36,.42);background:rgba(251,191,36,.10)}
+.ck-badge svg{width:11px;height:11px}
+.delta-chip{display:inline-flex;align-items:center;gap:2px;font-size:11px;font-weight:600;white-space:nowrap;
+  padding:1px 7px;border-radius:999px;margin-left:6px;font-variant-numeric:tabular-nums;
+  animation:deltaPop .45s cubic-bezier(.2,.9,.3,1.4) both}
+.delta-chip.up{color:#34d399;background:rgba(52,211,153,.14)}
+.delta-chip.down{color:#f87171;background:rgba(248,113,113,.14)}
+.delta-chip.zero{color:var(--dim);background:var(--panel2)}
+@keyframes deltaPop{0%{opacity:0;transform:translateY(4px) scale(.85)}100%{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){.delta-chip{animation:none}}
+/* ================= 全局交互 polish ================= */
+.main-nav-btn{transition:background .18s ease,color .18s ease,border-color .18s ease,
+  transform .12s ease,box-shadow .18s ease}
+.main-nav-btn:hover{transform:translateY(-1px)}
+.main-nav-btn:active{transform:translateY(0) scale(.97)}
+.main-nav-btn.active{box-shadow:0 2px 10px rgba(56,189,248,.16)}
+button{transition:transform .12s ease,box-shadow .18s ease,background .18s ease,border-color .18s ease,
+  color .18s ease}
+button:not(:disabled):active{transform:scale(.975)}
+button:disabled{opacity:.6;cursor:not-allowed}
+.table-wrap tbody tr{transition:background .16s ease}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+::selection{background:rgba(56,189,248,.28)}
+.card,.key-card{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}
+.card:hover{transform:translateY(-2px);box-shadow:0 10px 24px rgba(2,8,20,.22)}
+.badge{transition:background .18s ease,color .18s ease}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.001ms !important;animation-iteration-count:1 !important;
+    transition-duration:.001ms !important;scroll-behavior:auto !important}
+}
 .main-page{display:none}
 .main-page.active{display:block}
 .main-page.page-nav-on.active{display:grid;grid-template-columns:196px minmax(0,1fr);gap:20px;align-items:start}
@@ -558,6 +654,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <button class="main-nav-btn" id="btnNavAnalytics" onclick="switchMainTab('analytics')">
         数据指标看板
       </button>
+      <button class="main-nav-btn" id="btnNavInsights" onclick="switchMainTab('insights')">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="margin-right:5px;vertical-align:-2px"><path d="M3 3v18h18"/><path d="M7 15l3.5-4.5 3 2.5L19 7"/><circle cx="7" cy="15" r="1.2" fill="currentColor" stroke="none"/><circle cx="19" cy="7" r="1.2" fill="currentColor" stroke="none"/></svg>用量洞察
+      </button>
       <button class="main-nav-btn" id="btnNavLogs" onclick="switchMainTab('logs')">
         运行日志
       </button>
@@ -718,13 +817,6 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </div>
   </div>
 
-  <section id="insightSection">
-    <h2>用量洞察 <em id="insightHint">费用估算 · 积分获取 · 剩余天数</em></h2>
-    <div class="cards" id="insightCards"></div>
-    <div class="table-wrap" id="grantsWrap" style="margin-top:12px"></div>
-    <div class="table-wrap" id="remainingWrap" style="margin-top:12px"></div>
-    <div class="table-wrap" id="activityWrap" style="margin-top:12px"></div>
-  </section>
 
   <div class="cards" id="cards"></div>
 
@@ -873,7 +965,38 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 
   
   </div><!-- /pageGateway -->
-  <div id="pageAnalytics" class="main-page">
+  <div id="pageInsights" class="main-page">
+  <section class="insight-hero">
+    <div class="insight-hero-text">
+      <h2 style="margin:0">用量洞察</h2>
+      <div style="font-size:12px;color:var(--dim);margin-top:4px">
+        等价花费、积分获取与剩余天数——数据每 30 秒自动刷新，全部只读本地记录。
+      </div>
+    </div>
+    <button class="sec mini" onclick="loadInsights(true)" id="btnInsightRefresh">
+      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>
+      刷新
+    </button>
+  </section>
+
+  <div class="insight-grid" id="insightCards"></div>
+
+  <section class="insight-block">
+    <h2>积分包与获取记录 <em id="grantsHint"></em></h2>
+    <div class="table-wrap" id="grantsWrap"></div>
+  </section>
+
+  <section class="insight-block">
+    <h2>剩余用量估算 <em id="remainingHint"></em></h2>
+    <div class="table-wrap" id="remainingWrap"></div>
+  </section>
+
+  <section class="insight-block">
+    <h2>签到 / 领取流水 <em id="activityHint"></em></h2>
+    <div class="table-wrap" id="activityWrap"></div>
+  </section>
+</div>
+<div id="pageAnalytics" class="main-page">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px">
       <div>
         <h2 style="margin:0;font-size:16px;color:var(--fg);display:flex;align-items:center;gap:8px">
@@ -898,6 +1021,11 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <div class="k">累计消耗 Token</div>
         <div class="v" id="kpiTotalTokens">0</div>
         <div class="s" id="kpiTotalTokensDetail">输入 0 · 输出 0</div>
+      </div>
+      <div class="card" title="首字延迟与排队/回读质量（issue #87）">
+        <div class="k">首字延迟 / 排队</div>
+        <div class="v" id="kpiTTFT">-</div>
+        <div class="s" id="kpiQualityDetail">等待数据</div>
       </div>
       <div class="card accent2">
         <div class="k">网关平均生成速度</div>
@@ -2360,6 +2488,15 @@ async function saveSchedule(btn){
 // —— 用量洞察（跟进 wb：费用估算 / 积分获取历史 / 剩余用量估算）——
 let INSIGHT_GRANTS = [];
 let INSIGHT_REMAIN = [];
+let INSIGHT_ACTIVITY = [];
+
+// 图标卡片的 SVG（内联，零依赖）
+const INSIGHT_ICONS = {
+  cost: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M14.5 9.2c-.6-.7-1.5-1.1-2.5-1.1-1.5 0-2.6.8-2.6 2s1 1.7 2.6 2 2.6.9 2.6 2.1-1.1 2-2.6 2c-1 0-1.9-.4-2.5-1.1"/><path d="M12 6.3v11.4"/></svg>',
+  grants: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10.5h16V19a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19z"/><path d="M3 7.5h18v3H3z"/><path d="M12 7.5v13"/><path d="M12 7.5S10.8 3.6 8.6 3.6a2 2 0 0 0 0 3.9z"/><path d="M12 7.5s1.2-3.9 3.4-3.9a2 2 0 0 1 0 3.9z"/></svg>',
+  days: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h10"/><path d="M7 21h10"/><path d="M8 3c0 4 4 5 4 9s-4 5-4 9"/><path d="M16 3c0 4-4 5-4 9s4 5 4 9"/></svg>',
+  activity: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg>',
+};
 
 function _usd(v){
   if(v === null || v === undefined) return "—";
@@ -2370,9 +2507,56 @@ function _usd(v){
   return "$" + n.toFixed(4);
 }
 
-async function loadInsights(){
+function _prefersReduced(){
+  try{ return window.matchMedia("(prefers-reduced-motion: reduce)").matches; }catch(e){ return false; }
+}
+
+// 数字滚动（尊重 reduced-motion）
+function _countUp(el, to, fmtFn, dur){
+  if(!el) return;
+  if(to === null || to === undefined || !isFinite(Number(to))){ el.textContent = fmtFn(null); return; }
+  const target = Number(to);
+  if(_prefersReduced()){ el.textContent = fmtFn(target); return; }
+  const t0 = performance.now();
+  const ms = dur || 780;
+  function step(t){
+    const p = Math.min(1, (t - t0) / ms);
+    const eased = 1 - Math.pow(1 - p, 3);
+    el.textContent = fmtFn(target * eased);
+    if(p < 1) requestAnimationFrame(step);
+    else el.textContent = fmtFn(target);
+  }
+  requestAnimationFrame(step);
+}
+
+function _insightCard(cfg){
+  return '<div class="insight-card" title="' + esc(cfg.tip || "") + '">'
+    + '<div class="insight-icon">' + cfg.icon + '</div>'
+    + '<div class="insight-meta">'
+    +   '<div class="insight-val" id="' + cfg.id + '">—</div>'
+    +   '<div class="insight-lbl">' + esc(cfg.label) + '</div>'
+    +   (cfg.sub ? '<div class="insight-sub">' + cfg.sub + '</div>' : "")
+    +   (cfg.bar != null ? '<div class="insight-bar"><i id="' + cfg.id + 'Bar"></i></div>' : "")
+    + '</div></div>';
+}
+
+function _bar(id, ratio){
+  const el = document.getElementById(id);
+  if(!el) return;
+  requestAnimationFrame(function(){
+    el.style.width = Math.max(0, Math.min(1, ratio || 0)) * 100 + "%";
+  });
+}
+
+function _empty(text, icon){
+  return '<div class="insight-empty">' + (icon || "") + '<span>' + esc(text) + '</span></div>';
+}
+
+async function loadInsights(showToast){
   const cards = document.getElementById("insightCards");
   if(!cards) return;
+  const btn = document.getElementById("btnInsightRefresh");
+  if(btn){ btn.disabled = true; btn.classList.add("spin"); }
   try{
     const [usage, pricing, grants, remain, activity] = await Promise.all([
       getJSON("/usage").catch(() => ({})),
@@ -2382,71 +2566,104 @@ async function loadInsights(){
       getJSON("/accounts/activity?limit=100").catch(() => ({})),
     ]);
     const cost = usage && usage.cost_usd != null ? usage.cost_usd : null;
-    const unpriced = (pricing && pricing.unpriced || []).length;
+    const unpriced = (pricing && pricing.unpriced) || [];
+    const pricedTotal = Object.keys((pricing && pricing.table) || {}).length + unpriced.length;
     const gs = (grants && grants.summary) || {};
     INSIGHT_GRANTS = (grants && grants.rows) || [];
     INSIGHT_REMAIN = (remain && remain.rows) || [];
+    INSIGHT_ACTIVITY = (activity && activity.rows) || [];
+    const asum = (activity && activity.summary) || {};
     const days = INSIGHT_REMAIN.filter(r => r.days_left != null).map(r => r.days_left);
     const minDays = days.length ? Math.min.apply(null, days) : null;
+    const tightest = INSIGHT_REMAIN.filter(r => r.days_left === minDays)[0];
+
     cards.innerHTML =
-      '<div class="card"><div class="val">' + _usd(cost) + '</div>'
-      + '<div class="lbl">API 等价花费（参考 OpenRouter 价）</div>'
-      + '<div class="hint" style="font-size:11px;color:var(--dim)">'
-      + (unpriced ? (unpriced + " 个模型未定价（显示 —）") : "全部模型已定价")
-      + '</div></div>'
-      + '<div class="card"><div class="val">' + (gs.count || 0) + '</div>'
-      + '<div class="lbl">积分包 / 获取记录</div>'
-      + '<div class="hint" style="font-size:11px;color:var(--dim)">剩余 '
-      + fmt(gs.remain) + ' / 面额 ' + fmt(gs.size) + '</div></div>'
-      + '<div class="card"><div class="val">'
-      + (minDays == null ? "—" : (minDays + " 天")) + '</div>'
-      + '<div class="lbl">最快耗尽账号（按近 24h 速率）</div>'
-      + '<div class="hint" style="font-size:11px;color:var(--dim)">仅线性外推，仅供参考</div></div>';
+      _insightCard({ icon: INSIGHT_ICONS.cost, id: "insCost", bar: "insCostBar",
+        label: "API 等价花费（参考 OpenRouter 价）",
+        tip: "按缓存命中 / 未命中输入与输出三档单价折算，仅估算，不能用于结算",
+        sub: unpriced.length
+          ? (unpriced.length + " 个模型未定价 · 见 <code>usage/pricing-overrides.json</code>")
+          : "全部模型已定价" })
+      + _insightCard({ icon: INSIGHT_ICONS.grants, id: "insGrants", bar: "insGrantsBar",
+        label: "积分包 / 获取记录",
+        sub: "剩余 " + fmt(gs.remain) + " / 面额 " + fmt(gs.size) })
+      + _insightCard({ icon: INSIGHT_ICONS.days, id: "insDays", bar: "insDaysBar",
+        label: "最快耗尽账号（24h 外推）",
+        tip: "按近 24 小时消耗线性外推，仅供参考",
+        sub: tightest ? esc(tightest.account || "") : "暂无可用速率样本" })
+      + _insightCard({ icon: INSIGHT_ICONS.activity, id: "insAct", bar: "insActBar",
+        label: "签到 / 领取成功率（30 天）",
+        sub: "成功 " + fmt(asum.ok) + " · 失败 " + fmt(asum.failed)
+             + " · 累计积分 " + fmt(asum.earned_credits) });
+
+    _countUp(document.getElementById("insCost"), cost,
+      v => v == null ? "—" : _usd(v));
+    _countUp(document.getElementById("insGrants"), gs.count || 0, v => fmt(Math.round(v)));
+    _countUp(document.getElementById("insDays"), minDays,
+      v => v == null ? "—" : (Number(v).toFixed(1) + " 天"));
+    _countUp(document.getElementById("insAct"),
+      (asum.ok || 0) + (asum.failed || 0) ? (asum.ok || 0) : 0, v => fmt(Math.round(v)));
+
+    _bar("insCostBar", pricedTotal ? Math.max(0.05, 1 - unpriced.length / pricedTotal) : 0);
+    _bar("insGrantsBar", gs.size ? Math.min(1, (gs.remain || 0) / gs.size) : 0);
+    _bar("insDaysBar", minDays == null ? 0 : Math.min(1, minDays / 30));
+    _bar("insActBar", (asum.ok || 0) + (asum.failed || 0)
+      ? (asum.ok || 0) / ((asum.ok || 0) + (asum.failed || 0)) : 0);
+
     renderGrants();
     renderRemaining();
-    renderActivity((activity && activity.rows) || [], (activity && activity.summary) || {});
+    renderActivity(INSIGHT_ACTIVITY, asum);
+    if(showToast) toast("用量洞察已刷新", "ok");
   }catch(e){
-    cards.innerHTML = '<div class="card"><div class="val">—</div><div class="lbl">用量洞察加载失败</div></div>';
+    cards.innerHTML = _empty("用量洞察加载失败：" + ((e && e.message) || e), INSIGHT_ICONS.activity);
+  }finally{
+    if(btn){ btn.disabled = false; btn.classList.remove("spin"); }
   }
 }
 
+function _stagger(i){ return ' style="--i:' + Math.min(i, 20) + '"'; }
 
 function renderActivity(rows, summary){
   const box = document.getElementById("activityWrap");
+  const hint = document.getElementById("activityHint");
+  if(hint) hint.textContent = rows && rows.length ? ("（" + rows.length + " 条 · 30 天保留）") : "";
   if(!box) return;
   if(!rows || !rows.length){
-    box.innerHTML = '<div style="font-size:12px;color:var(--dim);margin:6px 0">签到 / 领取记录：暂无（执行一次签到后这里会出现）</div>';
+    box.innerHTML = _empty("还没有签到 / 领取记录，执行一次签到后这里就会出现。");
     return;
   }
   const kindName = k => k === "checkin" ? "签到" : (k === "claim" ? "领取" : (k || "动作"));
-  box.innerHTML = '<div style="font-size:12px;color:var(--dim);margin:6px 0">签到 / 领取记录（成功 '
-    + (summary.ok || 0) + ' · 失败 ' + (summary.failed || 0)
-    + ' · 累计积分 ' + fmt(summary.earned_credits) + '，30 天保留）</div>'
-    + '<table><thead><tr><th style="width:150px">时间</th><th style="width:80px">动作</th>'
-    + '<th style="width:110px">账号</th><th style="width:70px">结果</th>'
-    + '<th style="text-align:right;width:80px">积分</th><th>说明</th></tr></thead><tbody>'
-    + rows.slice(0, 100).map(r => {
+  box.innerHTML = '<table class="insight-table"><thead><tr><th style="width:150px">时间</th>'
+    + '<th style="width:80px">动作</th><th style="width:120px">账号</th>'
+    + '<th style="width:76px">结果</th><th style="text-align:right;width:80px">积分</th>'
+    + '<th>说明</th></tr></thead><tbody>'
+    + rows.slice(0, 100).map((r, i) => {
         const ts = r.ts ? new Date(r.ts * 1000).toLocaleString() : "—";
-        return '<tr><td class="mono" style="font-size:11px">' + esc(ts) + '</td>'
+        return '<tr' + _stagger(i) + '><td class="mono" style="font-size:11px">' + esc(ts) + '</td>'
           + '<td>' + esc(kindName(r.kind)) + '</td>'
           + '<td>' + esc(r.nickname || r.uid || "") + '</td>'
           + '<td>' + (r.ok ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>') + '</td>'
           + '<td style="text-align:right">' + fmt(r.amount) + '</td>'
-          + '<td style="color:var(--dim);font-size:11px">' + esc(r.detail || "") + '</td></tr>';
+          + '<td class="insight-detail">' + esc(r.detail || "") + '</td></tr>';
       }).join("")
     + '</tbody></table>';
 }
+
 function renderGrants(){
   const box = document.getElementById("grantsWrap");
+  const hint = document.getElementById("grantsHint");
+  if(hint) hint.textContent = INSIGHT_GRANTS.length ? ("（" + INSIGHT_GRANTS.length + " 条）") : "";
   if(!box) return;
-  if(!INSIGHT_GRANTS.length){ box.innerHTML = ""; return; }
-  box.innerHTML = '<div style="font-size:12px;color:var(--dim);margin:6px 0">积分获取历史（来自最近一次积分快照）</div>'
-    + '<table><thead><tr><th style="width:90px">账号</th><th>名称</th>'
-    + '<th style="text-align:right;width:80px">面额</th>'
-    + '<th style="text-align:right;width:80px">剩余</th>'
-    + '<th style="text-align:right;width:80px">已用</th></tr></thead><tbody>'
-    + INSIGHT_GRANTS.slice(0, 50).map(r =>
-        '<tr><td>' + esc(r.account || "") + '</td>'
+  if(!INSIGHT_GRANTS.length){
+    box.innerHTML = _empty("暂无积分包数据——先去「签到与福利中心」刷新一次积分。");
+    return;
+  }
+  box.innerHTML = '<table class="insight-table"><thead><tr><th style="width:110px">账号</th><th>名称</th>'
+    + '<th style="text-align:right;width:90px">面额</th>'
+    + '<th style="text-align:right;width:90px">剩余</th>'
+    + '<th style="text-align:right;width:90px">已用</th></tr></thead><tbody>'
+    + INSIGHT_GRANTS.slice(0, 50).map((r, i) =>
+        '<tr' + _stagger(i) + '><td>' + esc(r.account || "") + '</td>'
         + '<td>' + esc(r.name || "") + '</td>'
         + '<td style="text-align:right">' + fmt(r.size) + '</td>'
         + '<td style="text-align:right">' + fmt(r.remain) + '</td>'
@@ -2456,23 +2673,28 @@ function renderGrants(){
 
 function renderRemaining(){
   const box = document.getElementById("remainingWrap");
+  const hint = document.getElementById("remainingHint");
+  if(hint) hint.textContent = INSIGHT_REMAIN.length ? "（近 24 小时消耗外推）" : "";
   if(!box) return;
-  if(!INSIGHT_REMAIN.length){ box.innerHTML = ""; return; }
-  box.innerHTML = '<div style="font-size:12px;color:var(--dim);margin:6px 0">剩余用量估算（近 24 小时消耗外推）</div>'
-    + '<table><thead><tr><th style="width:120px">账号</th>'
-    + '<th style="text-align:right;width:90px">剩余积分</th>'
+  if(!INSIGHT_REMAIN.length){
+    box.innerHTML = _empty("暂无账号用量——先添加账号并产生一些请求。");
+    return;
+  }
+  box.innerHTML = '<table class="insight-table"><thead><tr><th style="width:130px">账号</th>'
+    + '<th style="text-align:right;width:100px">剩余积分</th>'
     + '<th style="text-align:right;width:110px">24h 消耗</th>'
     + '<th style="text-align:right;width:110px">24h tokens</th>'
     + '<th style="text-align:right;width:110px">预计可用</th></tr></thead><tbody>'
-    + INSIGHT_REMAIN.map(r =>
-        '<tr><td>' + esc(r.account || "") + '</td>'
+    + INSIGHT_REMAIN.map((r, i) =>
+        '<tr' + _stagger(i) + '><td>' + esc(r.account || "") + '</td>'
         + '<td style="text-align:right">' + (r.unlimited ? "无限" : fmt(r.remain)) + '</td>'
         + '<td style="text-align:right">' + fmt(r.used_24h_credit) + '</td>'
         + '<td style="text-align:right">' + fmt(r.used_24h_tokens) + '</td>'
-        + '<td style="text-align:right">' + (r.days_left == null ? "—" : (r.days_left + " 天")) + '</td></tr>').join("")
+        + '<td style="text-align:right">' + (r.days_left == null
+            ? '<span style="color:var(--dim)">—</span>'
+            : (r.days_left + " 天")) + '</td></tr>').join("")
     + '</tbody></table>';
-}
-async function loadSchedulerStatus(){
+}async function loadSchedulerStatus(){
   try{
     const s = await getJSON("/scheduler");
     const bar = document.getElementById("schedulerBar");
@@ -2532,7 +2754,6 @@ async function toggleScheduler(btn){
   try{
     const r = await postJSON("/scheduler/toggle", {});
     await loadSchedulerStatus();
-    loadInsights();
     toast("后台调度器已" + (r.enabled ? "启用" : "暂停"), "ok");
   }catch(e){
     toast("切换失败: " + e.message, "bad");
@@ -2815,6 +3036,30 @@ function accountGuardBadge(a){
   return '<span class="badge ok" title="' + title + '">正常</span>';
 }
 
+
+// 今日是否已签到（服务端 public() 的 checkedInToday / lastCheckinDate）
+function checkinBadge(a){
+  if(a && a.checkedInToday){
+    return '<span class="ck-badge done" title="今日已签到'
+      + (a.lastCheckinDate ? ("（" + esc(a.lastCheckinDate) + "）") : "") + '">'
+      + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>'
+      + '今日已签到</span>';
+  }
+  return '<span class="ck-badge pending" title="今日尚未签到"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>今日未签到</span>';
+}
+
+// 最近一次积分变化：正=进账（签到 +100），负=消耗
+function creditsDeltaChip(a){
+  const d = a && a.lastCreditsDelta;
+  if(d === null || d === undefined || d === "") return "";
+  const n = Number(d);
+  if(!isFinite(n) || n === 0) return "";
+  const cls = n > 0 ? "up" : "down";
+  const txt = (n > 0 ? "+" : "") + n;
+  const when = a.lastCreditsDeltaAt ? new Date(a.lastCreditsDeltaAt * 1000).toLocaleString() : "";
+  return '<span class="delta-chip ' + cls + '" title="最近一次积分变化 ' + txt
+    + (when ? ("（" + esc(when) + "）") : "") + '">' + esc(txt) + "</span>";
+}
 function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
@@ -2885,14 +3130,16 @@ function accountRow(a){
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
-    +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + entBadge + '</div>'
+    +   '<div style="font-weight:600;font-size:13px;color:var(--fg);display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
+    +     esc(a.nickname) + entBadge + checkinBadge(a) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + (a.note ? ('<div class="hint" style="margin:3px 0 0" title="备注（issue #69）"><span style="color:var(--accent)">备注</span> ' + esc(a.note) + '</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
     + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
-    + '<td style="text-align:left;white-space:nowrap">' + credText + freshLine + '</td>'
+    + '<td style="text-align:left;white-space:nowrap">' + credText
+    +   creditsDeltaChip(a) + freshLine + '</td>'
     + '<td style="text-align:right">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.total_tokens) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.cached_tokens) + '</td>'
@@ -3947,7 +4194,7 @@ async function startDashboard(){
     }, 5000),
     setInterval(refresh, 5000),
     setInterval(loadSchedulerStatus, 30000),
-    setInterval(loadInsights, 30000),
+    setInterval(() => { if(currentMainTab === 'insights') loadInsights(); }, 30000),
     setInterval(loadAccounts, 15000),
   ];
 }
@@ -4441,7 +4688,7 @@ async function saveLimits(btn){
   }
 }
 
-const MAIN_TABS = ['gateway', 'analytics', 'logs', 'agents', 'settings'];
+const MAIN_TABS = ['gateway', 'analytics', 'insights', 'logs', 'agents', 'settings'];
 
 /* ---- 页面区块导航（wb 同款全套移植）----
    导航项完全由页面内的 section 现场生成：标题取该 section 首个 h2 的文本
@@ -4758,6 +5005,7 @@ function switchMainTab(tab){
     initPageNav(document.querySelector('.main-page.active'));
   }
   if(tab === 'analytics') loadAnalytics();
+  if(tab === 'insights') loadInsights();
   if(tab === 'agents') loadAgentsPage(false);
   if(tab === 'settings') loadSettings();
   if(tab === 'logs'){
@@ -5634,12 +5882,35 @@ function renderDailyChart(d){
   }
 }
 
+async function loadQuality(){
+  // issue #87：TTFT p50/p90、排队率、回读命中（来自 /health.quality）
+  try{
+    const h = await getJSON('/health');
+    const q = (h && h.quality) || {};
+    const el = document.getElementById('kpiTTFT');
+    const det = document.getElementById('kpiQualityDetail');
+    const fmtSec = v => (v == null ? '-' : (v/1000).toFixed(1) + ' s');
+    if(el){
+      el.innerHTML = fmtSec(q.ttft_p50_ms) +
+        '<span style="font-size:12px;font-weight:400;color:var(--dim)"> p50 / p90 ' +
+        fmtSec(q.ttft_p90_ms) + '</span>';
+    }
+    if(det){
+      const qr = (q.queue_rate == null) ? '-' : (q.queue_rate * 100).toFixed(1) + '%';
+      const rec = q.recovery || {};
+      det.textContent = '排队 ' + qr + ' · 回读 ' + (rec.leak || 0) + '+' + (rec.dsml || 0) +
+        ' · 模式 ' + (q.queue_mode || '-');
+    }
+  }catch(e){ /* 面板静默：健康检查失败不该刷错误 */ }
+}
+
 async function loadAnalytics(){
   try {
     // 两个端点并行：矩阵有自己的 §range，失败也不影响 KPI（loadByKey 内部自吞异常）
     const [data] = await Promise.all([getJSON('/usage/analytics'), loadByKey()]);
     cachedAnalyticsData = data;
     renderAnalytics(data);
+    loadQuality();
   } catch(err) {
     console.error('loadAnalytics failed:', err);
   }
