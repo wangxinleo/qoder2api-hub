@@ -9,6 +9,188 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.6
+
+**🐛 问题修复**
+
+- **排队耗尽后 `RateLimited.status` AttributeError，200 的 SSE 被硬截断**（#100）：`visible_queue_acquire` 放弃时会把排队异常归一化成 `RateLimited`（只有 `http_error/detail/wait`，**没有 `.status`**），而 `/v1/responses` 与 chat 的 pump 收尾路径直接读 `pump_exc.status` —— 于是 200 已经发出去、流里一个字节都没补，客户端只看到连接被截断。
+  新增 `_exc_http_status(exc, default)` 统一取状态：`UpstreamStatus/Queued -> .status`、`RateLimited -> 429`、`HTTPError -> .code`，取不到才回落默认值；responses 与 chat 两处收尾都改为走它，并且仍按协议发终态事件（`response.failed` / `data: {error}` + `[DONE]`）。
+
+- **`max_tokens` 超上游上限直接透 400**（#101）：官方清单没有 `maxOutputTokens`，客户端只能踩坑试出来。现在把上游那句 `Range of max_tokens should be [1, N]` 当**学习信号**：
+  - `learn_max_output_limit()` 解析 `N`，按 `(区域, 模型)`（同时记客户端名与解析后的上游 key）落盘到 `usage/max-output-limits.json`，7 天 TTL；
+  - `build_qoder_body()` 在组装请求时就 clamp（含 `/v1/responses` 的 `max_output_tokens`），并打 WARN；
+  - `/v1/models` 补上 `max_output_tokens` / `max_completion_tokens`，客户端可自行预判；
+  - 记录点接在 `record_error`，任何入口命中该错误都会学到。
+
+  语义：第一次超限仍会收到上游 400（网关靠它才知道 N），**之后同一模型自动压到上限**。
+
+**验证**：新增 `tests/_test_issue100_101.py`（22 条：状态提取四类异常、两处收尾的源码守卫、上限解析/落盘/重载/clamp 生效与不生效、请求体实测 clamp、`/v1/models` 补字段）；全量 **77 suites / 2127 checks / 0 failed**。
+
+## v1.7.5
+
+**🔄 跟进官方桌面端新版（CN 0.4.3 / intl 0.4.8）**
+
+逆向了两版客户端的 bundle，把「我们已经落后」和「可以顺手增强」的部分分开处理。
+
+**✨ 新增：官方积分消耗（真实记账口径）**
+
+- 客户端新增 `/sash/api/v1/ai-conversations/credits-summary`（累计消耗 + 单日峰值 + 峰值日）与 `credits-heatmap`（近 365 天逐日消耗），cn / intl 实测均 200；
+- 网关新增 `Account.fetch_credit_usage()`（按账号缓存 5 分钟）与 `GET /accounts/credits/usage`（汇总 + 逐日合并，支持 `?uid=` / `?realm=`）；
+- 面板「用量洞察」新增 **官方积分消耗** 区块：累计 / 峰值摘要 + 365 天热力图 + 按账号明细表（含查询失败标记）；前端另有 60 秒节流与签名去重，不跟着 5 秒轮询打。
+
+**🩹 增强：国际版活动平台第二入口**
+
+- `center.qoder.sh` 实测对 intl 的 `/sash/...` 返回 200、对 cn 返回 401，已作为 intl 的候选基址排在官网域名之前（`openapi_candidates` 仍只在连接失败/404 时才换）。
+
+**📌 已封成能力、暂未上界面**
+
+- `/sash/api/v1/me/achievements`（已获成就 key）→ `Account.fetch_achievements()`，用于解释「活动需先完成某成就」，面板展示留到下一版。
+
+**🔍 查过但不采用的**
+
+- `/api/v2/service/region/endpoints`、`/api/v2/me/usage`：用桌面端 token 在 openapi 上是 404（`api.qoder.com` 上是 401，属另一套鉴权），暂无可解析契约——intl 推理主机仍用硬编码 api3/api2/api1 + `QD_INTL_GATEWAY` 覆盖；
+- 客户端版本号：本机 CN 实际是 **0.4.3**（随包带了 `resources/umid/runtime-info.exe`），我们的 `DESKTOP_CLIENT_VERSION=0.4.8` 来自 intl，仍可用 `QD_DESKTOP_VERSION` 覆盖。
+
+**🧪 测试**：新增 `_test_credit_usage.py`（21 条：端点常量 / 解析 / 缓存命中 / 失败回退 / 路由 / 面板 / 节流 / 去重）；修掉 `_test_qoder.py` 里两处依赖「本机没有 runtime-info 组件」的断言（新版客户端已随包提供，改为显式钉 derived 身份再验证）。全量 **76 suites / 2105 checks / 0 failed**。
+
+## v1.7.4
+
+**🐛 问题修复**
+
+- **Anthropic 入口（`/v1/messages`）漏接排队分支**（#99）：`open_upstream()` 在 `visible` 模式下把 10605 排队抛给上层由各入口等待，但 `_handle_anthropic` 的 except 链里只有父类 `UpstreamStatus`，没有 `UpstreamQueued`——于是排队异常掉进兜底分支：**零等待**直接 503，并且**丢掉 `Retry-After`**。聚合网关（NewAPI 的 Claude 渠道）因此无法按上游建议退避，只能立刻重试。
+
+  现在与 `/v1/chat/completions`、`/v1/responses` 对齐：
+  - `visible` + 流式：建流后**流内等待**，用 anthropic 的 `ping` 事件携带 `qoder_queue` 报进度，超预算给 `event: error`（`overloaded_error`）收尾；
+  - `fast` 或非流式：直接 503 + `Retry-After` + 中文原因；
+  - 兜底的 `except UpstreamStatus` 也会透传 `retry_after`，避免将来出现新的排队形态时再次丢掉退避信息。
+
+  为什么这里可以安全地做流内等待：排队发生在 `open_upstream()` 阶段，此时**一个字节都还没写给客户端**（`_sse_begin()` 尚未调用），不存在 docstring 里担心的「重复 `message_start`」问题——那条能力差异只适用于 `aggregate_stream` 之后的分支。
+
+**验证**：新增 `tests/_test_issue99_anthropic_queue.py`（18 条：源码守卫 + 用桩 Handler 实测三条路径——非流式 503+Retry-After、`fast` 模式不建流、`visible` 流式发 ping 排队帧并在超预算时发 `event: error` 且不返回 `_error`）；全量 **75 suites / 2084 checks / 0 failed**。
+
+## v1.7.3
+
+**🐛 问题修复**
+
+- **数据看板轮询时动画反复播放、图表跳动**（#98）：`loadAnalytics()` 每 5 秒重新拉数据并**整块重绘**，于是数字滚动、排行进度条增长、柱状图 `height` 过渡、折线描边、热力图 365 格重建、洞察四卡 + 三张表全部重播一次——数据没变也照播。
+  现在两层防护：
+  - **分区签名**（`statSig`）：KPI、四张排行、热力图、缓存四卡、24h 曲线、按天趋势、按 Key 档位表各自记忆上次渲染的数据签名，**没变就整段跳过**；热力图用它避免每 5 秒重建 365 个节点。
+  - **动画只在首屏 / 换区间 / 手动刷新播放**（`statAnimateOnce`）：轮询走「静默更新」，数字直接落值、进度条直接落宽度、柱状图直接 `grown`、折线不描边。
+  - 文本写入也去重（`statSetText`）：相同字符串不再写 DOM（赋值本身也会触发 characterData 变更）。
+  - 「用量洞察」同样加了 `INSIGHT_SIG` 早退与 `INSIGHT_ANIMATE` 开关。
+
+  实测：看板静止 12 秒（跨 2+ 次轮询）期间，`statKpis / heatWrap / 四张排行 / hourlyChart / dailyChart / insightCards / cacheCards / effortByKey / statQuality` 的 **DOM 变更次数从每次轮询数百次降到 0**。
+
+**验证**：新增 `tests/_test_issue98_flicker.py`（26 条：八处签名早退、文本去重、动画开关、以及 `statSig` 的语义自测——首次 true / 相同 false / 变化 true / key 隔离 / 按内容比较）；全量 **74 suites / 2066 checks / 0 failed**。
+
+## v1.7.2
+
+**🐛 问题修复（来自社区反馈）**
+
+- **导入本地凭证报「导入失败」但账号其实导入成功**（#95 / PR #96）：v1.7.1 重做看板时删掉了性能矩阵容器 `#perfMatrix`，但 `refreshInner()` 里操作它的约 138 行死代码没跟着删——每 5 秒轮询抛一次 `TypeError`；`doImportDesktop()` 又把它和导入请求放在同一个 try 里，于是被报成「导入失败」。现在删掉死代码，并把「导入」与「导入后刷新界面」拆成两段兜错。
+- **面板 `.hint` 类名冲突，说明文字被压成 14px 竖条**（#92 / PR #94）：同一个 `.hint` 既用作 12px 说明文字、又被写成 14×14 的「?」图标，后者覆盖前者，34 处受影响（28 处文字全中招）。图标类改名 `.hint-icon`，文字恢复 12px 正常排版；顺带修掉侧栏标签提取里 `\s` 写成 `s` 的老 bug。
+- **Windows 启动脚本三项缺陷**（#91 / PR #93）：
+  - 陈旧 PID 被无关进程复用 → 脚本误判「已在运行」而**从不拉起服务**：改为 `Get-CimInstance` + 校验命令行含 `qoder_proxy.py`（与 stop 脚本同标准）；
+  - 跑在**别的端口**时也被标成「已在运行」并给出无人监听的 Dashboard：新增独立分支，明确拒绝并解释（单 pid 文件不能并存两个实例）；
+  - 代理变量大小写重名（`HTTP_PROXY` 与 `http_proxy` 同时存在）让 PowerShell 5.1 的 `Start-Process` 静默失败、脚本仍打印 `[OK] started`：先清理小写别名，再用**真实 TCP 连接**验证端口起来，失败一律非零退出；
+  - `qoder-proxy.pid` 不再被 git 跟踪（陈旧 PID 会随仓库分发）。
+
+**✨ 新功能（可选）**
+
+- **前缀 session 亲和（PR #97，默认关闭）**：`QD_SESSION_CACHE=memory`（单进程，标准库，TTL + LRU）或 `=redis`（多进程共享，`QD_SESSION_REDIS_URL`，Lua 原子选最长前缀）。键是「隔离范围 + 累计消息前缀」的 HMAC，值是随机上游 session UUID——不含对话正文、API Key 明文或模型 KV Cache。按 Key 标识 / 实际账号 / 区域 / 模型 / 工具参数 / 显式会话 ID 隔离。Redis 不可达或配置非法时回退随机 session，不阻断推理。附带 `docker-compose.redis.yml` 与配置文档。默认关闭，行为与之前一致。
+
+**验证**：合并四个 PR 后全量 **73 suites / 2040 checks / 0 failed**（新增 `_test_prefix_session_cache.py` 41 条含并发与回退用例）。
+
+## v1.7.1
+
+**✨ 数据指标看板重做（统计概览）**
+
+- 顶部「区间胶囊」：今天 / 7 天 / 30 天 / 本月 / 全部 / 自定义（自定义时显示两个日期选择器，带滑块指示器）；
+- 六张 KPI 卡：总请求数、成功请求数、总 Token、活跃天数、当前连续天数、Top 模型；
+- 四张排行面板：Top 账号 / Top 提供商 / 模型用量 / 提供商用量（进度条 + 悬浮明细）；
+- **活跃热力图**：近 365 天按天 Token 着色，5 档图例按本机峰值自适应，月份只在变化处标注；
+- **缓存命中率**：近 10 分钟 / 1 小时 / 24 小时 / 7 天四卡（命中 / 输入）；
+- **近 24 小时双轴趋势**：左轴命中率、右轴总 Token，无请求整点按 0% 计但不写读数；
+- **按天 Token 趋势**：柱状图，空区间给明确占位；
+- 新增后端聚合接口 `GET /usage/stats`（单次扫描 `usage.jsonl` 产出上述全部数据；厂商由模型名推断，账号 UID 自动映射昵称）。
+
+**🧩 页面结构整理**
+
+- **账号独立成页**：账号列表、搜索、区域卡、账号 KPI、签到与福利中心、最近请求全部迁到「账号」页；网关页只保留「网关出口与调度」「运行概览」「模型库」三块；
+- **用量洞察并入数据看板**：导航由 7 项收敛到 6 项，洞察区块作为看板页最后一个分区（标注为全量口径，不随区间变化），随看板一起 30 秒刷新；
+- 账号页新增**搜索**（昵称 / UID / 组织名 / 备注，160ms 防抖，无结果有独立空状态）、吸顶工具栏、行入场动画。
+
+**🎨 产品化视觉层**
+
+- 建立设计令牌（圆角 / 阴影 / 缓动 / 时长 / 字体栈 / 面板渐变）；
+- 卡片统一「描边 + 分层投影 + 极轻渐变」，只有可交互卡片才 hover 抬升；
+- 表格改为小字距大写表头、行分隔线、数字等宽、主题色 4.5% 行 hover；
+- 按钮与表单建立基线（30px 高、8px 圆角、明确 hover/active/focus 态）；
+- 侧栏改为卡片式容器、active 用 2px 主题色左条；细滚动条、`:focus-visible` 光环、深浅色分别调校。
+
+**🐛 问题修复**
+
+- **`range` 形参遮蔽内建 `range()`**：新接口首版 500、连接被直接断开（`TypeError: 'str' object is not callable`）；
+- **面板标题 `<header>` 继承全局吸顶**：滚动时面板标题盖住顶部导航（`header{position:sticky;z-index:10}` 收窄为 `body>header`，并给面板标题显式清吸顶）；
+- **首屏任一 await 抛错就不再切页签**：表现为「页面出来了但数据永远空白」，boot 每步独立容错；
+- **预点亮 TABS 缺 `accounts`/`insights`**：刷新会回落到网关页；
+- **`RECENT_SNAPSHOT` 被误删**：网关页报「账号加载失败」；
+- **面板标题用 `h3` 导致左侧导航整块消失**（`pageNavSections` 只认 `h2`）；顺手让侧栏标签不再带「?」；
+- **侧栏折叠是全局记忆**：任一面折叠后其它页只剩 44px 细条，改为按页面记忆、默认展开。
+
+**验证**：新增 `_test_stats_overview.py`(28)、`_test_accounts_page.py`(22)；更新 `_test_insights_page.py`(25) 与两套旧看板 JS 套件锚点；全量 **72 suites / 1997 checks / 0 failed**。
+
+## v1.7.0
+
+**✨ 企业 / 团队账号（#90）**
+
+企业账号一直能用（额度走组织共享池），但**判定口径是错的**：此前只看 `userType` 含 team/enterprise，或额度里有共享池；而 `/api/v1/userinfo` 根本不返回 `user_type`，于是企业号被当成个人号——团队闸门不生效、共享额度不计入有效余额。
+
+- **判定统一到 `Account.is_team()`，三层优先**：① 组织字段（`organization_id` / `organization_name`，OAuth 登录即有）→ ② `userType` → ③ 额度快照里的共享池（含 `cap=-1` 无限池）；proxy 侧的 `_is_team_account()` 改为委托它，两处口径不再分裂。
+- **面板徽标**：企业/团队账号在账号名旁显示紫色的 **企业 · 组织名**（`public()` 新增 `isTeam` / `orgLabel`），一眼分清个人号与组织席位。
+- **登录字段兼容**：`organization_id` / `organization_name` 同时接受 camelCase 形态，避免换了个上游版本就丢组织信息。
+- **文档**：`docs/accounts.md` 新增《怎么把企业账号接进来》与《「企业号抓不到」的常见原因》——含 SSO 强制场景改用「导入 PAT」、`cap=-1` 无限池的显示口径、以及组织字段为空的含义。
+
+**验证**：新增 `tests/_test_issue90_enterprise.py`（21 条：三层判定、orgLabel 回退、public 字段、面板徽标、camelCase 兼容、文档）；全量 **70 suites / 1941 checks / 0 failed**。
+
+## v1.6.14
+
+**🐛 问题修复（macOS / Linux 常驻场景，#89）**
+
+- **防双开把「正在退出的旧进程」当成健康实例**：启动探测只问「有没有人应答 `/health`」，于是 `kill 旧进程 && 立刻 start` 这种最常见的升级姿势里，旧实例还在收尾、仍能应答，新实例就打印「已有一个反代在运行」并**主动退出**——服务一个都没起来，日志却在说「别重复启动」。
+  现在：`/health` 返回 `pid` / `started_at` / `started_iso`；启动时按**应答者的 pid 是否还活着**分类：
+  - `stale`（pid 已退出）→ 提示「旧实例正在释放端口」并等待重试（最多 3 轮），继续启动；
+  - `healthy` → 仍按双开处理，但提示里带上 **PID / 版本 / 启动时间**，并指向官方停止脚本；
+  - `foreign`（别的服务占端口）→ 保持原有的明确报错。
+  另外 `bind` 失败也加了 3 次重试（每次 1.5s），并在重试期间复查 `/health`——如果确实是健康实例起来了，按「已在运行」退出而不是报错。
+
+- **macOS / Linux 没有官方停止手段**：`start-qoder-proxy.sh` 从不传 `--pid-file`，`qoder-proxy.pid` 永远是陈旧值，常驻（nohup / launchd / tmux）时只能靠 `lsof` 猜 PID。
+  现在：`start-qoder-proxy.sh` 写 `--pid-file`，并新增 **`stop-qoder-proxy.sh`**（对齐 `.bat` 的严谨程度）：
+  - 读 `qoder-proxy.pid` → 校验命令行含 `qoder_proxy.py` → 只停那一个 PID；
+  - 先 `SIGTERM`，10 秒不退再 `SIGKILL`；
+  - pid 文件缺失时按「进程名 + `--port`」兜底，且**拒绝**停不是 qoder-proxy 的进程；
+  - 结束时清理 pid 文件，过期 pid 文件会被识别并移除。
+
+**📚 文档**：README 的平台表、`docs/deployment.md` 的脚本表与升级步骤都补上 macOS / Linux 的停止方式与常驻说明。
+
+**验证**：新增 `tests/_test_issue89_startup_stop.py`（20 条：实例分类四种情况、启动/绑定重试、提示文案、脚本语法与安全校验，POSIX 上还会真跑一次「启动→读 pid→停止→进程消失」）；全量 **69 suites / 1920 checks / 0 failed**。
+
+## v1.6.13
+
+**✨ 新增功能**
+
+- **排队可见 / 快速失败（`QD_QUEUE_WAIT_MODE`）**：`visible`（默认）流式请求先建流并持续发心跳 + `qoder_queue` 提示帧；`fast` 立即返回 503 + `Retry-After`；`wait` 保留旧行为。
+- **排队中文原因**：`上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试，或换一个模型/区域。这不是你的 Key、账号或网络问题。`
+- **面板质量指标**：`/health.quality` + 分析页卡片——首字延迟 p50/p90、输出 tok/s、排队率、回读命中。
+
+**🐛 问题修复**
+
+- **Responses（Codex）路径接入回读链**：三条入口（chat / Anthropic / Responses）行为一致。
+- **`/v1/responses` 兼容补齐**：`stream_options` 透传、`parallel_tool_calls` 默认 True；未实现字段显式告警一次。
+- **测试隔离**：runner 统一剥离 `HTTP(S)_PROXY` / `NO_PROXY`（开发机代理会让本机套件被回 502），并修掉 #70 排程套件的时间依赖 flake。
+
+**验证**：68 suites / 1899 checks / 0 failed。
+
 ## v1.6.12
 
 **🐛 问题修复**

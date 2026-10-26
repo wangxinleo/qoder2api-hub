@@ -7,6 +7,10 @@ accounts/*
 usage/
 backups/
 
+# 运行时进程状态：pid 文件是本地瞬时状态，绝不能随仓库分发
+# （陈旧 PID 会被 Windows 复用给无关进程，导致启动脚本误判"已在运行"）
+qoder-proxy.pid
+
 # ---- Python 运行产物 ----
 __pycache__/
 *.pyc
@@ -15,7 +19,6 @@ __pycache__/
 # ---- 本地工具 / 临时文件 ----
 .mimosa/
 .team/
-qoder-proxy.pid
 
 # ---- 自动提取的原生组件（体积大、平台相关，由 _install_umid.py 生成）----
 umid/

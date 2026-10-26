@@ -163,10 +163,15 @@ function doEnv(init){
     e.els.patBody.innerHTML);
 
   // ------------------------------------------------- ③ 账号行企业 badge
+  // 同步上游 #90 后 accountRow 额外引用 teamBadge(a)（团队/组织徽标）。VPC 账号必须
+  // 抑制它（否则「企业」徽标重复两次），非 VPC 团队账号则要显示上游徽标 —— 故这里
+  // 注入可计数的桩，把「调没调」也钉死。
+  const TB = { calls: 0 };
   const row = new Function('esc', 'USAGE_BY_ACCOUNT', 'accountGuardBadge', 'fmt',
-    'checkinBadge', 'creditsDeltaChip',
+    'checkinBadge', 'creditsDeltaChip', 'teamBadge',
     ROW + '; return accountRow;')(esc, {}, () => '', v => String(v ?? 0),
-    () => '<ck-stub>', () => '<delta-stub>');
+    () => '<ck-stub>', () => '<delta-stub>',
+    (a) => { TB.calls++; return (a && a.isTeam) ? '<team-stub>' : ''; });
   const base = { uid: 'ent-uid-1', nickname: 'Ent One', realm: 'cn', enabled: true,
     source: 'pat', expiresIn: '23h', lastError: '', credits: null };
   const entHtml = row(Object.assign({}, base, { enterpriseDomain: 'acme' }));
@@ -174,8 +179,24 @@ function doEnv(init){
     /企业 · acme/.test(entHtml) && /不参与每日签到\/活动/.test(entHtml), null);
   check('企业徽标与上游签到/积分 chip 同时渲染（同步冲突合并）',
     entHtml.includes('<ck-stub>') && entHtml.includes('<delta-stub>'), entHtml);
+  check('VPC 账号抑制上游团队徽标（不重复出现两个「企业」徽标）',
+    !entHtml.includes('<team-stub>') && TB.calls === 0,
+    (TB.calls, entHtml.indexOf('team-stub')));
   const pubHtml = row(Object.assign({}, base, { enterpriseDomain: '' }));
   check('公共账号（空串）不渲染企业 badge', !/企业 ·/.test(pubHtml), pubHtml.indexOf('企业 ·'));
+  const teamHtml = row(Object.assign({}, base, { enterpriseDomain: '',
+    isTeam: true, orgLabel: 'AcmeCorp' }));
+  check('非 VPC 团队账号渲染上游团队徽标（企业 · 组织）',
+    teamHtml.includes('<team-stub>') && !/企业 · acme/.test(teamHtml), teamHtml);
+
+  // 上游 teamBadge 本体：VPC 账号不走它（上面已断言零调用），团队账号文案为「企业 · <组织>」
+  const TBFN = slice('function teamBadge(a){', '// 今日是否已签到');
+  check('锚点：上游 teamBadge 定义抽到', TBFN.length > 200);
+  const realTeamBadge = new Function('esc', TBFN + '; return teamBadge;')(esc);
+  check('teamBadge 本体：团队账号渲染「企业 · 组织」、非团队账号空串',
+    /企业 · AcmeCorp/.test(realTeamBadge({ isTeam: true, orgLabel: 'AcmeCorp' }))
+    && realTeamBadge({ orgLabel: 'AcmeCorp' }) === ''
+    && realTeamBadge(null) === '', realTeamBadge({ isTeam: true, orgLabel: 'AcmeCorp' }));
 
   // 企业额度到期小字（task 10-16 · R5）：真实到期显示、占位/公共号不显示
   const expDays = Math.floor(Date.now() / 1000) + 5 * 86400;

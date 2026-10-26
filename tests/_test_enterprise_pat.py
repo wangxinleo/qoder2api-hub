@@ -361,6 +361,24 @@ check("A6 Pro 包族企业零出站",
       ent6.pro_eligibility() == (False, A.ENTERPRISE_ACTIVITY_MSG)
       and ent6.pro_claim().get("ok") is False, (ent6.pro_eligibility(),
                                                 ent6.pro_claim()))
+# v1.7.6 新增的官方积分/成就接口：默认走 _openapi_json -> openapi_candidates(公共域)，
+# 企业 PAT 不得出站到公共域，故两个方法首行零出站早退（桩对未登记 URL 必炸，
+# 一旦真的发请求这里会先抛 AssertionError，同时 CALLS 也会非空）。
+cu6 = ent6.fetch_credit_usage(force=True)
+check("A6 fetch_credit_usage 企业零出站 + unavailable/enterprise 原因",
+      cu6.get("ok") is False and cu6.get("unavailable") is True
+      and cu6.get("reason") == A.CHECKIN_REASON_ENTERPRISE
+      and cu6.get("error") == A.ENTERPRISE_ACTIVITY_MSG
+      and _cjk(cu6.get("error"))
+      and cu6.get("total") == 0 and cu6.get("peak") == 0
+      and cu6.get("peak_date") == "" and cu6.get("daily") == []
+      and cu6.get("unit") == "credits", cu6)
+ach6 = ent6.fetch_achievements(force=True)
+check("A6 fetch_achievements 企业零出站 + unavailable/enterprise 原因",
+      ach6.get("ok") is False and ach6.get("unavailable") is True
+      and ach6.get("keys") == []
+      and ach6.get("error") == A.ENTERPRISE_ACTIVITY_MSG
+      and _cjk(ach6.get("error")), ach6)
 check("A6 企业签到/活动族全程 /sash/ 零出站（http_json 未被调用）",
       CALLS == [], CALLS)
 

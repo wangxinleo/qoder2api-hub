@@ -117,6 +117,12 @@ PATH_CAMPAIGNS = "/sash/api/v1/me/campaigns"
 #        已领取返回 {"status":"CLAIMED","replayed":true}，不会重复发放）
 PATH_CAMPAIGN_REWARD = "/sash/api/v1/me/campaigns/%s/reward"
 PATH_CAMPAIGN_CLAIM = "/sash/api/v1/me/campaigns/%s/claim"
+# 官方积分消耗（0.4.3 客户端新增；cn/intl 实测均 200）：
+#   summary -> {totalCredits, peakCredits, peakDate, unit}
+#   heatmap -> {items: [{date, value}...]}（近 365 天，按天积分消耗）
+PATH_CREDIT_SUMMARY = "/sash/api/v1/ai-conversations/credits-summary"
+PATH_CREDIT_HEATMAP = "/sash/api/v1/ai-conversations/credits-heatmap"
+PATH_ACHIEVEMENTS = "/sash/api/v1/me/achievements"
 
 # 桌面端专用请求头（活动平台必需；CLI=5 / QoderWork=6 / 桌面端=10）
 DESKTOP_CLIENT_TYPE = "10"
@@ -878,6 +884,8 @@ CHECKIN_PROBE_TTL = 6 * 3600
 # 活动列表缓存 TTL：活动状态变化很慢（每日一轮），20 秒内复用可让看板切换视图
 # /账号不再等那 1–4 秒的上游请求；领取动作会强制绕过并立即失效缓存。
 CAMPAIGNS_TTL = 20
+# 官方积分消耗/成就属于全量聚合接口：缓存 5 分钟，别跟着面板轮询打
+CREDIT_USAGE_TTL = 300
 
 # 活动平台 claim 请求之间的默认间隔（秒）：调用方（qoder_tasks.run_checkin）的
 # gap 未透传时的安全默认，保持「>= 1.0s 防风控」语义（见 qoder_tasks 模块声明）。
@@ -947,8 +955,11 @@ def openapi_candidates(realm):
     if base:
         out.append(base)
     domain = str(cfg.get("domain") or "").strip()
-    for host in (("https://openapi." + domain) if domain else "",
-                 str(cfg.get("website") or "").rstrip("/")):
+    # 国际版活动平台另有一个可用入口 center.qoder.sh（0.4.3 客户端仍引用；实测
+    # intl=200 / cn=401），放在官网域名之前作为回退。
+    _extra = ("https://center.qoder.sh",) if r == "intl" else ()
+    for host in _extra + ((("https://openapi." + domain) if domain else ""),
+                          str(cfg.get("website") or "").rstrip("/")):
         if host and host not in out:
             out.append(host)
     return out
@@ -1480,6 +1491,8 @@ class Account(object):
             self.last_credits_delta_at = float(data.get("lastCreditsDeltaAt") or 0)
         except (TypeError, ValueError):
             self.last_credits_delta_at = 0.0
+        self._credit_usage_cache = None   # (ts, payload) 官方积分消耗
+        self._achievements_cache = None   # (ts, payload) 已获成就
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
         # 必须落盘持久化，否则网关重启后用户就找不回兑换码了。
         self.campaign_codes = dict(data.get("campaignCodes") or {})
@@ -1541,6 +1554,38 @@ class Account(object):
             "note": self.note,
         }
 
+    def is_team(self):
+        """是否团队 / 企业账号（issue #90）。
+
+        判定与 proxy 侧 _is_team_account 同源，优先级：
+          1. userinfo 里带 organization_id / organization_name（OAuth 登录即有）；
+          2. userType 含 team / enterprise（PAT 导入等路径）；
+          3. 额度快照里有组织共享池（orgResourcePackage 等）。
+        三者任一命中即算——企业号即使 userType 是个人风格，只要挂了组织就算。
+        """
+        if str(self.organization_id or "").strip() or \
+                str(self.organization_name or "").strip():
+            return True
+        ut = str(self.user_type or "").lower()
+        if "team" in ut or "enterprise" in ut:
+            return True
+        cred = self.credits if isinstance(self.credits, dict) else {}
+        shared = cred.get("shared")
+        if isinstance(shared, dict) and (shared.get("size") or shared.get("unlimited")):
+            return True
+        for pkg in cred.get("packages") or []:
+            if isinstance(pkg, dict) and pkg.get("name") == "共享额度":
+                return True
+        return False
+
+    def org_label(self):
+        """企业/组织展示名（面板徽标用；没有组织返回空串）。"""
+        name = str(self.organization_name or "").strip()
+        if name:
+            return name
+        oid = str(self.organization_id or "").strip()
+        return ("org " + oid[:8]) if oid else ""
+
     def public(self):
         exp = self.expires_at
         return {
@@ -1594,6 +1639,8 @@ class Account(object):
             "lastCheckin": self.last_checkin,
             # 运行时探测：None=未探测（照常尝试）/ True / False（本区域无接口）
             "canCheckin": self.can_checkin(),
+            "isTeam": self.is_team(),
+            "orgLabel": self.org_label(),
             "checkedInToday": self._checkin_stamped_today(),
             "lastCheckinDate": str(self.last_checkin or "")[:10],
             "lastCreditsDelta": self.last_credits_delta,
@@ -2387,6 +2434,87 @@ class Account(object):
         self._refresh_credits_quietly()
         return {"ok": True, "msg": "签到成功 +%d 积分" % reward,
                 "reward_credits": reward}
+
+    def fetch_credit_usage(self, days=365, force=False):
+        """官方积分消耗（0.4.3 客户端新增接口）。
+
+        返回 {ok, total, peak, peak_date, daily:[{date, value}], unit, error?}：
+          total      —— 窗口内累计消耗积分（官方口径，不是我们的 token 估算）
+          peak       —— 单日峰值；peak_date 对应日期
+          daily      —— 逐日消耗，可直接画热力图
+        结果缓存 CREDIT_USAGE_TTL 秒（该接口是全量聚合，别跟着 5 秒轮询打）。
+
+        企业版（VPC）账号：该接口只在公共 openapi 域上存在，企业 PAT 不得出站到公共域
+        （见 `.trellis/spec/backend/enterprise-vpc-accounts.md`），故首行零出站早退；
+        与 checkin / campaign 族的排除口径一致。
+        """
+        if self.is_enterprise():
+            return {"ok": False, "unavailable": True,
+                    "reason": CHECKIN_REASON_ENTERPRISE,
+                    "error": ENTERPRISE_ACTIVITY_MSG,
+                    "total": 0, "peak": 0, "peak_date": "", "daily": [],
+                    "unit": "credits"}
+        now = time.time()
+        if not force and self._credit_usage_cache \
+                and now - self._credit_usage_cache[0] < CREDIT_USAGE_TTL:
+            return self._credit_usage_cache[1]
+        q_sum, code, err = self._openapi_json(PATH_CREDIT_SUMMARY,
+                                              headers=self.desktop_headers(),
+                                              timeout=15, retries=1)
+        if not isinstance(q_sum, dict):
+            out = {"ok": False, "error": err or ("HTTP %s" % code),
+                   "total": 0, "peak": 0, "peak_date": "", "daily": [],
+                   "unit": "credits"}
+            self._credit_usage_cache = (now, out)
+            return out
+        q_heat, _c2, _e2 = self._openapi_json(PATH_CREDIT_HEATMAP,
+                                              headers=self.desktop_headers(),
+                                              timeout=20, retries=1)
+        daily = []
+        if isinstance(q_heat, dict):
+            for item in (q_heat.get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    daily.append({"date": str(item.get("date") or ""),
+                                  "value": float(item.get("value") or 0)})
+                except (TypeError, ValueError):
+                    continue
+        out = {
+            "ok": True,
+            "total": float(q_sum.get("totalCredits") or 0),
+            "peak": float(q_sum.get("peakCredits") or 0),
+            "peak_date": str(q_sum.get("peakDate") or ""),
+            "unit": str(q_sum.get("unit") or "credits"),
+            "daily": daily[-int(days):] if days else daily,
+        }
+        self._credit_usage_cache = (now, out)
+        return out
+
+    def fetch_achievements(self, force=False):
+        """已获得的成就 key 列表（用于解释活动「需先完成某成就」）。
+
+        企业版（VPC）账号：成就属于活动族，企业 PAT 零出站（不得访问公共 openapi 域）。
+        """
+        if self.is_enterprise():
+            return {"ok": False, "unavailable": True, "keys": [],
+                    "error": ENTERPRISE_ACTIVITY_MSG}
+        now = time.time()
+        if not force and self._achievements_cache \
+                and now - self._achievements_cache[0] < CREDIT_USAGE_TTL:
+            return self._achievements_cache[1]
+        q, code, err = self._openapi_json(PATH_ACHIEVEMENTS,
+                                          headers=self.headers(),
+                                          timeout=15, retries=1)
+        keys = []
+        if isinstance(q, dict):
+            for item in (q.get("achievements") or []):
+                if isinstance(item, dict) and item.get("achievementKey"):
+                    keys.append(str(item["achievementKey"]))
+        out = {"ok": isinstance(q, dict), "keys": keys,
+               "error": "" if isinstance(q, dict) else (err or ("HTTP %s" % code))}
+        self._achievements_cache = (now, out)
+        return out
 
     def _refresh_credits_quietly(self):
         """签到/领奖后顺手刷新余额（best-effort，绝不抛）。"""
@@ -4141,8 +4269,8 @@ class AccountPool(object):
             uid = str(ui.get("id") or uid)
             nickname = str(ui.get("name") or "")
             user_type = str(ui.get("user_type") or "") or DEFAULT_USER_TYPE
-            org_id = str(ui.get("organization_id") or "")
-            org_name = str(ui.get("organization_name") or "")
+            org_id = str(ui.get("organization_id") or ui.get("organizationId") or "")
+            org_name = str(ui.get("organization_name") or ui.get("organizationName") or "")
         except Exception:
             user_type, org_id, org_name = DEFAULT_USER_TYPE, "", ""
 
@@ -4217,8 +4345,8 @@ class AccountPool(object):
             uid = str(ui.get("id") or "")
             nickname = str(ui.get("name") or "")
             user_type = str(ui.get("user_type") or "") or DEFAULT_USER_TYPE
-            org_id = str(ui.get("organization_id") or "")
-            org_name = str(ui.get("organization_name") or "")
+            org_id = str(ui.get("organization_id") or ui.get("organizationId") or "")
+            org_name = str(ui.get("organization_name") or ui.get("organizationName") or "")
         except Exception:
             pass
         if data.get("expires_in"):

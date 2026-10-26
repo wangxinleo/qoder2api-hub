@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.6.13--wangxinleo-2496ED?style=flat-square" alt="Version 1.6.13-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.7.6--wangxinleo-2496ED?style=flat-square" alt="Version 1.7.6-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -59,12 +59,13 @@
 > python _diag_gateway.py --chat   # 端口 → /health → /v1/models → 真实流式，逐项报出断在哪
 > python _diag_campaign.py         # 签到/活动链路体检（含本机虚拟化状态，中文输出）
 > ```
-> - **Windows 启动脚本为分离启动**：关掉启动窗口网关继续运行，用 `stop-qoder-proxy.bat` 按 PID 精确停止；Linux / macOS 脚本仍在前台运行，Ctrl+C 或关闭终端即停。
+> - **Windows 启动脚本为分离启动**：关掉启动窗口网关继续运行，用 `stop-qoder-proxy.bat` 按 PID 精确停止；Linux / macOS 脚本仍在前台运行，Ctrl+C 即停；常驻（后台/会话不再挂着）时用 `./stop-qoder-proxy.sh` 按 PID 精确停止。
+> - **PID 文件**：`start-qoder-proxy.sh`（Linux / macOS）与 Windows 脚本一样会把运行中进程的 PID 写入 `qoder-proxy.pid`，停止脚本据此校验命令行确实是 `qoder_proxy.py` 再精确停止，不会误杀别的进程；陈旧 PID 自动清理。该文件不入库（见 `.gitignore`）。
 > - 判别口诀：日志时间戳停在某一刻、此后再无 `POST /v1/chat/completions` = 网关已停；重新运行启动脚本即可恢复。
 
 > ℹ️ 默认端口 **8790**（8788 被 `mimo-api-proxy.mjs` 占用，8789 为 wb-proxy 默认）。改端口：`start-qoder-proxy.bat 8791` / `./start-qoder-proxy.sh 8791`。
 
-> 🐧 **Linux / macOS**：三个启动脚本与 `.bat` 一一对应 —— `start-qoder-proxy.sh`（本机）、`start-qoder-proxy-lan.sh`（局域网）、`allow-firewall.sh`（放行防火墙，需 `sudo`）。首次使用先 `chmod +x *.sh`。脚本自动探测 `python3` / 便携运行时（要求 Python 3.9+），退出码透传；`allow-firewall.sh` 会自动识别 ufw / firewalld / nftables / iptables，WSL2 下还会打印 Windows 侧所需的防火墙与 `netsh portproxy` 步骤。
+> 🐧 **Linux / macOS**：四个脚本与 `.bat` 一一对应 —— `start-qoder-proxy.sh`（本机）、`start-qoder-proxy-lan.sh`（局域网）、`stop-qoder-proxy.sh`（按 PID 停止，对应 `stop-qoder-proxy.bat`）、`allow-firewall.sh`（放行防火墙，需 `sudo`）。首次使用先 `chmod +x *.sh`。脚本自动探测 `python3` / 便携运行时（要求 Python 3.9+），退出码透传；`allow-firewall.sh` 会自动识别 ufw / firewalld / nftables / iptables，WSL2 下还会打印 Windows 侧所需的防火墙与 `netsh portproxy` 步骤。
 
 首次启动若无账号，直接打开看板点击 **「+ 添加账号 (OAuth)」**，在浏览器完成设备授权即可自动加入；或点 **「🔑 导入 PAT」** 粘贴个人访问令牌。
 
@@ -491,7 +492,8 @@ python _verify_models.py --base http://127.0.0.1:8790
 | `dashboard.html` | 单文件 Web 看板（本地凭证两步扫描导入 + PAT 导入 + 签到中心的**本机虚拟化检测**卡片） |
 | `_diag_campaign.py` | 签到/活动链路体检（含本机虚拟化状态，中文输出） |
 | `_install_umid.py` | 从官方 npm 包 `@qoder-ai/qodercli` 提取内嵌的原生 UMID 组件（Linux/macOS 拿真机器身份；**机器级身份，解决不了同机多账号**） |
-| `start-qoder-proxy.sh` / `start-qoder-proxy-lan.sh` | Linux / macOS 启动脚本，分别对应 Windows 的 `start-qoder-proxy.bat` / `start-qoder-proxy-lan.bat`（探测 Python 3.9+ 运行时候选，`exec` 启动使进程生命周期 = 终端生命周期） |
+| `start-qoder-proxy.sh` / `start-qoder-proxy-lan.sh` | Linux / macOS 启动脚本，分别对应 Windows 的 `start-qoder-proxy.bat` / `start-qoder-proxy-lan.bat`（探测 Python 3.9+ 运行时候选，`exec` 启动使进程生命周期 = 终端生命周期；本机脚本会把 PID 写入 `qoder-proxy.pid`） |
+| `stop-qoder-proxy.sh` | Linux / macOS 停止脚本，对应 `stop-qoder-proxy.bat`（读 `qoder-proxy.pid`、校验命令行确为 `qoder_proxy.py` 后精确停止；PID 文件缺失时按「进程 + `--port`」兜底查找，陈旧 PID 自动清理） |
 | `allow-firewall.sh` | Linux / macOS 放行防火墙，对应 `allow-firewall.bat`（自动识别 ufw / firewalld / nftables / iptables；WSL2 打印 Windows 侧规则与 portproxy 命令） |
 
 ---
@@ -499,6 +501,22 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/wangxinleo/qoder2api-hub/releases)。
+
+### v1.7.6-wangxinleo
+
+**同步上游 v1.6.14–v1.7.6（22 个提交）**
+
+- **启动与运维**：#89 启动防双开 + 垂死实例识别，Linux / macOS 新增 `stop-qoder-proxy.sh`（读 `qoder-proxy.pid`、校验命令行后精确停止），`/health` 带 pid / started_at；Windows 启动脚本修复。
+- **账号判定**：#90 `Account.is_team()` 三层判定（组织字段 → `userType` → 共享额度池，含 `unlimited`），proxy 侧 `_is_team_account()` 委托它；面板新增团队徽标，登录 org 字段兼容 camelCase。
+- **看板重做**：v1.7.1 数据看板（`/usage/stats`、KPI / 热力图 / 缓存命中 / 趋势）+ 独立「账号」页；#98 轮询不重播动画、不重建图表（分区签名 + 文本去重）。
+- **会话与排队**：v1.7.2 前缀 session 亲和（新增 `qoder_session_cache.py`，`QD_SESSION_CACHE=off|memory|redis`，默认关闭）+ 导入误报失败修复；#99 Anthropic `/v1/messages` 排队可见分支（流内 ping / 503 + `Retry-After`）；#100 `_exc_http_status()` 修 `RateLimited.status` 缺属性导致的 SSE 截断。
+- **积分与模型**：v1.7.5 官方积分消耗（`credits-summary` / `credits-heatmap`、`/accounts/credits/usage`）与 intl 第二活动入口；#101 max_tokens 上限学习 / clamp 与 `/v1/models` 补字段。
+- **重合处置（上游更完整则按上游）**：企业 / 团队判定采上游 `is_team()`（fork 的 `is_enterprise()` 继续作为 VPC 出站与签到排除契约，二者正交，可同时为真）；Anthropic / chat 排队修复采上游 #99 / #100。
+- **保留 fork 语义**：企业 PAT / VPC（无公共回退、签到与活动零出站、Cosy 头、配额三形态口径）、`enterprise_first` 分层派单与会话亲和（前缀 session cache 与账号亲和正交）、坏参数 partial salvage（与上游 #72 marker-only fail-closed 并存）、单文件自更新指向本 fork、Dockerfile COPY 覆盖全部 `qoder_*.py`。
+- **新增契约**：`fetch_credit_usage()` / `fetch_achievements()` 对企业账号首行零出站早退（返回 `unavailable` + 中文原因），不让企业 PAT 触碰公共 `openapi_candidates`。
+- **版本线**：`VERSION = 1.7.6-wangxinleo`；镜像仍推 `ghcr.io/wangxinleo/qoder2api-hub`。
+
+**验证**：全量 **83 suites / 2282 checks / 0 failed**（合并前基线 74 suites / 2045 checks / 0 failed）。
 
 ### v1.6.13-wangxinleo
 
