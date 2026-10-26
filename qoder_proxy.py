@@ -9263,6 +9263,8 @@ class Handler(BaseHTTPRequestHandler):
                     "nickname": acc.nickname or acc.uid[:8],
                     "realm": getattr(acc, "realm", ""),
                     "ok": bool(cu.get("ok")),
+                    "unavailable": bool(cu.get("unavailable")),
+                    "reason": cu.get("reason") or "",
                     "total": cu.get("total") or 0,
                     "peak": cu.get("peak") or 0,
                     "peak_date": cu.get("peak_date") or "",
@@ -10145,11 +10147,14 @@ class Handler(BaseHTTPRequestHandler):
                 "stream": False,
             }
             t0 = time.time()
+            # 一次性 session key：测试请求不得派生 pfx-*，更不得在失败路径
+            # unbind 掉真实对话的会话亲和（issue #69/#71 的亲和表污染）。
+            test_session_key = "acct-test-%s" % uuid.uuid4().hex
             try:
                 # issue #86：必须测试被点的那个号（此前会落到池里任意账号）
                 resp, acc, _ = open_upstream(
                     test_payload, target_realm=acc_realm(account),
-                    only_account=account)
+                    session_key=test_session_key, only_account=account)
                 with resp:
                     chat_obj = aggregate_stream(resp, test_model, None)
                 wall_ms = int((time.time() - t0) * 1000)
@@ -10171,6 +10176,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": False, "uid": account.uid,
                                         "status": 429,
                                         "error": "rate limited: %s" % exc.detail[:150],
+                                        "elapsed_ms": wall_ms})
+            except UpstreamQueued as exc:
+                # issue #87：HTTP 层排队是模型级容量问题，不是账号故障——
+                # 不冷却、不写 last_error，返回结构化 queued 让面板单独提示。
+                wall_ms = int((time.time() - t0) * 1000)
+                _msg, _et = friendly_upstream_error(503, exc.detail)
+                log("account test: uid=%s model=%s wall=%dms queued retry_after=%ds"
+                    % (account.uid[:8], test_model, wall_ms, exc.retry_after),
+                    level="WARN", tag="accounts")
+                return self._json(200, {
+                    "ok": False, "uid": account.uid, "status": 503,
+                    "queued": True, "retry_after": exc.retry_after,
+                    "error": _msg, "elapsed_ms": wall_ms})
+            except UpstreamStatus as exc:
+                # 信封层（HTTP 200 + SSE statusCodeValue=403）同样可能是排队；
+                # 排队分支必须在 note_error 之前短路（issue #71 口径）。
+                wall_ms = int((time.time() - t0) * 1000)
+                qwait = _queue_wait_seconds(exc.detail)
+                if qwait > 0:
+                    _msg, _et = friendly_upstream_error(503, exc.detail)
+                    log("account test: uid=%s model=%s wall=%dms envelope queued "
+                        "retry_after=%ds"
+                        % (account.uid[:8], test_model, wall_ms, qwait),
+                        level="WARN", tag="accounts")
+                    return self._json(200, {
+                        "ok": False, "uid": account.uid, "status": 503,
+                        "queued": True, "retry_after": qwait,
+                        "error": _msg, "elapsed_ms": wall_ms})
+                _handle_envelope_account_cooldown(account, exc, model=test_model)
+                _code = _to_int_status(exc.status)
+                _msg, _et = friendly_upstream_error(_code, exc.detail)
+                return self._json(200, {"ok": False, "uid": account.uid,
+                                        "status": _code,
+                                        "error": _msg[:150],
                                         "elapsed_ms": wall_ms})
             except urllib.error.HTTPError as exc:
                 wall_ms = int((time.time() - t0) * 1000)
@@ -10470,6 +10509,15 @@ class Handler(BaseHTTPRequestHandler):
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
                     holder, account, usage_ctx=usage_ctx)
+            except RateLimited as exc:
+                # issue #71/#100：信封排队耗尽抛的是 RateLimited（没有 .status），
+                # 以前落入下面的通用分支变成 502；必须显式回 429 + Retry-After。
+                record_error(model, 429, exc.detail[:200],
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
+                return self._rate_limited(exc)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -10530,16 +10578,33 @@ class Handler(BaseHTTPRequestHandler):
                     session_key=session_key)
             except RateLimited as exc:
                 return self._rate_limited(exc)
+            except UpstreamQueued as exc:
+                _msg, _et = friendly_upstream_error(503, exc.detail)
+                return self._error(503, _msg, _et,
+                                   retry_after=exc.retry_after)
             except urllib.error.HTTPError as exc:
                 detail = getattr(exc, "qoder_detail", "") or ""
                 msg, etype = friendly_upstream_error(exc.code, detail)
                 return self._error(exc.code, msg, etype)
             except Exception as exc:
                 return self._error(502, str(exc)[:200], "upstream_error")
-            with resp:
-                obj = aggregate_stream(resp, model,
-                                       holder={"usage": None},
-                                       allowed_names=names)
+            try:
+                with resp:
+                    obj = aggregate_stream(resp, model,
+                                           holder={"usage": None},
+                                           allowed_names=names)
+            except RateLimited as exc:
+                return self._rate_limited(exc)
+            except UpstreamStatus as exc:
+                # 信封排队耗尽与其它协议路径同口径：429 + Retry-After；
+                # 非排队错误保留真实 status，不再统一 502。
+                qwait = _queue_wait_seconds(exc.detail)
+                if qwait > 0:
+                    return self._rate_limited(
+                        RateLimited(None, exc.detail, wait=qwait))
+                _code = _to_int_status(exc.status)
+                _msg, _et = friendly_upstream_error(_code, exc.detail)
+                return self._error(_code, _msg, _et)
             msg = ((obj.get("choices") or [{}])[0].get("message") or {})
             calls = [c for c in (msg.get("tool_calls") or [])
                      if (c.get("function") or {}).get("name") in names]
@@ -10848,6 +10913,14 @@ class Handler(BaseHTTPRequestHandler):
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
                     holder, account, usage_ctx=usage_ctx)
+            except RateLimited as exc:
+                # issue #71/#100：信封排队耗尽 -> 429 + Retry-After（不要 502）
+                record_error(model, 429, exc.detail[:200],
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
+                return self._rate_limited(exc)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -11308,6 +11381,14 @@ class Handler(BaseHTTPRequestHandler):
                 result, account = aggregate_with_envelope_retry(
                     upstream, payload, session_key, req_realm, model,
                     holder, account, usage_ctx=usage_ctx)
+            except RateLimited as exc:
+                # issue #71/#100：信封排队耗尽 -> 429 + Retry-After（不要 502）
+                record_error(model, 429, exc.detail[:200],
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
+                return self._rate_limited(exc)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),

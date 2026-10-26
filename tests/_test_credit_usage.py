@@ -84,7 +84,16 @@ check("路由汇总 total/peak/daily 并支持 uid/realm 过滤",
 check("面板有「官方积分消耗」区块",
       "creditUsageWrap" in _dash and "官方积分消耗" in _dash)
 check("面板渲染逐日热力图 + 账号明细表",
-      "heat-grid" in _dash and "峰值日期 / 错误" in _dash)
+      "heat-grid" in _dash and "峰值日期 / 状态" in _dash)
+check("路由透传企业版 unavailable / reason（面板据此区分「不适用」与「查询失败」）",
+      '"unavailable": bool(cu.get("unavailable"))' in _psrc
+      and '"reason": cu.get("reason") or ""' in _psrc)
+check("面板空逐日不早退：按企业版/未产生用量给出原因并保留明细表",
+      "na.length === accounts.length" in _dash
+      and "企业版账号不适用官方积分消耗统计" in _dash
+      and "不适用（企业版）" in _dash)
+check("面板签名包含账号状态（total/daily 不变也能重绘）",
+      "accounts.map(a => [a.uid, !!a.ok, !!a.unavailable" in _dash)
 check("面板有 60 秒节流（服务端另有 5 分钟缓存）",
       "CREDIT_USAGE_AT" in _dash and "60000" in _dash)
 check("看板加载时挂钩（失败不影响主看板）",

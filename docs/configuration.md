@@ -152,7 +152,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `QD_QUEUE_MAX_ROUNDS` | `6` | 上游排队（10605 / RESOURCE_LIMIT）时最多等待重试几轮 |
+| `QD_QUEUE_MAX_ROUNDS` | `3` | 上游排队（10605 / RESOURCE_LIMIT）时最多等待重试几轮 |
 | `QD_QUEUE_WAIT_MAX_SECS` | `180` | 单轮最多等待的秒数 |
 | `QD_QUEUE_WAIT_BUDGET_SECS` | `600` | 排队总共最多等待的秒数 |
 | `QD_QUEUE_WAIT_JITTER` | `2` | 每次排队等待额外加上 0 到 N 秒的随机抖动，避免多个客户端同时唤醒 |

@@ -2828,50 +2828,70 @@ async function loadCreditUsage(force){
     if(hint) hint.textContent = "";
     return;
   }
-  const sig = JSON.stringify([d.total, d.peak, d.peak_date, (d.daily || []).length]);
+  const accounts = d.accounts || [];
+  // 账号状态也要进签名：逐日数据没变但某个账号从失败恢复/企业版变成可查询时，
+  // 明细表必须重绘（只看 total/peak 会让表格一直停在旧的「查询失败」）。
+  const sig = JSON.stringify([d.total, d.peak, d.peak_date, (d.daily || []).length,
+    accounts.map(a => [a.uid, !!a.ok, !!a.unavailable, a.total, a.peak,
+                       a.error || "", a.reason || ""])]);
   if(hint) statSetText(hint, "（官方口径 · 累计 " + fmt(Math.round(d.total || 0)) + " 积分）");
   if(sig === CREDIT_USAGE_SIG) return;   // 数据没变就不重建（issue #98 的老教训）
   CREDIT_USAGE_SIG = sig;
   const daily = d.daily || [];
-  const failed = (d.accounts || []).filter(a => a && a.ok === false);
-  if(!daily.length){
-    box.innerHTML = '<div class="stat-empty">官方返回的逐日消耗为空（该账号可能还没产生用量）</div>';
-    return;
+  const failed = accounts.filter(a => a && a.ok === false && !a.unavailable);
+  const na = accounts.filter(a => a && a.unavailable);
+  let heatHtml = "";
+  if(daily.length){
+    const max = Math.max.apply(null, daily.map(x => x.value || 0)) || 1;
+    const first = new Date(daily[0].date + "T00:00:00");
+    const lead = (first.getDay() + 6) % 7;
+    const cells = [];
+    for(let i = 0; i < lead; i++) cells.push(null);
+    daily.forEach(x => cells.push(x));
+    const grid = cells.map(x => {
+      if(!x) return '<span class="heat-cell" style="opacity:0"></span>';
+      const ratio = (x.value || 0) / max;
+      const lvl = !x.value ? 0 : (ratio <= 0.25 ? 1 : ratio <= 0.5 ? 2 : ratio <= 0.75 ? 3 : 4);
+      const tip = esc(x.date) + " · " + (x.value ? (Math.round(x.value * 100) / 100 + " 积分") : "无消耗");
+      return '<span class="heat-cell" data-l="' + lvl + '" data-tip="' + tip + '"></span>';
+    }).join("");
+    heatHtml =
+      '<div class="heat-wrap"><div class="heat-grid" style="margin-bottom:6px">' + grid + "</div></div>"
+      + '<div class="heat-legend"><span>积分</span><i data-l="0"></i><span>0</span>'
+      + '<i data-l="1"></i><i data-l="2"></i><i data-l="3"></i><i data-l="4"></i>'
+      + '<span style="margin-left:auto">官方逐日消耗（近 365 天），与上方 token 热力图口径不同</span></div>';
+  } else {
+    // 逐日为空不代表没有账号可看：企业版账号恒为空，公共账号也可能还没产生用量。
+    // 早退会把下面的账号明细一起藏掉，用户只能看到一句「为空」却不知道哪个账号怎么了。
+    const emptyMsg = na.length === accounts.length
+      ? "企业版账号不适用官方积分消耗统计（不向公共域名出站）"
+      : "官方返回的逐日消耗为空（账号可能还没产生用量）";
+    heatHtml = '<div class="stat-empty">' + emptyMsg + '</div>';
   }
-  const max = Math.max.apply(null, daily.map(x => x.value || 0)) || 1;
-  const first = new Date(daily[0].date + "T00:00:00");
-  const lead = (first.getDay() + 6) % 7;
-  const cells = [];
-  for(let i = 0; i < lead; i++) cells.push(null);
-  daily.forEach(x => cells.push(x));
-  const grid = cells.map(x => {
-    if(!x) return '<span class="heat-cell" style="opacity:0"></span>';
-    const ratio = (x.value || 0) / max;
-    const lvl = !x.value ? 0 : (ratio <= 0.25 ? 1 : ratio <= 0.5 ? 2 : ratio <= 0.75 ? 3 : 4);
-    const tip = esc(x.date) + " · " + (x.value ? (Math.round(x.value * 100) / 100 + " 积分") : "无消耗");
-    return '<span class="heat-cell" data-l="' + lvl + '" data-tip="' + tip + '"></span>';
+  const accRows = accounts.map(a => {
+    let note;
+    if(a.ok) note = esc(a.peak_date || "");
+    else if(a.unavailable) note = '<span style="color:var(--dim)">不适用（企业版）</span>';
+    else note = "查询失败：" + esc(a.error || "");
+    return '<tr><td>' + esc(a.nickname || a.uid || "") + '</td>'
+      + '<td style="text-align:center">' + esc(a.realm || "") + '</td>'
+      + '<td style="text-align:right">' + fmt(Math.round(a.total || 0)) + '</td>'
+      + '<td style="text-align:right">' + (a.peak ? fmt(Math.round(a.peak)) : "—") + '</td>'
+      + '<td style="color:var(--dim)">' + note + '</td></tr>';
   }).join("");
-  const accRows = (d.accounts || []).map(a =>
-    '<tr><td>' + esc(a.nickname || a.uid || "") + '</td>'
-    + '<td style="text-align:center">' + esc(a.realm || "") + '</td>'
-    + '<td style="text-align:right">' + fmt(Math.round(a.total || 0)) + '</td>'
-    + '<td style="text-align:right">' + (a.peak ? fmt(Math.round(a.peak)) : "—") + '</td>'
-    + '<td style="color:var(--dim)">' + (a.ok ? esc(a.peak_date || "") : "查询失败：" + esc(a.error || "")) + '</td></tr>').join("");
   box.innerHTML =
     '<div class="stat-panel-sub" style="margin:0 0 8px">'
       + "累计消耗 <b>" + fmt(Math.round(d.total || 0)) + "</b> 积分 · 单日峰值 <b>"
       + fmt(Math.round(d.peak || 0)) + "</b> 积分"
       + (d.peak_date ? ("（" + esc(d.peak_date) + "）") : "")
       + (failed.length ? (" · <span style=\"color:var(--warn)\">" + failed.length + " 个账号查询失败</span>") : "")
+      + (na.length ? (" · <span style=\"color:var(--dim)\">" + na.length + " 个企业版账号不适用</span>") : "")
       + "</div>"
-    + '<div class="heat-wrap"><div class="heat-grid" style="margin-bottom:6px">' + grid + "</div></div>"
-    + '<div class="heat-legend"><span>积分</span><i data-l="0"></i><span>0</span>'
-    + '<i data-l="1"></i><i data-l="2"></i><i data-l="3"></i><i data-l="4"></i>'
-    + '<span style="margin-left:auto">官方逐日消耗（近 365 天），与上方 token 热力图口径不同</span></div>'
+    + heatHtml
     + '<div class="table-wrap" style="margin-top:10px"><table class="insight-table"><thead><tr>'
     + '<th>账号</th><th style="text-align:center">区域</th>'
     + '<th style="text-align:right">累计消耗</th><th style="text-align:right">单日峰值</th>'
-    + '<th>峰值日期 / 错误</th></tr></thead><tbody>' + accRows + "</tbody></table></div>";
+    + '<th>峰值日期 / 状态</th></tr></thead><tbody>' + accRows + "</tbody></table></div>";
   const wrap = box.querySelector(".heat-wrap");
   if(wrap) statBindTip(wrap);
   box.querySelectorAll(".heat-legend i").forEach(el => {
@@ -3718,6 +3738,8 @@ async function testAccount(uid, btn){
     const r = await postJSON('/accounts/test', {uid: uid});
     if(r.ok){
       toast('测试通过 (' + r.elapsed_ms + 'ms) [' + r.model + ']: ' + (r.reply || '正常'), 'ok');
+    } else if(r.queued){
+      toast('上游排队中，约 ' + (r.retry_after || 30) + 's 后重试；账号未被冷却', 'warn');
     } else {
       toast('测试失败: ' + (r.error || r.status || '异常'), 'bad');
     }

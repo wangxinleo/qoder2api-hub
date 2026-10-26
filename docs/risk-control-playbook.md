@@ -46,7 +46,7 @@
 | 机制 | 作用 | 旋钮 |
 |---|---|---|
 | 会话亲和 | 同一会话粘同一账号，避免「多号来回跳」 | 默认开 |
-| 队列等待 | 10605 等待而非报错（对齐官方分钟级） | `QD_QUEUE_MAX_ROUNDS=6` / `QD_QUEUE_WAIT_BUDGET_SECS=600` / `QD_QUEUE_WAIT_JITTER=2` |
+| 队列等待 | 10605 等待而非报错（对齐官方分钟级） | `QD_QUEUE_MAX_ROUNDS=3` / `QD_QUEUE_WAIT_BUDGET_SECS=600` / `QD_QUEUE_WAIT_JITTER=2` |
 | 模型级冷却 | 429 只冷却该模型 | 自动 |
 | 熔断/降权 | 连续 3 次硬失败才熔断（30min 起，封顶 6h） | 代码常量 |
 | 单号并发上限 | 防止一个号被多客户端打爆（**规划中**） | `QD_MAX_CONCURRENT_PER_ACCOUNT` |

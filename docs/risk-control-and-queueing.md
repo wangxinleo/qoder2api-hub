@@ -75,7 +75,7 @@
 | 机制 | 作用 | 相关开关 |
 |---|---|---|
 | 账号亲和（`SessionAffinity`） | 同一会话粘同一账号，减少"多号来回跳"的异常画像 | 默认开启 |
-| 队列等待 | 10605 排队时等待而非报错 | `QD_QUEUE_MAX_ROUNDS`（默认 3）、`QD_QUEUE_WAIT_MAX_SECS`（180）、`QD_QUEUE_WAIT_BUDGET_SECS`（300） |
+| 队列等待 | 10605 排队时等待而非报错 | `QD_QUEUE_MAX_ROUNDS`（默认 3）、`QD_QUEUE_WAIT_MAX_SECS`（180）、`QD_QUEUE_WAIT_BUDGET_SECS`（600） |
 | 模型级冷却 | 429 只冷却该模型，不拖垮整号 | 自动 |
 | 熔断/降权 | 连续硬失败才熔断（3 次），避免一个坏号拖垮请求 | `BREAKER_*`（代码常量） |
 | 短冷却等待 | 冷却窗口 ≤10s 时等待而不是换号 | 自动 |
@@ -179,8 +179,9 @@ GET /api/v2/service/ask/queue/status?requestSetId=<id>&modelKey=<key>&queueType=
 
 ### 7.6 由此得到的两个直接改进
 
-1. **等待预算对齐官方**：网关默认从「3 轮 × 30s ≈ 90s」提升到**分钟级**
-   （`QD_QUEUE_MAX_ROUNDS` 默认 6、`QD_QUEUE_WAIT_BUDGET_SECS` 默认 600），并加 0~2s 抖动，
+1. **等待预算对齐官方**：网关默认 3 轮、单轮最多 180s、总预算 600s
+   （`QD_QUEUE_MAX_ROUNDS=3`、`QD_QUEUE_WAIT_MAX_SECS=180`、
+   `QD_QUEUE_WAIT_BUDGET_SECS=600`），并加 0~2s 抖动，
    避免多客户端同时唤醒打同一队列；
 2. **可见性**：等待期间日志明确写「第 N 轮 / 已等 Xs」，客户端侧表现为「慢」而不是「403」。
 
