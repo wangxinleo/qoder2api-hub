@@ -10593,10 +10593,10 @@ class Handler(BaseHTTPRequestHandler):
                     obj = aggregate_stream(resp, model,
                                            holder={"usage": None},
                                            allowed_names=names)
-            except RateLimited as exc:
-                return self._rate_limited(exc)
             except UpstreamStatus as exc:
-                # 信封排队耗尽与其它协议路径同口径：429 + Retry-After；
+                # aggregate_stream 只解析已建立的响应，不会抛 RateLimited
+                # （只有 open_upstream / aggregate_with_envelope_retry 会）。
+                # 信封排队与其它协议路径同口径：429 + Retry-After；
                 # 非排队错误保留真实 status，不再统一 502。
                 qwait = _queue_wait_seconds(exc.detail)
                 if qwait > 0:
