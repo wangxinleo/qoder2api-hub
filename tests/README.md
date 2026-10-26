@@ -231,6 +231,23 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
+**基线（2026-10-26 · 排队 403 处理 + 积分面板空数据修复）**：
+
+| 口径 | 数值 |
+|---|---|
+| 套件数 | **85 suites** |
+| 全部断言 | **2326 checks** |
+| 结果 | 0 failed / exit 0 |
+| 上一基线 | 83 suites / 2282 checks |
+
+> 本版新增/变更：
+> - 新增 `_test_queue_nonstream.py`（17）：三协议非流式排队耗尽 429 + `Retry-After`、
+>   `record_error` 记 429、web tools 两种排队形态。
+> - 新增 `_test_credit_usage_panel.js`（13）：空 `daily` 仍渲染账号明细、企业版「不适用」
+>   与真实失败分离、账号状态变化触发重绘。
+> - `_test_issue86_account_test.py` 9 → 19（两种排队形态不冷却、钉号、一次性 session key、
+>   面板 queued toast）；`_test_credit_usage.py` 20 → 24（unavailable/reason 透传与面板契约）。
+
 **基线（2026-10-26 · 上游 v1.6.14–v1.7.6 同步）**：
 
 | 口径 | 数值 |
