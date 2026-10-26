@@ -512,11 +512,15 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **会话与排队**：v1.7.2 前缀 session 亲和（新增 `qoder_session_cache.py`，`QD_SESSION_CACHE=off|memory|redis`，默认关闭）+ 导入误报失败修复；#99 Anthropic `/v1/messages` 排队可见分支（流内 ping / 503 + `Retry-After`）；#100 `_exc_http_status()` 修 `RateLimited.status` 缺属性导致的 SSE 截断。
 - **积分与模型**：v1.7.5 官方积分消耗（`credits-summary` / `credits-heatmap`、`/accounts/credits/usage`）与 intl 第二活动入口；#101 max_tokens 上限学习 / clamp 与 `/v1/models` 补字段。
 - **重合处置（上游更完整则按上游）**：企业 / 团队判定采上游 `is_team()`（fork 的 `is_enterprise()` 继续作为 VPC 出站与签到排除契约，二者正交，可同时为真）；Anthropic / chat 排队修复采上游 #99 / #100。
+- **排队 403 收尾（补上游 0426c33 缺口）**：`/accounts/test` 的 HTTP `UpstreamQueued` 与信封 `403+10605` 都不再冷却账号 / 写 `last_error`，返回结构化 `queued` 并钉住被测账号；测试改用一次性 `acct-test-*` session key，不再派生 `pfx-*` 污染亲和表。Anthropic / Responses / Chat 非流式排队耗尽统一 429 + `Retry-After`（此前落 502），web tools 同口径。
+- **积分消耗面板**：`daily` 为空时不再早退，账号明细始终渲染；企业版显示「不适用（企业版）」，与真实「查询失败」分开计数；签名纳入账号状态，状态恢复即重绘。
+- **排队预算文档**：默认值对齐代码常量（3 轮 / 单轮 180s / 总预算 600s / jitter 2）。
 - **保留 fork 语义**：企业 PAT / VPC（无公共回退、签到与活动零出站、Cosy 头、配额三形态口径）、`enterprise_first` 分层派单与会话亲和（前缀 session cache 与账号亲和正交）、坏参数 partial salvage（与上游 #72 marker-only fail-closed 并存）、单文件自更新指向本 fork、Dockerfile COPY 覆盖全部 `qoder_*.py`。
 - **新增契约**：`fetch_credit_usage()` / `fetch_achievements()` 对企业账号首行零出站早退（返回 `unavailable` + 中文原因），不让企业 PAT 触碰公共 `openapi_candidates`。
+- **上游对照**：以上排队 / 面板缺口在 `0426c33` 均未实现，未重复实现上游已有修复；合并保留 #86/#87/#90/#98/#99/#100/#101 原实现。
 - **版本线**：`VERSION = 1.7.6-wangxinleo`；镜像仍推 `ghcr.io/wangxinleo/qoder2api-hub`。
 
-**验证**：全量 **83 suites / 2282 checks / 0 failed**（合并前基线 74 suites / 2045 checks / 0 failed）。
+**验证**：全量 **85 suites / 2326 checks / 0 failed**（合并前基线 74 suites / 2045 checks / 0 failed）。
 
 ### v1.6.13-wangxinleo
 
