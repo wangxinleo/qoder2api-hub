@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.7.7--wangxinleo-2496ED?style=flat-square" alt="Version 1.7.7-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.7.9--wangxinleo-2496ED?style=flat-square" alt="Version 1.7.9-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -501,6 +501,20 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/wangxinleo/qoder2api-hub/releases)。
+
+### v1.7.9-wangxinleo
+
+**同步上游 v1.7.7–v1.7.9（10 个提交）**
+
+- **模型上下文窗口可配置**（#106）：面板「模型库 → 上下文设置」写入 `settings.json.model_context`；请求头 `X-QD-Context: 1M`（或 token 数）可单次抬窗，chat / responses / anthropic 三端点生效，优先级高于面板；只信 HTTP 头，body 里的 `_qd_context` 入口即清除。
+- **换模型计费可见**（#105）：上游静默换模型计费（如 `kmodel_latest` 按 `auto`）时，usage 行新增 `billed_model` + WARN 日志，面板「最近请求」显示红色「计费→auto」徽标。
+- **额度类 403 快速失败**（#108/#109）：code 112（额度耗尽）冷却 30 分钟、code 110（每日次数上限）冷却到本地 0 点（封顶 6h），刻意绕开 single_account 的 3s 压缩；不禁用、不降权，10605 排队路径不受影响。
+- **面板 i18n**（#107）：`i18n/<code>.json` 即插即用，未命中回中文；`/i18n/*` 只读白名单 + realpath 收敛；语言按钮位于主题选择器左侧，选择本地记忆。
+- **账号表排序**（#111）：版本 / 账号 / 状态 / 积分 / 请求 / 总 token / 缓存七列三态排序 + `localStorage`；账号名自然序，积分列点击=剩余、`Shift+点击`=已用，取不到值沉底且不随方向翻转。
+- **保留 fork 语义**：企业 VPC（无公共回退、签到/活动/积分/成就零出站、Cosy 头、配额三形态）、`enterprise_first` 分层派单与会话亲和、排队 403 收尾、积分消耗面板空数据展示。
+- **版本线**：`VERSION = 1.7.9-wangxinleo`；镜像仍推 `ghcr.io/wangxinleo/qoder2api-hub`。
+
+**验证**：全量 **94 suites / 2599 checks / 0 failed**（合并前基线 88 suites / 2422 checks / 0 failed）。
 
 ### v1.7.7-wangxinleo
 
