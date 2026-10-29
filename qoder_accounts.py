@@ -1443,6 +1443,11 @@ class Account(object):
         self.source = str(data.get("source") or "oauth")
         self.enabled = data.get("enabled", True)
         self.last_error = str(data.get("lastError") or "")
+        # 仅用于「旧缺陷遗留的 disabled PAT 账号」保活自愈：标记本次停用原因是
+        # session dead。旧文件没有该键 -> False，靠 lastError 文本兜底。
+        self.disabled_by_session_dead = bool(data.get("disabledBySessionDead"))
+        # 手动启停标记：用户主动停用的账号不得被保活自愈（旧文件缺键 -> False）。
+        self.disabled_by_user = bool(data.get("disabledByUser"))
         self.cooldown_until = float(data.get("cooldownUntil") or 0)
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
         self.model_cooldowns = {}
@@ -1460,6 +1465,11 @@ class Account(object):
         # issue #56：团队/企业账号的自用保护（并发闸门 + 最小间隔 + 客户端统计）。
         # 全部是**内存态**，不落盘，不影响凭证文件格式。
         self._team_lock = threading.Lock()
+        # PAT 刷新：并发请求可能同时发现 token 过期；锁内 2s 去重，
+        # 避免重复轮换 jrt-/PAT（旧 token 已被上游作废后再刷会互相踩）。
+        self._refresh_lock = threading.Lock()
+        self.token_refreshed_at = 0.0    # 最近一次成功刷新（运行期）
+        self.token_recovery_at = 0.0     # 最近一次登录错误自愈尝试（失败也计时）
         self.team_leases = {}
         self.team_last_start = 0.0
         self.team_client_ips = {}
@@ -1540,6 +1550,8 @@ class Account(object):
             "source": self.source,
             "enabled": self.enabled,
             "lastError": self.last_error,
+            "disabledBySessionDead": bool(self.disabled_by_session_dead),
+            "disabledByUser": bool(self.disabled_by_user),
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
             "lastQuotaAnomaly": self.last_quota_anomaly,
@@ -2221,27 +2233,43 @@ class Account(object):
     def refresh(self):
         """刷新 access token。drt- 走 deviceToken，jrt-/PAT 走 jobToken。
 
-        PAT 永不覆盖活跃的 OAuth 会话，只做 jrt- 过期后的最终兜底。
-        """
-        base = self.openapi_base()
-        # 1) OAuth 设备族
-        if self.refresh_token.startswith("drt-"):
-            return self._post_token(base + PATH_DEVICE_REFRESH,
-                                    {"refresh_token": self.refresh_token}, kind="device")
-        # 2) jobToken 族：jrt- 优先，失败回落 PAT 重新交换
-        if self.refresh_token:
-            if self._post_token(base + PATH_JOB_REFRESH,
-                                {"refresh_token": self.refresh_token}, kind="job"):
-                return True
-        if self.personal_token:
-            if self._post_token(base + PATH_JOB_EXCHANGE,
-                                {"personal_token": self.personal_token}, kind="job"):
-                return True
-        if not self.refresh_token and not self.personal_token:
-            self.last_error = "no refresh token; sign in again"
-        return False
+        PAT 永不覆盖活跃的 OAuth 会话；drt-/jrt- 刷新失败后才做最终兜底。
+        并发请求共用一把账号级锁：2s 内已成功刷新则直接复用结果。
 
-    def _post_token(self, url, payload, kind):
+        停用只在**最后一次**尝试失败且确认 session dead 时发生：
+        jrt- 失败还有 PAT 兜底，提前 disable 会把本可恢复的账号永久打死。
+        """
+        with self._refresh_lock:
+            now = time.time()
+            if now - self.token_refreshed_at < 2:
+                return True
+            base = self.openapi_base()
+            # 1) OAuth 设备族：drt- 失败时若还存有 PAT，仍允许最终兜底
+            if self.refresh_token.startswith("drt-"):
+                if self._post_token(base + PATH_DEVICE_REFRESH,
+                                    {"refresh_token": self.refresh_token},
+                                    kind="device",
+                                    allow_disable=not self.personal_token):
+                    return True
+                if not self.personal_token:
+                    return False
+            # 2) jobToken 族：jrt- 优先，失败回落 PAT 重新交换
+            elif self.refresh_token:
+                if self._post_token(base + PATH_JOB_REFRESH,
+                                    {"refresh_token": self.refresh_token},
+                                    kind="job",
+                                    allow_disable=not self.personal_token):
+                    return True
+            if self.personal_token:
+                if self._post_token(base + PATH_JOB_EXCHANGE,
+                                    {"personal_token": self.personal_token},
+                                    kind="job", allow_disable=True):
+                    return True
+            if not self.refresh_token and not self.personal_token:
+                self.last_error = "no refresh token; sign in again"
+            return False
+
+    def _post_token(self, url, payload, kind, allow_disable=True):
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -2258,8 +2286,14 @@ class Account(object):
                 body = ""
             self.last_error = "refresh failed: HTTP %d %s" % (exc.code, body[:160])
             if exc.code in (401, 403) and session_dead(body):
-                self.enabled = False
                 self.last_error = "session dead (TOKEN_EXPIRE): re-login required"
+                # 有 PAT 兜底时延迟到下一次尝试：jrt- 失效不等于 PAT 失效。
+                if allow_disable:
+                    self.enabled = False
+                    self.disabled_by_session_dead = True
+                    # 旧实现只在内存里停用；必须落盘，否则重启后又变回 enabled。
+                    if self.path and os.path.exists(os.path.dirname(self.path)):
+                        self.save(os.path.dirname(self.path))
             return False
         except Exception as exc:
             self.last_error = "refresh failed: %s" % exc
@@ -2272,16 +2306,16 @@ class Account(object):
         else:
             token = data.get("token") or ""
             refresh = data.get("refresh_token") or self.refresh_token
-            if data.get("expires_in"):
-                exp = int(time.time() + int(data["expires_in"]) / 1000)
-            else:
-                exp = self.expires_at
+            exp = _job_expiry(data)
         if not token:
             self.last_error = "refresh returned no token"
             return False
         self.access_token = token
         self.refresh_token = refresh
         self.expires_at = exp or self.expires_at
+        self.token_refreshed_at = time.time()
+        self.disabled_by_session_dead = False
+        self.disabled_by_user = False
         self.last_error = ""
         self.cooldown_until = 0
         if self.path and os.path.exists(os.path.dirname(self.path)):
@@ -3319,6 +3353,24 @@ def token_family(acc):
     return "unknown"
 
 
+JOB_TOKEN_TTL_SECONDS = 24 * 3600
+
+
+def _job_expiry(data):
+    """jobToken 响应的过期时间：expires_in(ms)，缺省/非法按文档 24h 推进。
+
+    旧实现缺 expires_in 时保留旧 expires_at：过期的账号会永远停在“已过期”
+    （每次请求都刷新），而本地时间偏晚时又不会触发刷新（上游 login 错误）。
+    """
+    raw = (data or {}).get("expires_in")
+    if raw:
+        try:
+            return int(time.time() + int(raw) / 1000)
+        except (TypeError, ValueError):
+            pass
+    return int(time.time()) + JOB_TOKEN_TTL_SECONDS
+
+
 def _device_expiry(data):
     """deviceToken 响应的过期时间：expires_in(ms) / expires_at(RFC3339)，默认 30 天。"""
     if data.get("expires_in"):
@@ -4091,6 +4143,10 @@ class AccountPool(object):
         if account is None:
             return None
         account.enabled = bool(enabled)
+        # 手动启停覆盖自动恢复意图：不再保留 session-dead 自愈标记，
+        # 并记录“用户主动停用”，防止保活把账号又拉起来。
+        account.disabled_by_session_dead = False
+        account.disabled_by_user = not bool(enabled)
         if enabled:
             account.clear_error()
         account.save(self.dir)
@@ -4102,6 +4158,8 @@ class AccountPool(object):
                 if realm and account.realm != realm:
                     continue
                 account.enabled = bool(enabled)
+                account.disabled_by_session_dead = False
+                account.disabled_by_user = not bool(enabled)
                 if enabled:
                     account.clear_error()
                 account.save(self.dir)
@@ -4370,10 +4428,7 @@ class AccountPool(object):
             org_name = str(ui.get("organization_name") or ui.get("organizationName") or "")
         except Exception:
             pass
-        if data.get("expires_in"):
-            exp = int(time.time() + int(data["expires_in"]) / 1000)
-        else:
-            exp = int(time.time()) + 24 * 3600
+        exp = _job_expiry(data)
         account = Account({
             "uid": uid or ("p-" + uuid.uuid4().hex[:24]),
             "nickname": nickname or ("u" + (uid[-8:] if uid else uid[:8])),

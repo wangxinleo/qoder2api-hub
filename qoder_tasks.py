@@ -1021,15 +1021,40 @@ def run_keepalive(pool, force=False, threshold_seconds=4 * 3600):
     failed_uids = []
     now = time.time()
     for acc in list(pool.accounts if pool else []):
-        if not acc.enabled or not acc.access_token:
+        # 旧版本缺陷：jrt- 刷新先置 disabled，PAT 兜底成功却没恢复 enabled。
+        # 真实落盘态可能是 enabled=false + lastError 空（PAT 成功时清空过）——
+        # 旧文件没有 disabledBySessionDead 标记，只能按 source=pat + 空 lastError
+        # 做一次保守识别；新文件由标记精确区分。disabledByUser 优先于一切自愈。
+        _legacy_empty = (str(getattr(acc, "source", "") or "") == "pat"
+                         and not str(getattr(acc, "last_error", "") or "").strip())
+        recover = (not acc.enabled and getattr(acc, "personal_token", "")
+                   and not getattr(acc, "disabled_by_user", False)
+                   and (getattr(acc, "disabled_by_session_dead", False)
+                        or qoder_accounts.session_dead(acc.last_error)
+                        or _legacy_empty))
+        if not acc.enabled and not recover:
+            continue
+        if not acc.access_token and not getattr(acc, "personal_token", ""):
             continue
         remain = (acc.expires_at or 0) - now
-        if not force and remain > threshold_seconds:
+        if not force and not recover and remain > threshold_seconds:
             continue
         nick = acc.nickname or acc.uid[:8]
-        if force or remain <= threshold_seconds:
+        if force or recover or remain <= threshold_seconds:
+            if recover and not getattr(acc, "disabled_by_session_dead", False):
+                # 旧文件靠 lastError 命中：先持久化标记，避免本次刷新失败
+                # 覆盖 lastError 后，下一次保活不再尝试恢复。
+                acc.disabled_by_session_dead = True
+                if pool is not None and getattr(pool, "dir", ""):
+                    acc.save(pool.dir)
             logs.append(f"账号 [{nick}] Token 剩余 {_fmt_eta(remain)}，执行主动保活刷新...")
             if acc.refresh():
+                if recover and not acc.enabled:
+                    acc.enabled = True
+                    acc.disabled_by_session_dead = False
+                    if pool is not None and getattr(pool, "dir", ""):
+                        acc.save(pool.dir)
+                    logs.append(f"✓ 账号 [{nick}] 已自动恢复（PAT 刷新成功）")
                 refreshed += 1
                 logs.append(f"✓ 账号 [{nick}] Token 保活刷新成功（{_fmt_eta((acc.expires_at or 0) - time.time())}）")
             else:

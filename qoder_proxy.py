@@ -6219,6 +6219,41 @@ def _note_quota_cooldown(account, status, detail, where):
     return True
 
 
+def _auth_expired_detail(detail):
+    """403 登录/会话失效的文本判据（401 由状态码直接判定，无需看 body）。"""
+    s = str(detail or "").lower()
+    return (qoder_accounts.session_dead(detail)
+            or "login" in s or "sign in" in s or "unauthor" in s)
+
+
+def _recover_account_token(account, where, model=None):
+    """登录错误自愈：强制刷新一次，成功则由调用方重试同一账号。
+
+    仅处理有刷新凭证的账号；队列 10605 / 额度 112/110 由调用方先排除。
+    10s 门限对**失败**也计时，避免信封重试在同一请求内重复消耗 PAT。
+    """
+    if not account or not (getattr(account, "personal_token", "")
+                           or getattr(account, "refresh_token", "")):
+        return False
+    now = time.time()
+    last = max(float(getattr(account, "token_refreshed_at", 0) or 0),
+               float(getattr(account, "token_recovery_at", 0) or 0))
+    if now - last < 10:
+        return False
+    account.token_recovery_at = now
+    if account.refresh():
+        log("account %s auth expired (%s%s) - refreshed, retrying without "
+            "penalty" % (account.uid[:8], where,
+                         " model=%s" % model if model else ""),
+            level="WARN", tag="chat")
+        return True
+    log("account %s auth expired (%s%s) - refresh failed: %s"
+        % (account.uid[:8], where, " model=%s" % model if model else "",
+           str(getattr(account, "last_error", ""))[:120]),
+        level="WARN", tag="chat")
+    return False
+
+
 def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
     """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
     if isinstance(exc, InvalidToolArguments):
@@ -6237,6 +6272,13 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             "account (issue #71)" % (account.uid[:8], status_int),
             level="WARN", tag="chat")
         return
+    # 登录/会话失效：先尝试用 PAT 刷新，成功则不惩罚账号，调用方 reopen 重试。
+    # 401 无论 body 是否可解析都尝试；403 需 login/TOKEN_EXPIRE 文本标记。
+    if (status_int in (401, 403) and not _is_queue71
+            and (status_int == 401 or _auth_expired_detail(detail))
+            and not _quota_cooldown(detail)[0]):
+        if _recover_account_token(account, "envelope", model=model):
+            return
     if session_key and POOL:
         try:
             POOL.affinity.unbind(session_key)
@@ -6278,10 +6320,19 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             % (account.uid[:8], status_int, is_queue, float(actual or 0), cd,
                total), level="WARN", tag="chat")
         if dead:
-            account.enabled = False
-            account.save(ACCOUNTS_DIR) if account.path else None
-            log("account %s session dead via envelope (TOKEN_EXPIRE) - disabled"
-                % account.uid[:8], level="ERROR")
+            if not account.enabled or not (
+                    getattr(account, "personal_token", "")
+                    or getattr(account, "refresh_token", "")):
+                if account.enabled:
+                    account.enabled = False
+                setattr(account, "disabled_by_session_dead", True)
+                account.save(ACCOUNTS_DIR) if account.path else None
+                log("account %s session dead via envelope (TOKEN_EXPIRE) - disabled"
+                    % account.uid[:8], level="ERROR")
+            else:
+                log("account %s session dead via envelope but refresh "
+                    "transiently failed - keeping enabled for retry"
+                    % account.uid[:8], level="WARN", tag="chat")
     else:
         account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
                            cooldown=15, single_account=(total <= 1))
@@ -7041,6 +7092,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     # issue #86：钉死账号按单账号池处理（冷却压到 3s、不跨号轮换）
     total = 1 if only_account is not None else _realm_ready_total(realm, model)
     tried = set()
+    # 登录错误自愈预算按**请求**计：一次刷新已经能把过期 token 换成新的，
+    # 多账号连续过期时也只需要救回当前被选中的那个。
+    refresh_budget = 1
     last_error = None
     last_429 = None
     last_429_detail = ""
@@ -7107,6 +7161,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         last_exc = None
         detail = ""
         tries = 0                 # 瞬时故障重试计数（1s/2s 退避）
+        auth_retry = 0            # 登录错误刷新重试（每账号一次）
         while True:
             try:
                 sess = SESSIONS.get(account)
@@ -7164,6 +7219,24 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     # 抖动 0~2s：多客户端同时被唤醒会一起打同一队列
                     time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
                     continue
+                # 登录错误自愈：401（或 403 login/TOKEN_EXPIRE）先刷新一次，
+                # 再在同一账号上重试。队列 10605 与额度 112/110 必须排除，
+                # 它们不是凭证问题，长冷却/排队语义保持不变。
+                _quota_kind = _quota_cooldown(detail)[0]
+                _auth_like = (exc.code == 401
+                              or _auth_expired_detail(detail))
+                _can_refresh = bool(getattr(account, "personal_token", "")
+                                    or getattr(account, "refresh_token", ""))
+                if (exc.code in (401, 403) and _auth_like
+                        and qwait <= 0 and not _quota_kind and _can_refresh
+                        and auth_retry == 0 and refresh_budget > 0):
+                    # 预算按“尝试”扣减：刷新失败也不在多账号间串行重试，
+                    # 否则一个请求可能叠加 N 次 token 交换的长尾。
+                    refresh_budget -= 1
+                    if _recover_account_token(
+                            account, "HTTP %d" % exc.code, model=model):
+                        auth_retry = 1
+                        continue
                 # 429/401/403 与客户端参数错：立即进入分类，不重试
                 if exc.code in (429, 401, 403):
                     break
@@ -7281,10 +7354,19 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                                    cooldown=300 if dead else 60,
                                    single_account=(total <= 1))
                 if dead:
-                    account.enabled = False
-                    account.save(ACCOUNTS_DIR) if account.path else None
-                    log("account %s session dead (TOKEN_EXPIRE) - disabled"
-                        % account.uid[:8], level="ERROR")
+                    if not account.enabled or not (
+                            getattr(account, "personal_token", "")
+                            or getattr(account, "refresh_token", "")):
+                        if account.enabled:
+                            account.enabled = False
+                        setattr(account, "disabled_by_session_dead", True)
+                        account.save(ACCOUNTS_DIR) if account.path else None
+                        log("account %s session dead (TOKEN_EXPIRE) - disabled"
+                            % account.uid[:8], level="ERROR")
+                    else:
+                        log("account %s session dead but refresh transiently "
+                            "failed - keeping enabled for retry"
+                            % account.uid[:8], level="WARN", tag="chat")
                 last_error = exc
                 continue
             if _is_transient_upstream(exc.code, detail):
