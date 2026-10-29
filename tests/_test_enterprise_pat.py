@@ -21,6 +21,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import types
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -381,6 +382,21 @@ check("A6 fetch_achievements 企业零出站 + unavailable/enterprise 原因",
       and _cjk(ach6.get("error")), ach6)
 check("A6 企业签到/活动族全程 /sash/ 零出站（http_json 未被调用）",
       CALLS == [], CALLS)
+
+# #102 禁用与签到解耦：停用 + 「仍签到」的账号会进入签到 targets，
+# 企业账号即便命中该谓词，也必须在执行层继续零出站早退。
+ent6off = _ent("e6off", enabled=False, checkinWhenDisabled=True)
+check("A6 停用+仍签到：进签到口径但不接推理",
+      ent6off.checkin_eligible() is True
+      and ent6off.inference_eligible() is False,
+      (ent6off.checkin_eligible(), ent6off.inference_eligible()))
+sk6off = T.run_checkin(ent6off)
+check("A6 停用+仍签到企业账号：run_checkin 仍零出站跳过",
+      sk6off.get("skipped_enterprise") is True, sk6off)
+view6 = T.fetch_tasks_view(types.SimpleNamespace(accounts=[ent6off]))
+check("A6 停用+仍签到企业账号：任务中心零出站", CALLS == [], CALLS)
+check("A6 任务中心仍列出该账号（口径可见）",
+      [a["uid"] for a in view6.get("accounts") or []] == ["e6off"], view6)
 
 _reset()
 _route(A.PATH_QUOTA, {"userType": "enterprise", "usageType": "credits",

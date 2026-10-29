@@ -231,6 +231,23 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
+**基线（2026-10-27 · 上游 v1.7.6–v1.7.7 同步）**：
+
+| 口径 | 数值 |
+|---|---|
+| 套件数 | **88 suites** |
+| 全部断言 | **2422 checks** |
+| 结果 | 0 failed / exit 0 |
+| 上一基线 | 85 suites / 2326 checks |
+
+> 本版新增/变更（v1.7.7 合并）：
+> - 合入上游 #102 禁用与签到解耦、#103/PR #104 DSH credentials 引号 + 写后自检
+>   （+3 suites / +92 checks；`_test_issue103_yaml_refs_quoting.py` 的 PyYAML 真实反序列化
+>   1 条在无 PyYAML 环境 skip，不影响 0 failed）。
+> - 企业零出站回归 +4：`_test_enterprise_pat.py` 59 → 63（停用 + 仍签到的企业账号进入签到
+>   targets 后，`run_checkin` 与任务中心仍零出站）。
+> - 全量在 `env -u NO_PROXY -u no_proxy` 下运行。
+
 **基线（2026-10-26 · 排队 403 处理 + 积分面板空数据修复）**：
 
 | 口径 | 数值 |

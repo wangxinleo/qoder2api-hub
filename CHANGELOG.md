@@ -9,6 +9,26 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.7
+
+**🐛 问题修复**
+
+- **DSH「一键配置」写入未加引号的 YAML 值，纯数字 Key 让 DSH 完全起不来**（#103 / PR #104）：`yaml_refs_upsert()` 用字符串插值直接拼 `key: value`，YAML 会把 `13800138000`、`007`、`1e5`、`true`、`null` 解析成非字符串；DSH 的 credentials-local 对 `refs` 值做硬校验（`typeof !== "string"` 直接抛 `TypeError`），于是 `credentials` 插件不激活 → `connection`/`authorization` 与全部 tauri、mcp 插件级联 waiting → Harness 进程 exit 1，而面板全程显示「配置成功」。
+  现在统一用 `json.dumps()` 生成**双引号标量**（同时也是合法 YAML double-quoted scalar，转义覆盖换行/引号/反斜杠/控制字符）；三处写入点全部走它。
+  另外补了**写后自检**：`refs_value_is_scalar_string()` 校验写入结果，不合格就让 `plan()` 直接抛错——面板不会再报「配置成功」。
+
+**✨ 新功能**
+
+- **禁用与签到解耦**（#102）：`enabled` 只表示「不接推理流量」，不再顺带停掉每日签到。
+  - 账号新增 `checkinWhenDisabled`（默认关 = 维持历史行为）；停用的账号行多一个 **仍签到** 勾选；
+  - 口径拆成两个谓词：`inference_eligible()`（`enabled + token`，推理选号不变）与 `checkin_eligible()`（有 token 且「启用或开了开关」）；
+  - 面板每日签到、任务中心批量签到/领福利、调度器整点签到三条路径都改用后者；**凭证失效/过期仍排除**（`stale_uids` 逻辑不动）；
+  - 新接口 `POST /accounts/checkin-when-disabled {uid, value}`，落盘即生效。
+
+  副作用是好的：照常签到让认证会话保持活性，重新启用时更不容易撞上「token 早已静默过期」。
+
+**验证**：`_test_issue103_yaml_refs_quoting.py`（PR 自带 74 条）、新增 `_test_issue103_selfcheck.py`（17 条：十种危险 Key 都能安全写入 + 自检函数四态）、新增 `_test_issue102_checkin_decoupled.py`（18 条：两谓词语义、持久化/public、三条路径源码守卫、端到端落盘回读）；全量 **80 suites / 2236 checks / 0 failed**。
+
 ## v1.7.6
 
 **🐛 问题修复**

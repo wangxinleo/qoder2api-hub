@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.7.6--wangxinleo-2496ED?style=flat-square" alt="Version 1.7.6-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.7.7--wangxinleo-2496ED?style=flat-square" alt="Version 1.7.7-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -501,6 +501,18 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/wangxinleo/qoder2api-hub/releases)。
+
+### v1.7.7-wangxinleo
+
+**同步上游 v1.7.6–v1.7.7（3 个提交）**
+
+- **DSH 一键配置**：#103 / PR #104 —— `yaml_refs_upsert()` 的 `refs` 值统一用 JSON 双引号标量写入，纯数字 / 布尔 / null Key 不再被 YAML 解析成非字符串；新增写后自检 `refs_value_is_scalar_string()`，不合格直接抛错，面板不再假报「配置成功」。
+- **禁用与签到解耦**：#102 —— `enabled` 只表示不接推理流量；新增账号字段 `checkinWhenDisabled`（默认关 = 历史行为），拆出 `inference_eligible()` / `checkin_eligible()` 两个谓词；面板停用行新增「仍签到」勾选，新增 `POST /accounts/checkin-when-disabled`；面板每日签到、任务中心批量签到/领福利、调度器整点签到、任务中心账号列表统一改口径，凭证失效/过期仍排除。
+- **保留 fork 语义**：企业 VPC（无公共回退、签到/活动/积分/成就零出站、Cosy 头、配额三形态）、`enterprise_first` 分层派单与会话亲和、排队 403 收尾、积分消耗面板空数据展示。
+- **新增契约**：停用 + `checkinWhenDisabled` 的企业账号进入签到 targets 时，`run_checkin()` / `run_pro_claim()` / `campaigns()` 仍在执行层零出站早退（`_test_enterprise_pat.py` +4 条钉死）。
+- **版本线**：`VERSION = 1.7.7-wangxinleo`；镜像仍推 `ghcr.io/wangxinleo/qoder2api-hub`。
+
+**验证**：全量 **88 suites / 2422 checks / 0 failed**（合并前基线 85 suites / 2326 checks / 0 failed）。
 
 ### v1.7.6-wangxinleo
 

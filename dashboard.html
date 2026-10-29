@@ -526,6 +526,11 @@ a:hover{text-decoration:underline}
   .seg-pill,.rank-bar>i,.heat-cell,.stat-kpi,.cache-card,.stat-tip{transition:none !important}
 }
 
+.ck-when-off{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;
+  color:var(--dim);margin-top:4px;cursor:pointer;white-space:nowrap}
+.ck-when-off input{width:11px;height:11px;accent-color:var(--accent);cursor:pointer}
+.ck-when-off:hover{color:var(--fg)}
+
 /* ================= 账号页（独立板块） ================= */
 .acct-realms{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-bottom:16px}
 .acct-realms .realm-card{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}
@@ -3511,6 +3516,11 @@ function accountRow(a){
   const uidAttr = esc(String(a.uid || '').replace(/[^\w.@-]/g, ''));
   const nameAttr = esc(String(a.nickname || '').replace(/["'\\<>]/g, ''));
   const usage = USAGE_BY_ACCOUNT[a.uid] || {};
+  const _ckOff = (!a.enabled)
+    ? '<label class="ck-when-off" title="issue #102：禁用只表示不接推理流量，勾上后该账号仍参与每日签到/领福利">'
+      + '<input type="checkbox" ' + (a.checkinWhenDisabled ? 'checked' : '') +
+        ' onchange="setCheckinWhenDisabled(\'' + a.uid + '\', this.checked)">仍签到</label>'
+    : '';
   const state = !a.enabled ? '<span class="badge off">已停用</span>'
               : a.inCooldown ? '<span class="badge warn">冷却 ' + (a.cooldownFor||0) + 's</span>'
               : a.expiresIn === 'expired' ? '<span class="badge bad">已过期</span>'
@@ -3575,7 +3585,7 @@ function accountRow(a){
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + (a.note ? ('<div class="hint" style="margin:3px 0 0" title="备注（issue #69）"><span style="color:var(--accent)">备注</span> ' + esc(a.note) + '</div>') : '')
     + err + '</td>'
-    + '<td style="text-align:center">' + state + '</td>'
+    + '<td style="text-align:center">' + state + _ckOff + '</td>'
     + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
     + '<td style="text-align:left;white-space:nowrap">' + credText
     +   creditsDeltaChip(a) + freshLine + '</td>'
@@ -3621,6 +3631,15 @@ function setAccountSearch(v){
   window.ACCT_SEARCH = String(v || "");
   clearTimeout(_acctSearchTimer);
   _acctSearchTimer = setTimeout(renderAccounts, 160);
+}
+
+async function setCheckinWhenDisabled(uid, value){
+  try{
+    const r = await postJSON("/accounts/checkin-when-disabled", {uid: uid, value: !!value});
+    if(!r.ok){ toast(r.msg || "设置失败", "bad"); renderAccounts(); return; }
+    if(r.accounts){ window.ACCOUNTS = r.accounts; renderAccounts(); }
+    toast(value ? "该账号禁用期间仍会签到" : "该账号禁用期间不再签到", "ok");
+  }catch(e){ toast("设置失败: " + e.message, "bad"); }
 }
 
 function renderAccounts(){

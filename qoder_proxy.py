@@ -62,7 +62,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates_for,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.6-wangxinleo"
+VERSION = "1.7.7-wangxinleo"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -9896,8 +9896,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 # 不再按区域过滤：签到能力运行时探测，接口不存在的账号会在
                 # 日志里给出明确原因（历史问题：国际版点签到完全没反应）。
-                targets = [a for a in POOL.accounts
-                           if a.enabled and a.access_token]
+                # issue #102：签到与「是否接推理」解耦——禁用但开了
+                # checkinWhenDisabled 的账号仍参与（凭证缺失的仍排除）
+                targets = [a for a in POOL.accounts if a.checkin_eligible()]
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_checkin(targets, gap=1.0)
@@ -9921,8 +9922,9 @@ class Handler(BaseHTTPRequestHandler):
                                             "msg": "未找到指定的账号"})
                 targets = [target]
             else:
-                targets = [a for a in POOL.accounts
-                           if a.enabled and a.access_token]
+                # issue #102：签到与「是否接推理」解耦——禁用但开了
+                # checkinWhenDisabled 的账号仍参与（凭证缺失的仍排除）
+                targets = [a for a in POOL.accounts if a.checkin_eligible()]
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_pro_claim(targets)
@@ -9970,6 +9972,18 @@ class Handler(BaseHTTPRequestHandler):
                 save_persisted_realm(new_realm)
             return self._json(200, {"ok": True, "current": CURRENT_REALM,
                                     "persisted": True})
+        if path == "/accounts/checkin-when-disabled":
+            # issue #102：禁用只表示不接推理流量；允许该账号在禁用期间照常签到
+            uid = payload.get("uid")
+            target = POOL.get(uid) if uid else None
+            if not target:
+                return self._json(200, {"ok": False, "msg": "未找到指定的账号"})
+            target.checkin_when_disabled = bool(payload.get("value"))
+            if target.path:
+                target.save(os.path.dirname(target.path))
+            return self._json(200, {"ok": True, "uid": target.uid,
+                                    "checkinWhenDisabled": target.checkin_when_disabled,
+                                    "accounts": account_views()})
         if path == "/accounts/checkin":
             # 账号面板的「每日签到」按钮：**只做每日签到领积分**——Credits 类活动
             # （如"每天领 100 Credits"，旧 sash 接口兜底），不领券/兑换码类活动，
@@ -9983,7 +9997,7 @@ class Handler(BaseHTTPRequestHandler):
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
             targets = [a for a in targets
-                       if a is not None and a.enabled and a.access_token]
+                       if a is not None and a.checkin_eligible()]
             results = [None] * len(targets)
 
             def _one(idx, account):

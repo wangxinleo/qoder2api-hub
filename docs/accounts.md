@@ -158,6 +158,17 @@
 
 更完整的风控分析见[风控与排队](risk-control-and-queueing.md)和[风控处置手册](risk-control-playbook.md)。
 
+## 禁用与签到（#102）
+
+「禁用」只表示**不接推理流量**，不该顺带停掉每日签到——账号级奖励照领、会话也保持活性（效果近似 keepalive）。
+
+- 停用的账号行会多一个 **仍签到** 勾选（`checkinWhenDisabled`，默认关 = 维持历史行为）；
+- 勾上后：面板「每日签到」、任务中心批量签到、调度器整点签到都会带上它；
+- **凭证失效（无 token）与过期账号始终排除**——签了必然失败，还会用退化响应覆盖余额快照；
+- 推理选号口径不变：`inference_eligible()` 仍然只看 `enabled + token`。
+
+对应接口：`POST /accounts/checkin-when-disabled {uid, value}`。
+
 ## 定时调度
 
 调度器随网关一起启动，时间以网关所在机器的本地时区为准（Docker 镜像默认 `TZ=Asia/Shanghai`）：
