@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.7.9--wangxinleo-2496ED?style=flat-square" alt="Version 1.7.9-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.7.19--wangxinleo-2496ED?style=flat-square" alt="Version 1.7.19-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -496,11 +496,33 @@ python _verify_models.py --base http://127.0.0.1:8790
 | `stop-qoder-proxy.sh` | Linux / macOS 停止脚本，对应 `stop-qoder-proxy.bat`（读 `qoder-proxy.pid`、校验命令行确为 `qoder_proxy.py` 后精确停止；PID 文件缺失时按「进程 + `--port`」兜底查找，陈旧 PID 自动清理） |
 | `allow-firewall.sh` | Linux / macOS 放行防火墙，对应 `allow-firewall.bat`（自动识别 ufw / firewalld / nftables / iptables；WSL2 打印 Windows 侧规则与 portproxy 命令） |
 
+## 🔗 相关：多平台合集面板
+
+如果你同时在用别的 AI 编程平台账号，可以看看这块合集面板：
+
+**[WorkBuddy2API Panel](https://github.com/xu20060420fan-cell/workbuddy2api-trae-qoder-minimax-panel)**
+
+同样支持 **Qoder**（每日额度按账号轮转领取、凭证自动续期），另外还统管 **WorkBuddy / CodeBuddy / Trae / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道**，全部账号共用一个 OpenAI 兼容网关。
+
 ---
 
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/wangxinleo/qoder2api-hub/releases)。
+
+### v1.7.19-wangxinleo
+
+**同步上游 v1.7.10–v1.7.19（24 个提交）**
+
+- **安全审计修复**（#131）：模型白名单保存不再丢失（视图回显 + 区分未提交/显式空列表）、Web 工具补模型封禁与 Key 白名单前置检查、Web 工具每轮推理记账、保留账号 uid（`settings` / `models-cache-*` / `usage-*`）导入与落盘双重拒绝、`POST /panel/logout` 先鉴权、网页抓取 SSRF 三类绕过（全球单播判定 + 解析钉死到连接 + 重定向逐跳复检）。
+- **会话与计费**：同一客户端会话复用 `business.id` / `chat_record_id` / `begin_at`（#128），避免一次对话被上游拆成几十条；Usage 归一为 OpenAI 标准位 `prompt_tokens_details.cached_tokens`（#112）；移除误导性的计费自检与 `usage.billed_model`（#121，上游对网关身份统一回报 `auto`）。
+- **流式健壮性**：同帧 `tool_calls` 起点不再丢失（#124）、Anthropic `tool_use` 首帧无名时缓冲（#116）、截断工具流 fail-closed（#120）、effort 档位双向就近 clamp + namespace/MCP 工具展平（#126/#127）、chat 流尾 usage 帧顺序修正（#113 系列）。
+- **签到与调度**：活动列表抖动重试、`SAME_PERSON_ALREADY_CLAIMED` 按「人」去重语义与本地盖章、调度器 `_fired` 持久化（#130）；SBC 设备树判定不再误报 KVM（#123）。
+- **面板**：「最近请求」新增积分列与本页合计（#129）；客户端身份可用 `QD_COSY_CLIENTTYPE` / `QD_COSY_UA` 覆盖（#113）。
+- **保留 fork 语义**：企业 VPC（无公共回退、签到/活动/积分/成就零出站、Cosy 头、配额三形态、PAT 自愈）、`enterprise_first` 分层派单与会话亲和、排队 403 收尾、非流式 429 + `Retry-After`、echo partial salvage。上游 #120 的 fail-closed 残片守卫只覆盖「认不出的协议残片」，fork 对「marker + JSON 数组回声」的未闭合/非法形态继续走 droppable / fail-open（`_leak_array_echo_candidate` 分流）。
+- **版本线**：`VERSION = 1.7.19-wangxinleo`；镜像仍推 `ghcr.io/wangxinleo/qoder2api-hub`。
+
+**验证**：全量 **114 suites / 2959 checks / 0 failed**（含 fork 契约套件与上游新增套件）。
 
 ### v1.7.9-wangxinleo
 

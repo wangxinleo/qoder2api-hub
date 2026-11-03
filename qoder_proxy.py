@@ -28,7 +28,7 @@ OpenAI 兼容接口。上游链路：
 import argparse
 import atexit
 import hashlib
-from collections import deque
+from collections import deque, OrderedDict
 import re
 import json
 import os
@@ -50,6 +50,8 @@ import qoder_accounts
 import qoder_activity
 import qoder_agents
 import qoder_anthropic
+
+# issue #116：把宿主日志注入 anthropic 模块（它自己只 import 标准库）
 import qoder_catalog
 import qoder_pricing
 import qoder_settings
@@ -62,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates_for,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.9-wangxinleo"
+VERSION = "1.7.19-wangxinleo"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -476,6 +478,9 @@ def _empty_stats():
 _usage = _empty_stats()
 
 
+_BILLED_WARN_AT = {}
+
+
 def _extract_usage(usage):
     """Normalize the upstream usage block into the fields we track."""
     if not usage:
@@ -486,7 +491,8 @@ def _extract_usage(usage):
         "prompt_tokens": usage.get("prompt_tokens") or 0,
         "completion_tokens": usage.get("completion_tokens") or 0,
         "reasoning_tokens": details.get("reasoning_tokens") or 0,
-        "cached_tokens": usage.get("prompt_cache_hit_tokens")
+        "cached_tokens": usage.get("cached_tokens")
+        or usage.get("prompt_cache_hit_tokens")
         or details.get("cached_tokens") or prompt_details.get("cached_tokens") or 0,
         "total_tokens": usage.get("total_tokens") or 0,
         # issue #22：上游给的是**复数 credits** —— 旧实现只读单数 credit，
@@ -545,13 +551,6 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     fields = _extract_usage(usage)
     if not fields:
         return None
-    # issue #105：上游可能**静默换模型计费**（实测把 kmodel_latest 记成 auto）。
-    # 只有换号时才多写一个键——旧行格式零变化，面板/统计按需显示。
-    _billed = str((usage or {}).get("model") or "")
-    if _billed and _billed != str(model or ""):
-        fields["billed_model"] = _billed
-        log("upstream billed a different model: requested=%s billed=%s"
-            % (model, _billed), level="WARN", tag="chat")
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2337,6 +2336,10 @@ def runtime_settings_view():
             else "*" * len(raw),
             "source": entry.get("source") or "panel",
             "created_at": entry.get("created_at") or "",
+            # issue #131-1：白名单与备注必须回显 —— 面板「读 → 改 → 存」是一条
+            # 全量覆盖链，视图里没有的字段会被前端当成空值写回去（等于放大授权）。
+            "models": list(entry.get("models") or []),
+            "note": entry.get("note") or "",
         })
     return {
         "panel_password_is_default":
@@ -2421,10 +2424,12 @@ def prefix_session_cache():
 
 
 def assign_prefix_session(body, account, model_key, client_session_key=None,
-                          usage_ctx=None):
+                          usage_ctx=None, fallback_session_id=None):
     """Choose a cache-affine ID only within the selected upstream account."""
     # Always reset: a preceding failed account may already have acquired an ID.
-    body["session_id"] = str(uuid.uuid4())
+    # issue #128：没有前缀缓存命中时用**会话级** id 兜底，保证同一对话的
+    # session_id 稳定（上游用量归组用），而不是每请求一个新 uuid。
+    body["session_id"] = fallback_session_id or str(uuid.uuid4())
     if usage_ctx is not None:
         usage_ctx["session_affinity"] = "random"
     try:
@@ -2576,6 +2581,10 @@ def log(msg, level=None, tag=None):
     add_log_entry(msg, level=level, tag=tag)
 
 
+
+# issue #116：把宿主日志注入 anthropic 模块（它只 import 标准库，无法反向 import 本模块）
+qoder_anthropic._bind_log(log)
+
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
     with _LOG_LOCK:
         items = list(LOG_BUFFER)
@@ -2676,30 +2685,55 @@ def merge_catalog(primary, realm=None):
     return out
 
 
+LOCAL_CATALOG_VERSIONS = ("catalog-v7", "catalog-v6")
+
+
+def local_catalog_files(home):
+    """本机目录缓存文件候选：新版 v7 优先、老客户端 v6 兜底（issue #74 同款降级）。
+
+    官方 1.1.81 起写 catalog-v7（格式与 v6 同为 QMC v1，只是场景更多）；仍存
+    在只有 v6 的老安装，因此两个文件名都找，同一账号目录下 v7 优先。
+    返回 [(path, uid)]，uid 是解密密钥派生用的子目录名。
+    """
+    out = []
+    try:
+        with open(os.path.join(home, "default"), encoding="utf-8") as fh:
+            uid = str(json.load(fh).get("uid") or "")
+    except Exception:
+        # issue #74：容器 / 未装官方客户端时 ~/.qoder/.models/default 天然
+        # 不存在，这是**正常降级**（最终回落到内嵌快照），不该刷 WARN。
+        uid = ""
+    try:
+        subs = [uid] if uid and os.path.isdir(os.path.join(home, uid)) else \
+            sorted(d for d in os.listdir(home) if os.path.isdir(os.path.join(home, d)))
+    except Exception:
+        return out
+    for sub in subs:
+        for fname in LOCAL_CATALOG_VERSIONS:
+            path = os.path.join(home, sub, fname)
+            if os.path.isfile(path):
+                out.append((path, sub))
+    return out
+
+
 def read_local_models(realm=None):
     """读取本机官方客户端的模型目录缓存（QMC 解密），无网络也能跟官方对齐。
 
-    路径：~/.qoder/.models/<uid>/catalog-v6（intl）/ ~/.qoder-cn/...（cn）
+    路径：~/.qoder/.models/<uid>/catalog-v7（1.1.81+，v6 兜底）
     返回 [(key, meta)]；任何失败返回 []（回退静态快照）。
     """
     r = realm or CURRENT_REALM
     home = os.path.join(os.path.expanduser("~"),
                         get_realm_config(r)["home_dir"], ".models")
     try:
-        default_path = os.path.join(home, "default")
-        uid = ""
-        with open(default_path, encoding="utf-8") as fh:
-            uid = str(json.load(fh).get("uid") or "")
-        subdirs = [uid] if uid and os.path.isdir(os.path.join(home, uid)) else \
-            [d for d in os.listdir(home) if os.path.isdir(os.path.join(home, d))]
-        for sub in subdirs:
-            cat = os.path.join(home, sub, "catalog-v6")
-            if not os.path.isfile(cat):
+        from qoder_sign import qmc_decrypt
+        for cat, sub in local_catalog_files(home):
+            try:
+                with open(cat, "rb") as fh:
+                    blob = fh.read().decode("ascii", "replace")
+                plain = json.loads(qmc_decrypt(blob, sub).decode("utf-8"))
+            except Exception:
                 continue
-            with open(cat, "rb") as fh:
-                blob = fh.read().decode("ascii", "replace")
-            from qoder_sign import qmc_decrypt
-            plain = json.loads(qmc_decrypt(blob, sub).decode("utf-8"))
             chat = plain.get("chat") or []
             out = []
             for m in chat:
@@ -2715,10 +2749,6 @@ def read_local_models(realm=None):
                 log("model catalog read from local client cache: %d models (%s)"
                     % (len(out), r))
                 return out
-    except FileNotFoundError:
-        # issue #74 补充：容器 / 未装官方客户端时 ~/.qoder/.models/default 天然
-        # 不存在，这是**正常降级**（最终回落到内嵌快照），不该刷 WARN 让人误判。
-        pass
     except Exception as exc:
         log("local model catalog read skipped: %s" % exc, level="DEBUG")
     return []
@@ -2764,23 +2794,131 @@ def _load_models_cache(realm):
         return []
 
 
-def fetch_models(realm=None):
+def _register_live_names(entries):
+    """把清单条目的 display_name -> key 注册进解析器（官方改显示名窗口期）。
+
+    动态接口 / 本机目录缓存 / 落盘缓存里 display_name 永远比冻结快照新鲜；
+    注册后 resolve_upstream_key 才认得 /v1/models 正在广告的新名字
+    （如 kmodel_latest 改显示名 Kimi-K3 -> Kimi-K3.1-Pro，详见
+    qoder_catalog.register_live_display_names 的注释）。失败静默：清单
+    拉不出来时冻结别名表仍在，行为退回改动前。
+    """
+    try:
+        pairs = []
+        for mid, meta in entries or []:
+            name = str((meta or {}).get("display_name")
+                       or (meta or {}).get("name") or "").strip()
+            if name and mid:
+                pairs.append((name, mid))
+        if pairs:
+            qoder_catalog.register_live_display_names(pairs)
+    except Exception:
+        pass
+
+
+_LIVE_NAMES_SYNC_AT = {}
+_LIVE_NAMES_LOCK = threading.Lock()
+
+
+def _ensure_live_names(realm=None):
+    """确保动态清单的显示名已注册进解析器（每区域 300s 至多一次，失败静默）。
+
+    聊天主链路的兜底：客户端可以不看 /v1/models 直接发模型名（配了固定模型
+    的脚本/智能体），此时 fetch_models 可能一次都没跑过，解析器里没有动态
+    显示名——第一次解析失败时在这里补注册。**只读离线源**（allow_network=
+    False）：请求路径里出网拉 model/list 会多一次出站调用并触发 POOL.pick
+    轮换账号（破坏 #86 钉死账号语义）；在线清单由启动预热线程与 /v1/models
+    等常规路径负责刷新。
+    """
+    r = realm if realm in ("cn", "intl") else CURRENT_REALM
+    with _LIVE_NAMES_LOCK:
+        if time.time() - _LIVE_NAMES_SYNC_AT.get(r, 0.0) < 300:
+            return
+        _LIVE_NAMES_SYNC_AT[r] = time.time()
+    try:
+        _register_live_names(fetch_models(realm=r, allow_network=False))
+    except Exception:
+        # 失败不占节流窗口：离线源只是本地文件探测，让下一条请求能立即重试，
+        # 冷启动竞态（预热线程还没跑完就来了第一条请求）不会白等 300s。
+        with _LIVE_NAMES_LOCK:
+            _LIVE_NAMES_SYNC_AT[r] = 0.0
+
+
+def resolve_model_key(model, realm=None):
+    """open_upstream 用的模型名解析：冻结表优先，未命中时同步动态名再试一次。
+
+    返回原样字符串 = 真未知（BYOK 自定义模型等，透传语义保持不变）；
+    官方改了显示名的情况（快照未跟上）由第二次解析兜住。
+    """
+    key = qoder_catalog.resolve_upstream_key(model, realm=realm)
+    raw = str(model or "").strip()
+    if key and key == raw and not qoder_catalog.is_known_upstream_key(key, realm):
+        _ensure_live_names(realm)
+        key = qoder_catalog.resolve_upstream_key(model, realm=realm)
+    return key
+
+
+# 离线合并结果的短 TTL memo（MAJOR：请求路径每请求一次磁盘 IO 的节流）。
+# 离线模式不写 _models_cache（会挡住在线刷新），但没有自己的 memo 时，
+# 降级环境（无账号 / 上游持续失败 / 容器重启后）每条请求都会重读
+# models-cache JSON 甚至重解密本机目录缓存。
+_OFFLINE_MODELS_TTL = 60.0
+_offline_models_cache = {}      # realm -> (at, entries)，受 _lock 保护
+
+
+def _offline_models_memo_get(r):
+    hit = _offline_models_cache.get(r)
+    if hit and time.time() - hit[0] < _OFFLINE_MODELS_TTL:
+        return hit[1]
+    return None
+
+
+def fetch_models(realm=None, allow_network=True):
+    """合并三级来源的模型清单（[(key, meta)]，官方 UI 顺序）。
+
+    allow_network=False 供**请求路径**（resolve_model_key 的惰性同步、
+    catalog_meta_for 的元数据查询）使用：只读离线源（内存缓存 / issue #58
+    落盘缓存 / 本机官方目录缓存），不出网、不碰账号池（#86），且结果有
+    60s memo——磁盘 IO 每分钟至多一次。请求路径里调 read_dynamic_models
+    会多一次 model/list 出站调用（打乱 failover 序列）并触发 POOL.pick。
+    """
     r = realm or CURRENT_REALM
     with _lock:
         c = _models_cache.get(r) or {"at": 0.0, "data": None}
         if c["data"] and time.time() - c["at"] < 300:
             return c["data"]
+        if not allow_network:
+            memo = _offline_models_memo_get(r)
+            if memo is not None:
+                return memo
     # 1) 动态接口（需要账号） 2) 本机官方目录缓存 3) 内嵌静态快照
-    live = read_dynamic_models(realm=r)
-    if live:
-        _save_models_cache(r, live)      # issue #58：成功的动态清单落盘
+    live = []
+    if allow_network:
+        live = read_dynamic_models(realm=r)
+        if live:
+            _save_models_cache(r, live)      # issue #58：成功的动态清单落盘
+    if not live:
+        # 过期的内存缓存也好过没有：display_name -> key 的映射几乎不会变旧
+        # （官方改显示名的窗口期里，旧映射最多让新名字解析不到，不会解析错）
+        with _lock:
+            live = (_models_cache.get(r) or {}).get("data") or []
     if not live:
         live = _load_models_cache(r)     # 动态拿不到时先用上次成功的结果
     if not live:
         live = read_local_models(realm=r)
-    entries = merge_catalog(live, realm=r)
-    with _lock:
-        _models_cache[r] = {"at": time.time(), "data": entries}
+    entries = merge_catalog(live or None, realm=r)
+    # 广告的名字（/v1/models 的 id）与解析器认知同源：清单一到手就注册显示名
+    _register_live_names(entries)
+    if allow_network:
+        with _lock:
+            _models_cache[r] = {"at": time.time(), "data": entries}
+            # 在线刷新出了新数据：旧 memo 作废，离线消费者立即看到新显示名
+            _offline_models_cache.pop(r, None)
+    else:
+        # 只进 memo（短 TTL），不写 _models_cache：把离线合并结果标成
+        # 「新鲜」会挡住 /v1/models 等在线路径 300s 内的正常网络刷新。
+        with _lock:
+            _offline_models_cache[r] = (time.time(), entries)
     return entries
 
 
@@ -3133,6 +3271,42 @@ def strip_data_prefix(line):
     return line
 
 
+def normalize_usage_for_client(usage):
+    """把上游的多套缓存字段归一写进 OpenAI 标准位（issue #112）。
+
+    上游按模型族换字段：DeepSeek 用 `prompt_cache_hit_tokens`、Qwen 用
+    `completion_tokens_details.cached_tokens`，都不发标准位
+    `prompt_tokens_details.cached_tokens` —— 按标准协议解析的客户端恒读 0。
+    这里复用 _extract_usage 的优先级把数字搬过去，**原字段保留**（不删上游惯例，
+    避免已经适配了上游形态的客户端反而读不到）。
+    """
+    if not isinstance(usage, dict):
+        return usage
+    det = usage.get("completion_tokens_details") or {}
+    pdet = usage.get("prompt_tokens_details")
+    pdet = dict(pdet) if isinstance(pdet, dict) else {}
+    val = None
+    for cand in (usage.get("cached_tokens"),
+                 usage.get("prompt_cache_hit_tokens"),
+                 det.get("cached_tokens") if isinstance(det, dict) else None,
+                 pdet.get("cached_tokens")):
+        try:
+            n = int(cand or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            val = n
+            break
+    if val is None:
+        if "prompt_tokens_details" in usage and pdet:
+            return usage          # 上游已经给了标准位，别动它
+        return usage
+    if pdet.get("cached_tokens") == val and usage.get("prompt_tokens_details"):
+        return usage
+    pdet["cached_tokens"] = val
+    usage["prompt_tokens_details"] = pdet
+    return usage
+
 def clean_chunk(raw):
     """Drop the empty noise fields the gateway pads deltas with."""
     try:
@@ -3142,6 +3316,12 @@ def clean_chunk(raw):
     if not isinstance(obj, dict):
         return raw
     changed = False
+    # issue #112：流尾 usage 帧也要按 OpenAI 标准位给 cached_tokens
+    if isinstance(obj.get("usage"), dict):
+        before = json.dumps(obj["usage"], sort_keys=True)
+        obj["usage"] = normalize_usage_for_client(obj["usage"])
+        if json.dumps(obj["usage"], sort_keys=True) != before:
+            changed = True
     for choice in obj.get("choices") or []:
         delta = choice.get("delta")
         if not isinstance(delta, dict):
@@ -3351,8 +3531,25 @@ def catalog_meta_for(model_key, realm=None):
 
     Anthropic 入口在调用 qoder_anthropic.messages_to_chat 时需要一个 meta，
     否则 effort_from_anthropic 取不到 supported 档位表 -> 思考档位被静默丢弃。
+
+    优先动态清单（display_name / thinking_config / 上下文窗口都是官方**此刻**
+    的口径；快照可能还停在旧显示名，如 kmodel_latest 的 Kimi-K3 ->
+    Kimi-K3.1-Pro 改名），静态快照兜底。fetch_models 自带 300s 缓存与
+    「动态 > 落盘 > 本机 > 快照」降级，离线/无账号时退回快照，行为不变。
     """
-    for m in qoder_catalog.models_for_realm(realm or CURRENT_REALM):
+    r = realm if realm in ("cn", "intl") else CURRENT_REALM
+    try:
+        # 请求路径也会走到这里（build_qoder_body / Anthropic 档位表）——离线取
+        # （allow_network=False）：在线刷新由启动预热线程与 /v1/models 负责，
+        # 请求内不做额外出站调用、不碰账号池（#86 钉死账号语义）。
+        for mid, meta in fetch_models(realm=r, allow_network=False):
+            if mid == model_key and meta:
+                out = dict(meta)
+                out.setdefault("key", model_key)
+                return out
+    except Exception:
+        pass
+    for m in qoder_catalog.models_for_realm(r):
         if m.get("key") == model_key:
             return m
     for m in qoder_catalog.STATIC_INTL_MODELS + qoder_catalog.STATIC_CN_MODELS:
@@ -3960,6 +4157,137 @@ def _marker_only_echo(text):
         rest = rest[len(LEAK_MARKER):].lstrip()
     rest = _strip_dsml_close_tail(rest).strip()
     return rest == ""
+
+
+def _leak_residue_present(text):
+    """这段文本是不是「剥不干净的协议残片」——不是散文里提到标记，是真的漏了。
+
+    issue #49 的三条「认不出就当正文补发」分支都是 fail-open：残片进到客户端
+    的 content 里，coding agent 会把标记与半截参数当成工具协议去解析，结果是
+    整轮任务静默中断（2026-10-30 实测 4828 字符残片打断一次、31 字符一次）。
+
+    判据必须**双向精确**：
+      · 没有泄漏标记 -> 不是残片（普通正文/示例代码）；
+      · 有标记但只是散文在讨论它（没有标签、没有 JSON 键）-> 不是残片，
+        否则「解释这个 bug 的那轮回复」会被自己打断，客户端无限重试。
+    """
+    t = str(text or "")
+    if not t or not (LEAK_MARKER in t or LEAK_MARKER_ALT in t):
+        return False
+    if "DSML" in t and "<" in t:                       # DSML 标签残片
+        return True
+    if "</" in t:                                      # 闭标签尾巴
+        return True
+    if re.search(r'"(?:arguments|name)"\s*:', t):      # 半截调用参数
+        return True
+    return "<tool_call" in t or '{"' in t
+
+
+_LEAK_STRUCT_RE = re.compile(
+    r"name\s*=\s*[\"']"                 # DSML invoke/parameter 属性
+    r"|<tool_call"                      # 伪标签
+    r"|\"(?:arguments|name)\"\s*:"      # JSON 调用字段
+    r"|\{\""                            # 参数对象开头
+)
+
+
+_LEAK_TAG_RE = re.compile(r"<\s*/?\s*[A-Za-z_][\w:.-]*\s*/?\s*>")
+
+# DSML 令牌：`<|DSML|calls>` / `</｜DSML｜｜ parameter>` / `<｜DSML｜invoke>` 都算
+_DSML_TOKEN_RE = re.compile(r"<[^<>]{0,4}DSML|DSML[^<>]{0,4}>|｜DSML｜")
+
+
+def _leak_array_echo_candidate(text):
+    """marker 之后是否进入 JSON 数组/对象回声（而非散落的协议标签）。
+
+    上游 #120 的 fail-closed 只应覆盖「认不出的协议残片」；fork 自 v1.5.6 起
+    对「marker + 数组回声」的未闭合/非法形态走 droppable / fail-open 链
+    （_test_echo_recovery [9]、_test_echo_salvage_fork [8]）。两者用 marker
+    之后是否以 JSON 容器开头区分，避免上游守卫覆盖 fork 语义。
+    """
+    state, body = _leak_body_offset(text or "")
+    if state != "body":
+        return False
+    rest = _strip_dsml_tail(body or "").lstrip()
+    rest = rest.lstrip(chr(34) + chr(39) + ">=: ]").lstrip()
+    return rest[:1] in ("[", "{")
+
+
+def _dsml_residue_present(text):
+    """有 DSML 协议令牌或别的协议结构 —— **不要求出现 LEAK_MARKER**。
+
+    `_sse_recover_dsml` 只有在上游流里出现过 DSML 令牌时才会被调用，所以进到它的
+    尾部 else 分支时，DSML 本身已经确认存在。2026-10-30 17:58 实测漏了一条
+    `markers=0, dsml=3` 的 58 字符残片：只带 DSML 令牌、没有 LEAK_MARKER，
+    用 `_leak_residue_present` 判就漏过去了。
+    """
+    t = str(text or "")
+    if not t or "DSML" not in t:
+        return False
+    if _DSML_TOKEN_RE.search(t):
+        return True
+    return bool(_LEAK_STRUCT_RE.search(t) or _LEAK_TAG_RE.search(t))
+
+
+_FENCE_RE = re.compile(r"```.*?(?:```|$)|`[^`\n]{0,200}`", re.S)
+
+
+def _outside_fences(text):
+    """剥掉代码块/行内代码后的正文。
+
+    非流式侧拿到的是全文，用户/模型**在代码块里讲解本协议**是正常内容
+    （例如「DSML 格式长这样：```<|DSML|calls>…```」）。判定残片前先剥掉围栏，
+    否则会把一段教学示例判成泄漏，白白 502 一次。
+    """
+    return _FENCE_RE.sub("", str(text or ""))
+
+
+def _residue_text_only(text):
+    """回读成功后剩下的文本里还带协议残片 -> 该丢（不影响已恢复的调用）。"""
+    t = str(text or "")
+    if not t or _leak_garbage_only(t):
+        return False
+    if _marker_only_echo(t):
+        # 孤立 marker 同样没有信息量：fork 的 hold 切分可能把它与后续 DSML
+        # 残片分开，回读成功后只剩这一个标记，不能当正文补发。
+        return True
+    return bool(_leak_residue_present(t) or _dsml_residue_present(t))
+
+
+def _leak_garbage_only(text):
+    """只有泄漏标记和空壳标签，**没有任何可恢复结构**（issue #49 形态 3）。
+
+    形态 3 = `[assistant 请求调用工具]` + `<terminal></terminal>` 刷 54 遍：
+    既没有 JSON 也没有 invoke 属性，回读必然失败。此前它是 fail-open 补发，
+    结果是客户端正文被标记与空标签塞满，coding agent 解析工具协议时直接
+    断在半路（2026-10-30 实测 31 字符残片打断一次）。
+
+    判据必须窄：**文本里得有真正的 HTML 式空标签**才算这种垃圾。
+    散文里提到标记（"关于 [assistant 请求调用工具] 这个标记…"）没有标签，
+    必须原样透传 —— 既有 #37/#60 的逐字节守恒测试就盯着这条。
+    """
+    t = str(text or "")
+    if not t or not (LEAK_MARKER in t or LEAK_MARKER_ALT in t):
+        return False
+    if _LEAK_STRUCT_RE.search(t):
+        return False
+    return _LEAK_TAG_RE.search(t) is not None
+
+
+def _echo_names_all_undeclared(text, allowed_names):
+    """回声里出现的工具名**全部不在**本次声明集合里（issue #27 的 fail-open 边界）。
+
+    模型复述一个没声明的工具时，我们本来就没有可恢复的调用可言，把这种残片判成
+    失败会误伤一批正常回合（既有 _test_issue37 / _test_qoder 都盯着这条）。
+    """
+    if not allowed_names:
+        return False
+    t = str(text or "")
+    names = re.findall(r'"name"\s*:\s*"([^"]{1,120})"', t)
+    names += re.findall(r'name\s*=\s*["\']([^"\']{1,120})["\']', t)
+    if not names:
+        return False
+    return all(n not in allowed_names for n in names)
 
 
 class InvalidToolArguments(UpstreamStatus):
@@ -4587,6 +4915,34 @@ def _echo_hold_candidate(text):
     return _still_leak_candidate(text) or _tool_echo_prefix_hold(text)
 
 
+def _carry_delta(delta):
+    """取一帧里「除 content 外的增量」（tool_calls / reasoning_content）。
+
+    issue #124：合成正文帧时只带 content，会把**同一帧里的** tool_calls 起点
+    （带 function.name）整个丢掉 —— 下游只收到后续参数帧，index 上永远没有
+    name，ai-sdk 系客户端收尾时抛 "tool call delta is missing id or name"。
+    正文要被改写时，这两类增量必须原样搬运到合成帧里。
+    """
+    if not isinstance(delta, dict):
+        return {}
+    out = {}
+    tcs = delta.get("tool_calls")
+    if isinstance(tcs, list) and tcs:
+        out["tool_calls"] = tcs
+    rc = delta.get("reasoning_content")
+    if isinstance(rc, str) and rc:
+        out["reasoning_content"] = rc
+    return out
+
+
+def _content_chunk(meta, piece, delta=None, finish_reason=None):
+    """正文帧 = content + 该帧原有的 tool_calls/reasoning 增量（issue #124）。"""
+    body = {"content": piece}
+    body.update(_carry_delta(delta))
+    return _leak_chunk_frame(meta, body, finish_reason)
+
+
+
 def _leak_chunk_frame(meta, delta, finish_reason=None):
     """按流式 chat.completion.chunk 形态合成一帧（沿用上游的 id/model）。"""
     payload = {
@@ -4727,8 +5083,9 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
       - 上游中断时暂存直接丢弃（正文未发，交给上游重试/错误帧处理）。
     """
     hold = None          # 正在暂存的候选正文（None = 未暂存）
-    hold_frames = 0      # 连续未增长的帧数（空转保护，issue #16/#36 后续）
+    hold_frames = 0      # 连续未增长帧数（空转保护，issue #16/#36 后续）
     finished = None      # 暂存的收尾帧：(payload, 原 finish_reason)
+    tail_usage = []      # hold 期间到达的 usage 垫底帧（流末补发）
     recovered = False
     meta = {"id": None, "model": None, "created": None}
 
@@ -4761,12 +5118,19 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
         if piece_raw is not None and not isinstance(piece_raw, str):
             # 非字符串 content（罕见）：不参与暂存判断，原样透传
             if hold is not None:
-                yield _leak_chunk_frame(meta, {"content": hold})
+                yield _content_chunk(meta, hold)   # 随后 yield raw 已携带增量
                 hold = None
                 hold_frames = 0
             yield raw
             continue
         if hold is not None:
+            if not choices and isinstance(payload.get("usage"), dict):
+                # 回读暂存期间到达的 usage 垫底帧：没有正文增量、不影响候选
+                # 判定，此前会掉进下面的 continue 被静默吞掉 —— 触发回读的
+                # 轮次调用方整轮收不到 usage（只剩客户端自估的输入 tokens）。
+                # 缓存到流末、跟在收尾帧之后发（保持 usage 垫底的标准顺序）。
+                tail_usage.append(payload)
+                continue
             hold += piece
             # issue #36 后续：帧上限只防**空转**（连续空帧不增长），有增长的
             # 合法回声块（每帧 1 字符也会推进长度）交给 32KB 字符上限兜底——
@@ -4784,10 +5148,16 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                 # issue #16 兜底：超限即 fail-open 放行（内存 + 首字延迟）。
                 if len(hold) > _HOLD_MAX_CHARS \
                         or hold_frames > _HOLD_MAX_FRAMES:
+                    # issue #112：超限放行前先补一次 #72 判定 —— marker-only 的
+                    # 空壳块走到这里会被当正文发出去，绕过流末的 fail-closed
+                    # （实测日志：released oversized leak hold (21 chars /
+                    # 201 frames) — fail-open）。
+                    if allowed_names and _marker_only_echo(hold):
+                        raise EmptyToolEcho(len(hold), "marker_only_released")
                     log("released oversized leak hold (%d chars / %d frames) "
                         "— fail-open" % (len(hold), hold_frames),
                         level="WARN", tag="chat")
-                    yield _leak_chunk_frame(meta, {"content": hold})
+                    yield _content_chunk(meta, hold, None if fin else delta)
                     hold = None
                     hold_frames = 0
                     if fin:
@@ -4816,7 +5186,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                 if _still_leak_candidate(_tail60):
                     _prose60 = hold[:_last_m.start()]
                     if _prose60.strip():
-                        yield _leak_chunk_frame(meta, {"content": _prose60})
+                        yield _content_chunk(meta, _prose60, None if fin else delta)
                     hold = _tail60
                     if fin:
                         finished = (_frame_without_content(payload), fin)
@@ -4825,8 +5195,28 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # （形态3「marker + <terminal></terminal> 空壳」就走这条：没有 JSON
             # 可恢复，但必须让发生率可见，而不是静默失真）。
             _log_unrecovered_leak(hold, "stream-falsified")
-            # 证伪：暂存整段补发为普通正文
-            yield _leak_chunk_frame(meta, {"content": hold})
+            if _leak_garbage_only(hold):
+                # issue #49 形态3：只有标记 + 空壳标签，补发出去只会污染客户端正文
+                log("dropped bare tool-protocol residue (%d chars) — issue #49 form3"
+                    % len(hold), level="WARN", tag="chat")
+            elif (allowed_names
+                    and _leak_residue_present(hold)
+                    and not parse_dsml_tool_calls(hold)[0]
+                    and not _echo_names_all_undeclared(hold, allowed_names)
+                    and not _leak_array_echo_candidate(hold)):
+                # issue #120 后续：可被 DSML 解析器还原的残片要留给下游
+                # _sse_recover_dsml（它才是 DSML 回读者），这里只拦真正还原不了的。
+                # 注意：这条分支是**流中途**判定，绝不能把 `_dsml_residue_present`
+                # 也算进来 —— 分块投递时 hold 可能只是 DSML 调用的前半截
+                # （_test_issue50_51_52 的 B 形态 n=8 就是这样），中途判死会把
+                # 本来能恢复的整轮打断；DSML 残片的 fail-closed 留给流末分支。
+                log("unrecovered leak residue in tools session (%d chars) — "
+                    "failing the turn closed (issue #49)" % len(hold),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(hold), "unrecovered_falsified")
+            else:
+                # 证伪：暂存整段补发为普通正文
+                yield _content_chunk(meta, hold, None if fin else delta)
             hold = None
             hold_frames = 0
             if fin:
@@ -4845,7 +5235,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             _emit16, _hold16 = _find_marker_split(piece)
             if _hold16:
                 if _emit16:
-                    yield _leak_chunk_frame(meta, {"content": _emit16})
+                    yield _content_chunk(meta, _emit16, None if fin else delta)
                 hold = _hold16
                 hold_frames = 1
                 if fin:
@@ -4861,11 +5251,21 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                     # 去掉 content，否则同一段内容会被发两次（issue #16）。
                     finished = (_frame_without_content(payload), fin)
                 continue
-            if fin:
-                yield _leak_chunk_frame(meta, {"content": piece}, fin)
-            else:
-                yield _leak_chunk_frame(meta, {"content": piece})
+            # issue #124：同帧里可能还有 tool_calls 起点（带 name）——
+            # 只发 content 会把起点整帧吞掉，下游 index 永远缺 name。
+            yield _content_chunk(meta, piece, delta, fin)
             continue
+        if (finished is not None and hold is None and not choices
+                and isinstance(payload.get("usage"), dict)):
+            # 上游流尾顺序是 [finish] -> [usage]（OpenAI 标准也是 usage 垫底）。
+            # 收尾帧被扣到这里说明回读判定早已结束（hold 为空、不可能再改写
+            # finish_reason），继续扣它只会把 usage 顶到 finish 前面 —— 按
+            # 「末帧 usage」解析的客户端（OpenAI Chat 格式）就此读不到
+            # 输出/缓存 tokens。这里先放行收尾帧再透传 usage，恢复标准顺序。
+            _fp, _ffin = finished
+            finished = None
+            yield ("data: " + json.dumps(_fp, ensure_ascii=False)
+                   + "\n\n").encode("utf-8")
         yield raw
 
     if hold is not None:
@@ -4901,7 +5301,11 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                     "type": call.get("type") or "function",
                     "function": call.get("function") or {},
                 }]})
-            if clean:
+            if clean and _residue_text_only(clean):
+                # issue #120 后续：同上（marker 回声回读成功后的剩余文本）
+                log("dropped residue in post-recovery text (%d chars) — issue #49"
+                    % len(clean), level="WARN", tag="chat")
+            elif clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
         elif salvaged_empty:
             # 0 合法条目：整块吞掉，只补发 marker 前散文；不泄漏、不报错。
@@ -4940,7 +5344,21 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
         else:
             # issue #49 方向 C：认不出但**看起来就是协议回声**的，必须留痕。
             _log_unrecovered_leak(hold, "stream")
-            yield _leak_chunk_frame(meta, {"content": hold})
+            if _leak_garbage_only(hold):
+                log("dropped bare tool-protocol residue (%d chars) — issue #49 form3"
+                    % len(hold), level="WARN", tag="chat")
+            elif (allowed_names
+                    and (_leak_residue_present(hold) or _dsml_residue_present(hold))
+                    and not parse_dsml_tool_calls(hold)[0]
+                    and not _echo_names_all_undeclared(hold, allowed_names)
+                    and not (_leak_array_echo_candidate(hold)
+                             and not _dsml_residue_present(hold))):
+                log("unrecovered leak residue in tools session (%d chars) — "
+                    "failing the turn closed (issue #49)" % len(hold),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(hold), "unrecovered_leak")
+            else:
+                yield _content_chunk(meta, hold)   # 流末补发：不再重复增量
     if finished is not None:
         payload, fin = finished
         if recovered:
@@ -4952,6 +5370,9 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                + "\n\n").encode("utf-8")
     elif recovered:
         yield _leak_chunk_frame(meta, {}, "tool_calls")
+    for _up in tail_usage:
+        yield ("data: " + json.dumps(_up, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
 
 
 def _dsml_tail_hold(text):
@@ -4991,6 +5412,7 @@ def _sse_recover_dsml(frames, allowed_names=None):
     buf = ""
     tail = ""
     finish = None
+    tail_usage = []      # DSML 缓冲期间到达的 usage 垫底帧（流末补发）
     meta = {"id": None, "model": None, "created": None}
     recovered = False
 
@@ -5007,6 +5429,21 @@ def _sse_recover_dsml(frames, allowed_names=None):
             continue
         choices = payload.get("choices") if isinstance(payload, dict) else None
         if not isinstance(choices, list) or not choices:
+            if (isinstance(payload, dict)
+                    and isinstance(payload.get("usage"), dict)):
+                if buf or tail:
+                    # DSML 缓冲期间到达的 usage 垫底帧：流末可能还要改写
+                    # finish_reason，缓存到收尾帧之后补发（不吞、不抢序）。
+                    tail_usage.append(payload)
+                    continue
+                if finish is not None:
+                    # usage 垫底帧到达且无缓冲可改写 finish_reason：先放行
+                    # 被扣的收尾帧再透传 usage，保持 [finish] -> [usage] ->
+                    # [DONE] 标准顺序（同 _recover_leaked_tool_calls_inner）。
+                    _fp, _ffin = finish
+                    finish = None
+                    yield ("data: " + json.dumps(_fp, ensure_ascii=False)
+                           + "\n\n").encode("utf-8")
             yield raw
             continue
         if not meta["id"] and payload.get("id"):
@@ -5056,7 +5493,12 @@ def _sse_recover_dsml(frames, allowed_names=None):
         if calls:
             recovered = True
             RECOVERY_STATS["dsml"] = RECOVERY_STATS.get("dsml", 0) + 1
-            if clean:
+            if clean and _residue_text_only(clean):
+                # issue #120 后续：调用已恢复，但剥离后的剩余文本仍带协议残片
+                # （嵌套/重复块导致剥离不干净）—— 丢掉残片，别再喂给客户端。
+                log("dropped residue in post-recovery text (%d chars) — issue #49"
+                    % len(clean), level="WARN", tag="chat")
+            elif clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
             for i, call in enumerate(calls):
                 yield _leak_chunk_frame(meta, {"tool_calls": [{
@@ -5068,9 +5510,27 @@ def _sse_recover_dsml(frames, allowed_names=None):
                 }]})
         else:
             _log_unrecovered_leak(buf, "dsml-stream")
-            yield _leak_chunk_frame(meta, {"content": buf})
+            if _leak_garbage_only(buf):
+                log("dropped bare tool-protocol residue (%d chars) — issue #49 form3"
+                    % len(buf), level="WARN", tag="chat")
+            elif (allowed_names
+                    and (_leak_residue_present(buf) or _dsml_residue_present(buf))
+                    and not _echo_names_all_undeclared(buf, allowed_names)):
+                log("unrecovered DSML leak residue in tools session (%d chars) "
+                    "— failing the turn closed (issue #49)" % len(buf),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(buf), "unrecovered_dsml")
+            else:
+                yield _leak_chunk_frame(meta, {"content": buf})
     if tail:
-        yield _leak_chunk_frame(meta, {"content": tail})
+        if _residue_text_only(tail):
+            # issue #120 后续（Ultimate 审计 5232 行）：tail 是流末 holdback 的
+            # 尾巴，原先无条件当正文补发 —— 截在 `<|DSML|inv` 中间、或第二个
+            # DSML 块的开头都会从这条漏出去。含残片就丢。
+            log("dropped residue tail (%d chars) — issue #49" % len(tail),
+                level="WARN", tag="chat")
+        else:
+            yield _leak_chunk_frame(meta, {"content": tail})
     if finish is not None:
         payload, fin = finish
         if recovered:
@@ -5082,17 +5542,196 @@ def _sse_recover_dsml(frames, allowed_names=None):
                + "\n\n").encode("utf-8")
     elif recovered:
         yield _leak_chunk_frame(meta, {}, "tool_calls")
+    for _up in tail_usage:
+        yield ("data: " + json.dumps(_up, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
+
+
+def _sse_guard_truncated_tool_args(frames):
+    """issue #112：上游在 tool_calls 的 arguments 还没写完时就干净 EOF。
+
+    症状（客户端侧）：流里出现了一半的 `tool_calls` 增量，随后既没有
+    `finish_reason` 也没有错误帧，连接正常关闭 —— coding agent 只看到
+    「参数不完整的调用 + 流结束」，整轮任务静默中断，用户看到的就是
+    「助手突然只回了几个命令片段就停了」。
+
+    这里在流末做一次完整性校验：累计到过 tool_call 增量、没收到
+    finish_reason、且某个调用的 arguments 不是合法 JSON -> 抛
+    EmptyToolEcho（fail-closed）。四条协议出口会把它转成明确失败，
+    客户端据此重试，而不是把半截调用当成功收尾。其余情况逐字节透传。
+    """
+    calls = {}
+    finish_seen = False
+    for raw in frames:
+        try:
+            text = (raw.decode("utf-8", "replace")
+                    if isinstance(raw, bytes) else raw)
+            data = strip_data_prefix(text)
+            if data and data != "[DONE]":
+                payload = json.loads(data)
+                choice = (payload.get("choices") or [{}])[0] or {}
+                if choice.get("finish_reason"):
+                    finish_seen = True
+                for tc in ((choice.get("delta") or {}).get("tool_calls") or []):
+                    idx = tc.get("index")
+                    idx = 0 if idx is None else idx
+                    slot = calls.setdefault(idx, {"args": "", "name": ""})
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+        except Exception:
+            pass
+        yield raw
+    if not calls or finish_seen:
+        return
+    for _idx, slot in sorted(calls.items()):
+        args = (slot.get("args") or "").strip()
+        if not args:
+            continue
+        try:
+            json.loads(args)
+        except Exception:
+            log("stream ended without finish_reason and tool call '%s' has "
+                "incomplete JSON arguments (%d chars) — failing closed "
+                "(issue #112)" % (slot.get("name") or "?", len(args)),
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(args), "truncated_arguments")
+
+
+def _finish_only_frame(payload, finish_reason):
+    """复制一帧、清空 delta、只改 finish_reason（issue #124 降级用）。"""
+    out = dict(payload or {})
+    choices = []
+    for ch in (payload or {}).get("choices") or []:
+        if isinstance(ch, dict):
+            ch2 = dict(ch)
+            ch2["delta"] = {}
+            ch2["finish_reason"] = finish_reason
+            choices.append(ch2)
+        else:
+            choices.append(ch)
+    if not choices:
+        choices = [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+    out["choices"] = choices
+    return ("data: " + json.dumps(out, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _sse_guard_nameless_tool_calls(frames):
+    """issue #124：没拿到 name 的 tool_call 起点不许直接发给下游。
+
+    上游（或回读路径）可能先给「index + arguments」、name 稍后才到，甚至永不到。
+    OpenAI 流式语义里一个 index 的首帧必须同时带 id 与 name；ai-sdk 这类客户端
+    会把它挂进 pendingTools，收尾仍不完整就抛
+    "OpenAI Chat tool call delta is missing id or name"，整轮作废。
+
+    与 Anthropic 侧的 #116 同构：
+      · name 未到 -> 扣住 arguments，不发这一条；
+      · name 到 -> 立刻发「id + name + 攒下的 arguments」一次；
+      · 流结束仍无名 -> 丢弃，并把 finish_reason: tool_calls 降级为 stop。
+    """
+    pending = {}
+
+    for raw in frames:
+        text = (raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else raw)
+        data = strip_data_prefix(text)
+        payload = None
+        if data and data != "[DONE]":
+            try:
+                payload = json.loads(data)
+            except Exception:
+                payload = None
+        if not isinstance(payload, dict):
+            yield raw
+            continue
+        choices = payload.get("choices") or []
+        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        fin = choice.get("finish_reason")
+        tcs = delta.get("tool_calls")
+        if not isinstance(tcs, list) or not tcs:
+            if fin and any(not s["opened"] for s in pending.values()):
+                yield _finish_only_frame(payload, "stop")
+            else:
+                yield raw
+            continue
+
+        forwarded = []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            idx = tc.get("index")
+            idx = idx if isinstance(idx, int) else 0
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = str(fn.get("name") or "")
+            args = fn.get("arguments") or ""
+            slot = pending.setdefault(idx, {"id": "", "type": tc.get("type"),
+                                            "name": "", "args": [], "opened": False})
+            if tc.get("id"):
+                slot["id"] = str(tc["id"])
+            if name:
+                slot["name"] = name
+            if not slot["name"]:
+                slot["args"].append(args)        # 扣住，等 name
+                continue
+            if not slot["opened"]:
+                slot["opened"] = True
+                forwarded.append({
+                    "index": idx,
+                    "id": slot["id"] or _new_id("call_"),
+                    "type": slot["type"] or "function",
+                    "function": {"name": slot["name"],
+                                 "arguments": "".join(slot["args"]) + args},
+                })
+                slot["args"] = []
+            else:
+                forwarded.append({
+                    "index": idx,
+                    "id": slot["id"] or "",
+                    "type": slot["type"] or "function",
+                    "function": {"arguments": args},
+                })
+
+        body = {k: v for k, v in delta.items() if k != "tool_calls"}
+        if forwarded:
+            body["tool_calls"] = forwarded
+            frame = dict(payload)
+            frame["choices"] = [{"index": choice.get("index", 0) or 0,
+                                 "delta": body, "finish_reason": fin}]
+            yield ("data: " + json.dumps(frame, ensure_ascii=False)
+                   + "\n\n").encode("utf-8")
+        elif body:
+            # 这一帧还有正文/思考：只把无名 tool_calls 剥掉，其余照发
+            frame = dict(payload)
+            frame["choices"] = [{"index": choice.get("index", 0) or 0,
+                                 "delta": body, "finish_reason": fin}]
+            yield ("data: " + json.dumps(frame, ensure_ascii=False)
+                   + "\n\n").encode("utf-8")
+        elif fin and any(not s["opened"] for s in pending.values()):
+            yield _finish_only_frame(payload, "stop")
+
+    dropped = [i for i, s in pending.items() if not s["opened"]]
+    if dropped:
+        RECOVERY_STATS["nameless_drop"] = RECOVERY_STATS.get("nameless_drop", 0) + 1
+        log("dropped %d tool_call(s) without name at stream end - issue #124"
+            % len(dropped), level="WARN", tag="chat")
+
 
 
 def recover_leaked_tool_calls(frames, allowed_names=None):
-    """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）。
+    """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）
+    + 截断参数守卫（issue #112）。
 
     保持同名：三条调用点（chat 主链路 / Anthropic / Responses）都不用改。
     """
-    for frame in _sse_fill_tool_call_ids(
-            _sse_recover_dsml(
-                _recover_leaked_tool_calls_inner(frames, allowed_names),
-                allowed_names)):
+    for frame in _sse_guard_truncated_tool_args(
+            _sse_guard_nameless_tool_calls(
+                _sse_fill_tool_call_ids(
+                    _sse_recover_dsml(
+                        _recover_leaked_tool_calls_inner(frames, allowed_names),
+                        allowed_names)))):
         yield frame
 
 
@@ -5481,7 +6120,22 @@ def _keep_toplevel_images():
     return str(os.environ.get("QD_KEEP_TOPLEVEL_IMAGES") or "").strip().lower()         in ("1", "on", "true", "yes")
 
 
-def build_qoder_body(payload, account, model_key, realm=None):
+def _quota_hint(detail):
+    """上游 detail -> 人话解释（issue #123 后续）。只认已实测过的码。"""
+    d = str(detail or "")
+    if "10605" in d or "isQueued" in d:
+        return ("上游排队中（10605 / RESOURCE_LIMIT）：等 retryAfterSeconds 后会放行，")
+    if "112" in d and ("pricingUrl" in d or "code" in d):
+        return "账号额度耗尽（112 / pricingUrl）：充值或换号，重试无效"
+    if "Billing daily count exceeded" in d or "110" in d:
+        return "当日计费次数上限（110）：次日 0 点重置"
+    if "430" in d:
+        return "客户端/网关版本过低（430）：上游要求升级"
+    if "TOKEN_EXPIRE" in d or "expire" in d.lower():
+        return "凭证过期：需要重新登录该账号"
+    return ""
+
+def build_qoder_body(payload, account, model_key, realm=None, conversation=None):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
     以官方 baseprompt.json 为骨架：每次覆写 request/session id、时间戳、
@@ -5538,7 +6192,10 @@ def build_qoder_body(payload, account, model_key, realm=None):
 
     nid = str(uuid.uuid4())
     body["request_id"] = nid
-    body["chat_record_id"] = nid
+    # issue #128：用量面板的「一条对话」看起来是按 chat_record_id 归组的（官方
+    # 客户端一次对话内该值不变）。同一会话复用会话 id；request_id 仍然每请求
+    # 唯一 —— 计费/限额按请求计数，不能被并掉。
+    body["chat_record_id"] = (conversation or {}).get("id") or nid
     body["request_set_id"] = str(uuid.uuid4())
     body["session_id"] = str(uuid.uuid4())
     body["stream"] = True
@@ -5546,17 +6203,10 @@ def build_qoder_body(payload, account, model_key, realm=None):
     body["aliyun_user_type"] = getattr(account, "user_type", "") or \
         qoder_sign.DEFAULT_USER_TYPE
 
-    # model_config（按出口区域的官方清单取元数据 + 动态 key）
-    catalog_meta = {}
-    for m in qoder_catalog.models_for_realm(r):
-        if m.get("key") == model_key:
-            catalog_meta = m
-            break
-    if not catalog_meta:
-        for m in qoder_catalog.STATIC_INTL_MODELS + qoder_catalog.STATIC_CN_MODELS:
-            if m.get("key") == model_key:
-                catalog_meta = m
-                break
+    # model_config（按出口区域的官方清单取元数据 + 动态 key）——动态清单优先
+    # （catalog_meta_for），官方改显示名（Kimi-K3 -> Kimi-K3.1-Pro）后这里
+    # 发出去的 display_name 仍是官方此刻的名字，与真实客户端一致。
+    catalog_meta = catalog_meta_for(model_key, r)
     mc = body.get("model_config") or {}
     mc["key"] = model_key
     mc["display_name"] = catalog_meta.get("display_name") or model_key
@@ -5633,12 +6283,27 @@ def build_qoder_body(payload, account, model_key, realm=None):
 
     # business 会话卡片
     biz = body.get("business") or {}
-    biz["id"] = str(uuid.uuid4())
-    biz["begin_at"] = int(time.time() * 1000)
+    # issue #128：同一次对话复用同一个 id 与 begin_at —— 上游用量面板按它归组，
+    # 每请求一个新 uuid 会把一个 agent 回合拆成几十条「<1min 的对话」，
+    # 日上限（code 110）被迅速刷爆。拿不到会话身份时保持旧行为。
+    if conversation:
+        biz["id"] = conversation["id"]
+        biz["begin_at"] = conversation["begin_at"]
+    else:
+        biz["id"] = str(uuid.uuid4())
+        biz["begin_at"] = int(time.time() * 1000)
     biz["name"] = (prompt[:30] if prompt else "chat")
     biz.setdefault("product", "cli")
     biz.setdefault("type", "agent")
     biz.setdefault("stage", "start")
+    # 计费归属（2026-10-30 实测，Kimi-K3.1-Pro 被 qoder 后台记成 auto 的根因）：
+    # 官方 CLI 1.1.81 的 business 块带 model_key，上游计费归因读它；网关此前
+    # 不发，kmodel_latest 这类模型被静默归到 auto（老模型不受影响，疑似有
+    # model_config 兜底）。与官方客户端对齐，始终带上。
+    biz["model_key"] = model_key
+    # 同理对齐版本号：官方报自己的真实版本，模板里 0.1.43 是上个时代的残留。
+    # 版本号不影响计费归属（A/B 实测），但身份故事应与 cosy-version 同源。
+    biz["version"] = qoder_sign.COSY_VERSION
     body["business"] = biz
     return body
 
@@ -5744,6 +6409,94 @@ def realm_model_throttled(realm, model):
     if waits and all(w > 0 for w in waits):
         return (True, max(1, int(min(waits))))
     return (False, 0)
+
+
+# ---------------------------------------------------------------------------
+# 上游会话身份（issue #128）
+# ---------------------------------------------------------------------------
+# 官方客户端在一次对话里全程复用同一个 business.id / session_id，因此 Qoder 用量
+# 面板把整段对话算成**一条**；网关此前每个 HTTP 请求都新造 uuid —— 一个 Codex
+# 回合里有几十次工具步进，就被上游记成几十条「<1min 的对话」，日上限（code 110）
+# 很快被刷爆。
+#
+# 策略：同一客户端会话复用同一身份与 begin_at。
+#   1) 客户端显式给了会话键（X-Conversation-Id / session_id / metadata…）就用它；
+#   2) 没给时退化为「首条 user 消息 + 系统提示 + 模型」的摘要 —— Codex 全量回放
+#      历史，首条消息在一次对话里恒定，因此同一对话能稳定命中；
+#   3) 两者都拿不到 -> 保持旧行为（每次新造），绝不把无关请求并成一条。
+# 可用 QD_CONVERSATION_SHARE=0 整体关闭（回到 v1.7.14 行为）。
+CONVERSATION_SHARE = (os.environ.get("QD_CONVERSATION_SHARE") or "1").strip() \
+    not in ("0", "false", "False", "no")
+_CONV_TTL_SECS = float(os.environ.get("QD_CONVERSATION_TTL") or 6 * 3600)
+_CONV_MAX_ENTRIES = 4096
+_CONVERSATIONS = OrderedDict()      # key -> {"id","begin_at","at"}
+_CONV_LOCK = threading.Lock()
+
+
+def _conversation_key_from_history(payload):
+    """会话判据：**最后一条 user 消息** + 系统提示 + 模型（issue #128 后续）。
+
+    为什么不是首条：Codex 全量回放历史，若用首条，整个窗口（可能几小时）永远是
+    同一个 id —— 用量面板里就成了一条超长对话，看不出「这次对话花了多久」。
+    用最后一条 user 消息：同一次对话内（工具步进时）它不变，用户下一次提问才变，
+    正好等于「一次对话 = 一次用户提问 + 后续工具步进」。
+    """
+    if not isinstance(payload, dict):
+        return ""
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list):
+        return ""
+    last_user = ""
+    system = ""
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "")
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(str((p or {}).get("text") or "")
+                                for p in content if isinstance(p, dict))
+        text = str(content or "")
+        if role == "system" and not system:
+            system = text[:200]
+        elif role == "user":
+            last_user = text[:400]        # 一直覆盖到最后一条
+    if not last_user:
+        return ""
+    raw = "\x00".join([str(payload.get("model") or ""), system, last_user])
+    return "turn:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def conversation_identity(payload, client_session_key=None):
+    """本请求所属的上游会话身份（issue #128）。返回 {"id","begin_at"} 或 None。"""
+    if not CONVERSATION_SHARE:
+        return None
+    key = str(client_session_key or "").strip()
+    if key:
+        # issue #128 后续：窗口级 id 会把几小时的会话并成一条，用量面板看不出
+        # 单次对话时长。这里在显式键后追加「本轮提问」摘要 —— 同一次提问内的
+        # 工具步进仍归同一条，用户下次提问才换 id。
+        _turn = _conversation_key_from_history(payload)
+        if _turn:
+            key = key + "|" + _turn
+    else:
+        key = _conversation_key_from_history(payload)
+    if not key:
+        return None
+    now = time.time()
+    with _CONV_LOCK:
+        entry = _CONVERSATIONS.get(key)
+        if entry is not None and now - entry["at"] <= _CONV_TTL_SECS:
+            entry["at"] = now
+            _CONVERSATIONS.move_to_end(key)
+            return {"id": entry["id"], "begin_at": entry["begin_at"]}
+        entry = {"id": str(uuid.uuid4()), "begin_at": int(now * 1000), "at": now}
+        _CONVERSATIONS[key] = entry
+        _CONVERSATIONS.move_to_end(key)
+        while len(_CONVERSATIONS) > _CONV_MAX_ENTRIES:
+            _CONVERSATIONS.popitem(last=False)
+        return {"id": entry["id"], "begin_at": entry["begin_at"]}
+
 
 
 def extract_session_key(headers, payload):
@@ -7042,6 +7795,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     全部账号失败后抛 RateLimited 或最后一个错误。
     """
     model = str(payload.get("model") or "")
+    # issue #128：整段对话复用同一上游会话身份（拿不到就 None = 旧行为）
+    _conv = conversation_identity(payload, session_key)
     if only_account is not None and not target_realm:
         # issue #86：钉死账号时区域跟随该账号（自动路由可能把它换掉）
         target_realm = getattr(only_account, "realm", "") or None
@@ -7056,14 +7811,15 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             if usage_ctx is not None:
                 # 确定性原因 → 面板直接显示，不必自己推断
                 usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
-    model_key = qoder_catalog.resolve_upstream_key(model, realm=realm)
+    model_key = resolve_model_key(model, realm=realm)
 
     # task 10-16（R3）：这里原为 `POOL.pick(realm=realm)`，但代表号只用于请求体
     # 的占位 aliyun_user_type（发送前会被真实服务号覆写）——pick 会白耗一格轮询
     # cursor，偶数池下固定一半账号服务数恒 0（根因见 tests/_test_alloc_parity.py）。
     # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）。
     representative = only_account
-    body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
+    body_obj = build_qoder_body(payload, representative, model_key, realm=realm,
+                                conversation=_conv)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
         # 与真实出站内容同源，不做二次推算。
@@ -7142,7 +7898,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         # Resolve only after choosing the actual account, before signing.
         assign_prefix_session(body_obj, account, model_key,
                               client_session_key=client_session_key,
-                              usage_ctx=usage_ctx)
+                              usage_ctx=usage_ctx,
+                              fallback_session_id=(_conv or {}).get("id"))
         encoded = qoder_encode(
             json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
@@ -7814,6 +8571,22 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
             else:
                 # issue #49 方向 C：四条路径都没认出来 -> 至少留痕（非流式侧）
                 _log_unrecovered_leak(_echo_src, "aggregate")
+                # issue #120 后续：非流式侧同样不许把协议残片留在 content 里。
+                # 非流式没有"重试"概念，但抛 EmptyToolEcho 会走既有 502 出口，
+                # 客户端重发这一轮 —— 比返回一段被污染的回答强。
+                if _leak_garbage_only(_echo_src):
+                    log("dropped bare tool-protocol residue (%d chars) — "
+                        "issue #49 form3 (aggregate)" % len(_echo_src),
+                        level="WARN", tag="chat")
+                    message["content"] = _head16
+                elif (allowed_names
+                        and (_leak_residue_present(_outside_fences(_echo_src))
+                             or _dsml_residue_present(_outside_fences(_echo_src)))
+                        and not _echo_names_all_undeclared(_echo_src, allowed_names)):
+                    log("unrecovered leak residue in tools session (%d chars) — "
+                        "failing the turn closed (aggregate)" % len(_echo_src),
+                        level="WARN", tag="chat")
+                    raise EmptyToolEcho(len(_echo_src), "unrecovered_aggregate")
     # issue #51：DeepSeek DSML 回退（非流式 chat 侧此前**完全没有**这一层，
     # 只有 Responses 有）——模型直接吐原生 DSML 时整段协议会当正文返回。
     if not tool_calls_map and "DSML" in (message.get("content") or ""):
@@ -7830,6 +8603,23 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                 finish = "tool_calls"
         else:
             _log_unrecovered_leak(message["content"], "aggregate-dsml")
+            # issue #120 后续：非流式 DSML 回退也解析不出来时，不许把整段
+            # DSML 协议留在 content 里当正文返回（这正是 17:38 那条 4828 字符
+            # 泄漏在非流式侧的等价路径）。空壳残片丢弃，其余走 502 出口。
+            _bad_dsml = message["content"] or ""
+            if _leak_garbage_only(_bad_dsml):
+                log("dropped bare tool-protocol residue (%d chars) — "
+                    "issue #49 form3 (aggregate-dsml)" % len(_bad_dsml),
+                    level="WARN", tag="chat")
+                message["content"] = ""
+            elif (allowed_names
+                    and (_leak_residue_present(_outside_fences(_bad_dsml))
+                         or _dsml_residue_present(_outside_fences(_bad_dsml)))
+                    and not _echo_names_all_undeclared(_bad_dsml, allowed_names)):
+                log("unrecovered DSML residue in tools session (%d chars) — "
+                    "failing the turn closed (aggregate-dsml)" % len(_bad_dsml),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(_bad_dsml), "unrecovered_aggregate_dsml")
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -7850,7 +8640,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     }
     if usage:
-        out["usage"] = usage
+        out["usage"] = normalize_usage_for_client(usage)   # issue #112
     out["elapsed_ms"] = int((time.time() - started) * 1000)
     out["first_chunk_at"] = first_chunk_at
     return out
@@ -7955,12 +8745,133 @@ def _is_custom_tool(tool):
     return isinstance(tool, dict) and str(tool.get("type") or "").lower() == "custom"
 
 
+_NS_MAX_DEPTH = 4
+_NS_CHILD_KEYS = ("tools", "children", "functions")
+
+
+def _tool_declared_name(tool):
+    """工具声明里的名字（Responses 平铺形态或 Chat function 形态）。"""
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function")
+    name = tool.get("name") or (fn.get("name") if isinstance(fn, dict) else "")
+    return str(name or "").strip()
+
+
+def _is_namespace_tool(tool):
+    """是不是 Codex / MCP 的 namespace 容器（issue #127）。"""
+    if not isinstance(tool, dict):
+        return False
+    if str(tool.get("type") or "").strip() == "namespace":
+        return True
+    # 有些客户端省略 type，只给 name + children/functions/tools
+    if tool.get("type") in (None, ""):
+        for key in _NS_CHILD_KEYS:
+            if isinstance(tool.get(key), list) and tool.get(key):
+                return True
+    return False
+
+
+def _flatten_ns_tools(tools, depth=0, ns_map=None, seen=None):
+    """把 `type:"namespace"` 容器展开成平铺工具（issue #127 F1）。
+
+    Codex 把 MCP server / multi-agent 工具装在 namespace 容器里发出；上游只认
+    `function`，整块透传会 400（#63），此前的取舍是整块丢弃 —— 结果是工具静默
+    消失。展开的产物只有 function/custom 条目，容器本身不出站，不触发同一个
+    `unknown variant` 错误。
+
+    返回 (flat_tools, ns_map)：ns_map 记录「工具名 -> namespace」，用于回程把
+    namespace 字段补回（客户端按 (name, namespace, kind) 三元组匹配执行器）。
+    重名策略：同名只留第一个并打 WARN（两个 MCP server 有同名工具时展平后
+    无法区分，保留第一个至少让其中一个是可用的）。
+    """
+    ns_map = {} if ns_map is None else ns_map
+    seen = set() if seen is None else seen
+    flat = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if _is_namespace_tool(tool):
+            if depth >= _NS_MAX_DEPTH:
+                log("namespace tool %r nested deeper than %d - dropped (issue #127)"
+                    % (_tool_declared_name(tool) or "?", _NS_MAX_DEPTH),
+                    level="WARN", tag="chat")
+                continue
+            ns = str(tool.get("name") or tool.get("namespace") or "").strip()
+            children = []
+            for key in _NS_CHILD_KEYS:
+                val = tool.get(key)
+                if isinstance(val, list) and val:
+                    children = val
+                    break
+            # 子层用**独立**的 seen：共享会让递归先登记、父层再判重时
+            # 把所有子工具都当成重复丢掉（issue #127 自查到）。
+            sub, _ = _flatten_ns_tools(children, depth + 1, ns_map, set())
+            for item in sub:
+                name = _tool_declared_name(item)
+                if name and name in seen:
+                    log("duplicate tool name %r after namespace flatten - "
+                        "keeping the first (issue #127)" % name,
+                        level="WARN", tag="chat")
+                    continue
+                if name:
+                    seen.add(name)
+                    if ns:
+                        ns_map[name] = ns
+                flat.append(item)
+            continue
+        name = _tool_declared_name(tool)
+        if name and name in seen:
+            log("duplicate tool name %r - keeping the first (issue #127)" % name,
+                level="WARN", tag="chat")
+            continue
+        if name:
+            seen.add(name)
+        flat.append(tool)
+    return flat, ns_map
+
+
+def _additional_tools_from_input(inp):
+    """收集 input 里的 additional_tools（Codex Desktop 0.162+，issue #127 F3）。"""
+    out = []
+    if not isinstance(inp, list):
+        return out
+    for item in inp:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "") not in ("additional_tools", "mcp_tools"):
+            continue
+        for key in ("tools", "value"):
+            val = item.get(key)
+            if isinstance(val, list):
+                out.extend(val)
+                break
+    return out
+
+
+def _stamp_tool_namespace(item, ns_map):
+    """回程：把 namespace 补到 function_call/custom_tool_call 项上（issue #127）。"""
+    if not isinstance(item, dict) or not ns_map:
+        return item
+    name = str(item.get("name") or "")
+    ns = ns_map.get(name) if name else None
+    if ns and not item.get("namespace"):
+        item["namespace"] = ns
+    return item
+
+
 def custom_tool_names(tools):
-    """Names of tools declared as freeform/custom in a Responses request."""
+    """Names of tools declared as freeform/custom in a Responses request.
+
+    issue #127：新版 Codex Desktop 会把 `exec` 这类 freeform 工具**嵌在
+    namespace 容器里**。不递归进来，回程就判成 function_call，客户端按
+    custom_tool_call 匹配不到执行器 —— 调用不执行、模型无限重试。
+    """
     names = set()
-    for t in tools or []:
-        if _is_custom_tool(t) and t.get("name"):
-            names.add(str(t["name"]))
+    flat, _ = _flatten_ns_tools(tools)
+    for t in flat:
+        if _is_custom_tool(t) and _tool_declared_name(t):
+            names.add(_tool_declared_name(t))
     return names
 
 
@@ -8223,8 +9134,16 @@ def responses_to_chat(payload):
         effort = payload.get("reasoning_effort")
     if effort:
         chat["reasoning_effort"] = effort
-    if payload.get("tools"):
-        chat["tools"] = _tools_for_chat(payload["tools"])
+    # issue #127：工具清单可能分两处（顶层 tools + input 里的 additional_tools），
+    # 且可能包在 type:"namespace" 容器里。先合并再展平，最后才做类型过滤。
+    _raw_tools = list(payload.get("tools") or [])
+    _raw_tools.extend(_additional_tools_from_input(payload.get("input")))
+    if _raw_tools:
+        _flat_tools, _ns_map = _flatten_ns_tools(_raw_tools)
+        chat["tools"] = _tools_for_chat(_flat_tools)
+        if _ns_map:
+            # 回程补 namespace 用（不下发给上游）
+            chat["_qd_tool_ns"] = _ns_map
     if payload.get("tool_choice"):
         chat["tool_choice"] = payload["tool_choice"]
     if payload.get("parallel_tool_calls") is not None:
@@ -8246,7 +9165,8 @@ def _responses_usage(u):
     return {
         "input_tokens": u.get("prompt_tokens") or 0,
         "input_tokens_details": {
-            "cached_tokens": u.get("prompt_cache_hit_tokens")
+            "cached_tokens": u.get("cached_tokens")
+            or u.get("prompt_cache_hit_tokens")
             or det.get("cached_tokens") or pdet.get("cached_tokens") or 0,
         },
         "output_tokens": u.get("completion_tokens") or 0,
@@ -8256,7 +9176,7 @@ def _responses_usage(u):
     }
 
 
-def chat_to_response(chat_obj, model, custom_names=None):
+def chat_to_response(chat_obj, model, custom_names=None, ns_map=None):
     """Fold a Chat Completions object into a Responses API response object.
 
     custom_names: the set of tool names the client declared as freeform.
@@ -8281,23 +9201,23 @@ def chat_to_response(chat_obj, model, custom_names=None):
         call_id = tc.get("id") or _new_id("call_")
         name = fn.get("name") or ""
         if name and name in custom_names:
-            output.append({
+            output.append(_stamp_tool_namespace({
                 "id": _new_id("ctc_"),
                 "type": "custom_tool_call",
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
                 "input": _unwrap_custom_input(fn.get("arguments") or ""),
-            })
+            }, ns_map))
         else:
-            output.append({
+            output.append(_stamp_tool_namespace({
                 "id": _new_id("fc_"),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
                 "arguments": fn.get("arguments") or "{}",
-            })
+            }, ns_map))
     # DeepSeek DSML 工具调用回退
     if not (msg.get("tool_calls")):
         dsml_calls, clean_t = parse_dsml_tool_calls(text)
@@ -8468,6 +9388,9 @@ def stream_responses_events(inner_lines, model, holder):
                     tool_calls_map[idx] = entry
                     item = {"id": entry["item_id"], "status": "in_progress",
                             "call_id": c_id, "name": fn_name}
+                    # issue #127：namespace 必须在 added 帧就带上，
+                    # 否则客户端按 (name, namespace, kind) 匹配不到执行器
+                    _stamp_tool_namespace(item, (holder or {}).get("tool_ns"))
                     if is_custom:
                         item["type"] = "custom_tool_call"
                         item["input"] = ""
@@ -8629,28 +9552,28 @@ def stream_responses_events(inner_lines, model, holder):
                 "call_id": entry["id"],
                 "input": _unwrap_custom_input(entry["arguments"]),
             })
-            fc_item = {
+            fc_item = _stamp_tool_namespace({
                 "id": entry["item_id"],
                 "type": "custom_tool_call",
                 "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
                 "input": _unwrap_custom_input(entry["arguments"]),
-            }
+            }, (holder or {}).get("tool_ns"))
         else:
             yield ev("response.function_call_arguments.done", {
                 "output_index": entry["output_index"],
                 "call_id": entry["id"],
                 "arguments": entry["arguments"],
             })
-            fc_item = {
+            fc_item = _stamp_tool_namespace({
                 "id": entry["item_id"],
                 "type": "function_call",
                 "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
                 "arguments": entry["arguments"],
-            }
+            }, (holder or {}).get("tool_ns"))
         outputs[entry["output_index"]] = fc_item
         yield ev("response.output_item.done",
                  {"output_index": entry["output_index"], "item": fc_item})
@@ -8726,6 +9649,19 @@ def stream_responses_events(inner_lines, model, holder):
             if not calls_rem:
                 # issue #49 方向 C：Responses 侧同样留痕（DSML 也解析不出来时）
                 _log_unrecovered_leak(clean_rem or text_buffer, "responses")
+                # issue #120 后续：Responses 侧也不许把残片当正文补发。
+                # 空壳残片（只有标记 + 空标签）直接丢：text_buffer 不清空就不会进
+                # text_parts，等于静默丢弃；带协议结构又还原不了的走 502 出口。
+                _allowed_resp = holder.get("allowed_names") or set()
+                if (not _leak_garbage_only(clean_rem or text_buffer)
+                        and _allowed_resp
+                        and (_leak_residue_present(_outside_fences(text_buffer))
+                             or _dsml_residue_present(_outside_fences(text_buffer)))
+                        and not _echo_names_all_undeclared(text_buffer, _allowed_resp)):
+                    log("unrecovered leak residue in tools session (%d chars) — "
+                        "failing the turn closed (responses)" % len(text_buffer),
+                        level="WARN", tag="chat")
+                    raise EmptyToolEcho(len(text_buffer), "unrecovered_responses")
         if calls_rem:
             dsml_tool_calls.extend(calls_rem)
         if clean_rem:
@@ -9350,12 +10286,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, update_plan_info())
         if path == "/diag/vm":
             # 本机虚拟化检测（看板「签到与福利中心」展示；中文输出）。
-            # 以官方风控桥 runtime-info.exe 的 vmInfo 为准，桥不可用时本机交叉校验。
+            # 以官方风控桥 runtime-info 的 vmInfo 为准，桥不可用时本机交叉校验。
+            # issue #123 后续：把「判定来源」与「桥是否真的可用」一并回显，
+            # 否则用户看到「本地：单板计算机」+「官方风控：KVM」会以为是自相矛盾。
             _q = parse_qs(urlparse(self.path).query)
             try:
-                return self._json(200, local_vm_status(
-                    _q.get("realm", [None])[0] or CURRENT_REALM,
-                    force=bool(_q.get("force", [None])[0])))
+                _realm = _q.get("realm", [None])[0] or CURRENT_REALM
+                _st = local_vm_status(_realm, force=bool(_q.get("force", [None])[0]))
+                _exe = qoder_accounts.runtime_info_exe(_realm)
+                _raw = qoder_accounts.run_runtime_info(_realm) or {}
+                _vmi = _raw.get("vmInfo") if isinstance(_raw.get("vmInfo"), dict) else {}
+                _st["bridge_exe"] = _exe or ""
+                _st["bridge_available"] = bool(_exe)
+                _st["bridge_vm_info"] = {
+                    k: _vmi.get(k) for k in
+                    ("isVm", "brand", "percentage", "vmTypeCode")
+                    if k in _vmi}
+                _st["local_evidence"] = list(_st.get("evidence") or [])
+                return self._json(200, _st)
             except Exception as exc:
                 return self._error(500, "vm status failed: %s" % exc)
         if path == "/health":
@@ -9410,9 +10358,13 @@ class Handler(BaseHTTPRequestHandler):
                                                  "(check account/network)"})
             _save_models_cache(req_realm, live)
             entries = merge_catalog(live, realm=req_realm)
+            # 与 fetch_models 同步注册显示名 + 作废离线 memo：手动刷新后
+            # 新显示名立即可解析，不用等节流窗口。
+            _register_live_names(entries)
             with _lock:
                 _models_cache[req_realm] = {"at": time.time(),
                                             "data": entries}
+                _offline_models_cache.pop(req_realm, None)
             return self._json(200, {"ok": True, "realm": req_realm,
                                     "count": len(entries),
                                     "ids": [mid for mid, _m in entries]})
@@ -10056,6 +11008,16 @@ class Handler(BaseHTTPRequestHandler):
                     or (existing.get(entry_id, {}).get("created_at")
                         if entry_id in existing else None) \
                     or time.strftime("%Y/%m/%d %H:%M")
+                # issue #131-1：区分「字段没提交」与「显式提交空列表」。
+                # 老客户端/精简载荷不含 models 时保留旧白名单，只有明确写
+                # [] 才表示「清除限制」——否则一次改名就能把授权范围放大。
+                _prev = existing.get(entry_id) or {}
+                if "models" in item:
+                    models_val = item.get("models")
+                else:
+                    models_val = _prev.get("models")
+                note_val = (str(item.get("note")).strip()
+                            if "note" in item else (_prev.get("note") or ""))
                 cleaned.append({
                     "id": entry_id,
                     "name": str(item.get("name") or "").strip(),
@@ -10063,9 +11025,10 @@ class Handler(BaseHTTPRequestHandler):
                     "realm": realm,
                     "enabled": item.get("enabled", True) is not False,
                     "created_at": created_at,
-                    # P1-4：每 Key 模型白名单（原样透传；规范化统一在
+                    # P1-4：每 Key 模型白名单（规范化统一在
                     # qoder_settings._clean_key_entry 一处完成）。
-                    "models": item.get("models"),
+                    "models": models_val,
+                    "note": note_val,
                 })
             qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
             reply["api_keys_saved"] = len(cleaned)
@@ -10165,6 +11128,12 @@ class Handler(BaseHTTPRequestHandler):
                     qoder_settings.panel_password_is_default(ACCOUNTS_DIR),
             })
         if path == "/panel/logout":
+            # issue #131-5：先认证再吊销。revoke_all() 会换签名密钥，等于把
+            # **所有**已登录浏览器踢下线；此前它在 _panel_ok() 之前执行，任
+            # 何能连到端口的人不带任何凭据就能做到这件事。
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
             # 退出登录不能只往内存黑名单里写一笔：那份 dict 重启即丢，已退出的
             # token 会活到 TTL（7 天）结束——比改动前的「重启全清」更差。
             # 直接换密钥：本 token 与其它浏览器的会话一起作废。本地单人面板无感，
@@ -10194,6 +11163,61 @@ class Handler(BaseHTTPRequestHandler):
             token = PANEL.create()
             return self._json(200, {"ok": True, "token": token})
         return self._unknown_path_error(path)
+
+    # issue #121：/diag/model-billing 已移除——上游对网关身份一律回报 "auto"，    # 该字段不携带计费信息，据此提示用户只会误导（用户实测国际版同样如此）。
+    def _handle_diag_checkin(self, payload):
+        """issue #123：签到诊断——把每一步的上游结果原样吐出来，便于定位。
+
+        只读：不发 claim（不会误领/重复领）。回显内容不含 token，只给状态与
+        活动 key/标题，够用来比对"官方客户端能领、网关看不到"的差异。
+        """
+        uid = str((payload or {}).get("uid") or "").strip()
+        acc = POOL.get(uid) if uid else None
+        if acc is None:
+            return self._error(404, "no such account: %s" % (uid or "-"))
+        out = {"ok": True, "uid": acc.uid[:8], "realm": acc.realm,
+               "enabled": bool(acc.enabled),
+               "capability": None, "capability_reason": "",
+               "status": None, "campaigns": None, "can_checkin": None,
+               "last_checkin": acc.last_checkin}
+        try:
+            cap, reason = acc.checkin_capability()
+            out["capability"] = cap
+            out["capability_reason"] = reason
+        except Exception as exc:
+            out["capability_reason"] = "probe failed: %s" % str(exc)[:120]
+        try:
+            ok, st = acc.checkin_status()
+            out["status"] = {"ok": ok, "detail": st}
+        except Exception as exc:
+            out["status"] = {"ok": False, "error": str(exc)[:200]}
+        try:
+            out["can_checkin"] = bool(acc.can_checkin())
+        except Exception:
+            pass
+        try:
+            res = acc.campaigns()
+            items = res if isinstance(res, list) else (
+                (res or {}).get("campaigns") or (res or {}).get("list")
+                or (res or {}).get("data") or [])
+            if not isinstance(items, list):
+                items = []
+            out["campaigns"] = {
+                "count": len(items),
+                # 字段名各区域不同（campaignId/id/title/name/...），这里把
+                # 标量字段原样列出来，比猜字段名对定位更有用；token 不在活动
+                # 对象里，回显安全。
+                "items": [{"keys": sorted(c.keys())[:12],
+                           "scalars": {k: v for k, v in c.items()
+                                        if isinstance(v, (str, int, bool))}
+                           if isinstance(c, dict) else {},
+                           "label": qoder_accounts.campaign_label(c)}
+                          for c in items[:8] if isinstance(c, dict)],
+            }
+        except Exception as exc:
+            out["campaigns"] = {"error": str(exc)[:200]}
+        return self._json(200, out)
+
 
     def _handle_accounts(self, path, payload):
         """Account-management endpoints (dashboard uses these)."""
@@ -10561,12 +11585,21 @@ class Handler(BaseHTTPRequestHandler):
                         "ok": False, "uid": account.uid, "status": 503,
                         "queued": True, "retry_after": qwait,
                         "error": _msg, "elapsed_ms": wall_ms})
+                # issue #123 后续：非排队信封错误把 detail 原样带回面板，
+                # 并按已知业务码（10605/112/110/…）给出人话解释。
                 _handle_envelope_account_cooldown(account, exc, model=test_model)
                 _code = _to_int_status(exc.status)
+                _detail = str(getattr(exc, "detail", "") or "")[:400]
+                _hint = _quota_hint(_detail)
                 _msg, _et = friendly_upstream_error(_code, exc.detail)
+                log("account test: uid=%s model=%s wall=%dms upstream=%s %s"
+                    % (account.uid[:8], test_model, wall_ms, _code,
+                       _hint or _detail[:120]), level="WARN", tag="accounts")
                 return self._json(200, {"ok": False, "uid": account.uid,
                                         "status": _code,
                                         "error": _msg[:150],
+                                        "detail": _detail,
+                                        "hint": _hint,
                                         "elapsed_ms": wall_ms})
             except urllib.error.HTTPError as exc:
                 wall_ms = int((time.time() - t0) * 1000)
@@ -10677,7 +11710,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, problem, "invalid_request_error")
         req_realm = self._request_realm()
         model_hint = payload.get("model") or "auto"
-        model_key = qoder_catalog.resolve_upstream_key(model_hint, realm=req_realm)
+        # 与 open_upstream 同一解析器（含动态显示名兜底）：官方改显示名窗口期
+        # Anthropic 首条请求才不会原样透传（meta 取不到 -> 思考档位被静默丢弃）。
+        model_key = resolve_model_key(model_hint, realm=req_realm)
         # 传 supported 档位表，否则 effort_from_anthropic 会静默丢弃思考档位。
         meta = catalog_meta_for(model_key, req_realm)
         chat_req = qoder_anthropic.messages_to_chat(
@@ -10922,12 +11957,19 @@ class Handler(BaseHTTPRequestHandler):
         chat_req["tools"] = rewrite_web_tools(chat_req.get("tools") or [], names)
         chat_req["stream"] = False
         model = str(chat_req.get("model") or "")
+        # issue #131-2：这条分支此前直接 open_upstream，跳过了模型封禁与 Key
+        # 白名单 —— 只要声明一个 web_search/web_fetch 就能用本不该授权的模型。
+        # 授权必须与协议/工具无关，统一在分流之后、推理之前判一次。
+        _blocked = self._model_precheck(model, self._request_realm())
+        if _blocked:
+            return self._error(400, _blocked, "invalid_request_error")
         session_key = extract_session_key(self.headers, payload)
         messages = list(chat_req.get("messages") or [])
         realm = self._request_realm()
         usage_ctx = {"tenant_scope": self._key_id_for_usage()}
         obj = None
         rounds = 0
+        _acc = {}          # 多轮消耗累加（issue #131-3）
         for _ in range(max(1, WEB_TOOLS_MAX_ROUNDS)):
             req = dict(chat_req, messages=messages)
             try:
@@ -10946,6 +11988,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(exc.code, msg, etype)
             except Exception as exc:
                 return self._error(502, str(exc)[:200], "upstream_error")
+            _round_t0 = time.time()
             try:
                 with resp:
                     obj = aggregate_stream(resp, model,
@@ -10963,6 +12006,34 @@ class Handler(BaseHTTPRequestHandler):
                 _code = _to_int_status(exc.status)
                 _msg, _et = friendly_upstream_error(_code, exc.detail)
                 return self._error(_code, _msg, _et)
+            # issue #131-3：这条分支此前完全不记账 —— 看板/按 Key 账号统计、
+            # 以及按本地流水折叠的每日限额都漏掉这部分消耗。每轮都记一条
+            # （账号/Key/模型与真实出站一致），并累加成总数回给客户端。
+            _u = obj.get("usage") or {}
+            if _u:
+                try:
+                    record_usage(model, _u, stream=want_stream,
+                                 elapsed_ms=int((time.time() - _round_t0) * 1000),
+                                 account=account.uid if account else None,
+                                 effort=usage_ctx.get("effort"),
+                                 effort_requested=usage_ctx.get("effort_requested"),
+                                 key_id=self._key_id_for_usage(),
+                                 realm_reason=usage_ctx.get("realm_reason", ""),
+                                 session_trace=usage_ctx)
+                except Exception as exc:
+                    log("web tools: record_usage failed: %s" % exc,
+                        level="WARN", tag="webtools")
+                for _k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    try:
+                        _acc[_k] = _acc.get(_k, 0) + int(_u.get(_k) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                for _k in ("credits", "credit"):
+                    if _u.get(_k) is not None:
+                        try:
+                            _acc[_k] = float(_acc.get(_k) or 0) + float(_u[_k])
+                        except (TypeError, ValueError):
+                            pass
             msg = ((obj.get("choices") or [{}])[0].get("message") or {})
             calls = [c for c in (msg.get("tool_calls") or [])
                      if (c.get("function") or {}).get("name") in names]
@@ -10988,6 +12059,11 @@ class Handler(BaseHTTPRequestHandler):
         self.realm_used = usage_ctx.get("realm") or (realm or "")
         obj = obj or {"choices": [{"index": 0, "message": {"role": "assistant",
                                    "content": ""}, "finish_reason": "stop"}]}
+        if _acc:
+            # 多轮合计回给客户端：客户端只看到一次请求，但上游扣的是每轮的钱。
+            _usage = dict(obj.get("usage") or {})
+            _usage.update({k: v for k, v in _acc.items() if v})
+            obj = dict(obj, usage=_usage)
         if is_responses:
             if not want_stream:
                 return self._json(200, chat_to_response(obj, model))
@@ -11008,8 +12084,11 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
-        custom_names = custom_tool_names(payload.get("tools"))
         chat_req = responses_to_chat(payload)
+        # issue #127：custom 判型必须用**合并 + 展平后**的清单（顶层 tools 与
+        # input.additional_tools 都可能含容器），否则回程判型与出站不一致。
+        custom_names = custom_tool_names(chat_req.get("tools") or [])
+        tool_ns = chat_req.get("_qd_tool_ns") or {}
         self._apply_context_header(chat_req)  # issue #106
         model = payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
@@ -11020,6 +12099,7 @@ class Handler(BaseHTTPRequestHandler):
                chat_req.get("reasoning_effort"),
                sorted(custom_names) or "-"))
         holder = {"usage": None, "custom_names": custom_names,
+                  "tool_ns": tool_ns,
                   "allowed_names": _tool_names_from_payload(chat_req)}
         # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
         # 而选号成功前它就是 None。放在 try 内、open_upstream 之前也行 —— 只要
@@ -11298,7 +12378,8 @@ class Handler(BaseHTTPRequestHandler):
                              key_id=self._key_id_for_usage())
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
-            result = chat_to_response(chat_obj, model, custom_names)
+            result = chat_to_response(chat_obj, model, custom_names,
+                                       ns_map=tool_ns)
             record_usage(model, chat_obj.get("usage"), stream=False,
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
@@ -11479,7 +12560,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/v1/responses", "/responses",
                 # Anthropic Messages（task-78 接线）：两条都要进白名单，
                 # 否则会在 404 分支被拦掉（CORS 无需另加，"/v1" 前缀已覆盖）。
-                "/v1/messages", "/v1/messages/count_tokens"):
+                "/v1/messages", "/v1/messages/count_tokens",
+                # issue #123：签到诊断（只读，面板鉴权）
+                "/diag/checkin"):
             if path in ("/v1/completions", "/completions"):
                 # legacy Completions（prompt 而非 messages）本网关不实现：
                 # 明确 404 优于"接受请求却按空会话转发上游"。
@@ -11495,6 +12578,11 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
+        if path == "/diag/checkin":
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._handle_diag_checkin(payload)
         if is_account_route:
             return self._handle_accounts(path, payload)
         # 本地 web 工具：客户端声明了内置 web_search / web_fetch 时由网关代跑
@@ -12145,6 +13233,21 @@ def main():
     log("listening  : http://%s:%d/v1  (api key: %s)"
         % (args.host, args.port, "on" if API_KEY else "off"))
     log("dashboard  : http://%s:%d/" % (args.host, args.port))
+
+    # 启动预热（后台线程，不阻塞监听）：拉一次动态模型清单并注册显示名，
+    # 让「客户端跳过 /v1/models 直接发新模型名」的第一条请求也能解析对
+    # （官方改显示名窗口期，如 kmodel_latest 的 Kimi-K3 -> Kimi-K3.1-Pro）。
+    # 失败静默——落盘缓存 / 本机目录缓存 / 冻结别名表仍然兜底。
+    def _warm_models():
+        for _r in ("cn", "intl"):
+            try:
+                fetch_models(realm=_r)
+            except Exception:
+                pass
+
+    _warm = threading.Thread(target=_warm_models, name="qd-models-warm",
+                             daemon=True)
+    _warm.start()
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()

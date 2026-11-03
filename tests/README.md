@@ -231,6 +231,29 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
+**基线（2026-11-03 · 上游 v1.7.10–v1.7.19 同步）**：
+
+| 口径 | 数值 |
+|---|---|
+| 套件数 | **114 suites** |
+| 全部断言 | **2959 checks** |
+| 结果 | 0 failed / exit 0 |
+| 上一基线 | 95 suites / 2635 checks |
+
+> 本版新增（上游 v1.7.10–v1.7.19）：
+> - `_test_issue112_truncated_stream.py`、`_test_issue112_usage.py`、`_test_issue113_model_billing.py`、
+>   `_test_issue116_anthropic_tool_name.py`、`_test_issue120_unrecovered_dsml.py`、
+>   `_test_issue120c_residue_edges.py`、`_test_issue123_checkin_diag.py`、`_test_issue123_sbc_vm.py`、
+>   `_test_issue123b_diagnostics.py`、`_test_issue124_nameless_tool_call.py`、
+>   `_test_issue126_127_effort_namespace.py`、`_test_issue128_conversation_split.py`、
+>   `_test_issue129_credits_ui.py`、`_test_issue130_checkin_claim.py`、
+>   `_test_issue131_audit_fixes.py`、`_test_business_model_key.py`、`_test_live_model_names.py`、
+>   `_test_usage_frame_order.py`、`_test_i18n_dialog.js`。
+> - fork 契约补充：`_test_issue130_checkin_claim.py` 的 fake 账号补 `is_enterprise()`；
+>   `_test_echo_recovery.py` / `_test_echo_salvage_fork.py` 继续钉住 fail-open/partial salvage，
+>   上游 #120 fail-closed 仅覆盖非数组回声残片（`_leak_array_echo_candidate` 分流）。
+> - 全量在 `env -u NO_PROXY -u no_proxy` 下运行。
+
 **基线（2026-10-29 · 企业 PAT 刷新修复）**：
 
 | 口径 | 数值 |
