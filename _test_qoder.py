@@ -180,7 +180,7 @@ print("[5.5] per-realm catalogs follow the official client (must DIFFER)")
 intl_keys = [m["key"] for m in C.STATIC_INTL_MODELS]
 cn_keys = [m["key"] for m in C.STATIC_CN_MODELS]
 check("intl catalog not empty (>=17)", len(intl_keys) >= 17, len(intl_keys))
-check("cn catalog not empty (14)", len(cn_keys) == 14, len(cn_keys))
+check("cn catalog includes verified QoDuck (15)", len(cn_keys) == 15, len(cn_keys))
 check("two realms' catalogs differ", intl_keys != cn_keys)
 check("intl-only: smodel present, absent from cn",
       "smodel" in intl_keys and "smodel" not in cn_keys)
@@ -190,22 +190,22 @@ check("cn-only: gm51model present, absent from intl",
       "gm51model" in cn_keys and "gm51model" not in intl_keys)
 intl_en = {m["key"] for m in C.STATIC_INTL_MODELS if m.get("enable")}
 cn_en = {m["key"] for m in C.STATIC_CN_MODELS if m.get("enable")}
-check("intl enabled flags = {qmodel_38max, qfmodel} (official plan state)",
-      intl_en == {"qmodel_38max", "qfmodel"}, sorted(intl_en))
-check("cn all 14 enabled", len(cn_en) == 14, sorted(cn_en))
+check("intl enabled flags include QoDuck launch state",
+      intl_en == {"qmodel_38max", "qfmodel", "lmodel"}, sorted(intl_en))
+check("cn all 15 enabled", len(cn_en) == 15, sorted(cn_en))
 # 全量列出（不按 enable 过滤）
 merged_i = P.merge_catalog([], realm="intl")
 merged_c = P.merge_catalog([], realm="cn")
-check("merge keeps FULL intl list (17, no enable filtering)", len(merged_i) == 17,
+check("merge keeps FULL intl list (18, no enable filtering)", len(merged_i) == 18,
       len(merged_i))
-check("merge keeps FULL cn list (14)", len(merged_c) == 14, len(merged_c))
+check("merge keeps FULL cn list (15)", len(merged_c) == 15, len(merged_c))
 # 清单以官方动态/本机目录为准（桌面版此刻显示什么就显示什么）
 dyn_keys = [("cmodel", {"key": "cmodel", "display_name": "Cantus"})]  # 反例占位
 primary15 = [(m["key"], dict(m)) for m in C.STATIC_INTL_MODELS
              if m["key"] not in ("cmodel", "smodel")]   # 模拟动态返回的 15 条
 merged_dyn = P.merge_catalog(primary15, realm="intl")
-check("merge follows primary set (dynamic 15 wins, static-only excluded)",
-      len(merged_dyn) == 15 and
+check("merge follows primary set (dynamic wins, static-only excluded)",
+      len(merged_dyn) == len(primary15) and
       {k for k, _ in merged_dyn} == {m["key"] for m in C.STATIC_INTL_MODELS}
       - {"cmodel", "smodel"}, len(merged_dyn))
 

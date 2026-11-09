@@ -112,6 +112,8 @@ _src = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 check("#47 recover_leaked_tool_calls 确实包了 _sse_fill_tool_call_ids",
       "_sse_fill_tool_call_ids(" in _src
       and "_sse_recover_dsml(" in _src
-      and "_recover_leaked_tool_calls_inner(frames, allowed_names)" in _src)
+      # 空回合守卫后置于链首（先看上游原始输出），其余阶段仍是包装器。
+      and "_recover_leaked_tool_calls_inner(" in _src
+      and "_sse_guard_empty_tool_turn(" in _src)
 
 finish()

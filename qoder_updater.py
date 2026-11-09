@@ -29,7 +29,7 @@ REPO = "wangxinleo/qoder2api-hub"
 TARBALL_URL = "https://github.com/%s/archive/refs/tags/%s.tar.gz" % (REPO, "%s")
 
 PROTECTED_TOP = {
-    ".git", "accounts", "backups", "python", "_acc", "node_modules",
+    ".git", "accounts", "backups", "python", "_acc", "logs", "usage", "node_modules",
     ".venv", "venv", "__pycache__", ".idea", ".vscode",
 }
 

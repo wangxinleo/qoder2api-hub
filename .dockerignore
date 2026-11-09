@@ -17,6 +17,7 @@ _use
 .team/
 accounts/
 usage/
+logs/
 .mimosa/
 _shots/
 umid/
@@ -25,3 +26,4 @@ umid/
 .env
 .venv/
 _tmp_*
+.tmp_*

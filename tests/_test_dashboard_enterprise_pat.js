@@ -166,12 +166,15 @@ function doEnv(init){
   // 同步上游 #90 后 accountRow 额外引用 teamBadge(a)（团队/组织徽标）。VPC 账号必须
   // 抑制它（否则「企业」徽标重复两次），非 VPC 团队账号则要显示上游徽标 —— 故这里
   // 注入可计数的桩，把「调没调」也钉死。
+  // v1.9.4 起主数字改由上游 accountCreditMain() 渲染（共享池/构成同源），
+  // 注入桩即可；企业到期小字仍由 accountRow 自己追加，故用空桩不影响断言。
   const TB = { calls: 0 };
   const row = new Function('esc', 'USAGE_BY_ACCOUNT', 'accountGuardBadge', 'fmt',
-    'checkinBadge', 'creditsDeltaChip', 'teamBadge',
+    'checkinBadge', 'creditsDeltaChip', 'teamBadge', 'accountCreditMain',
     ROW + '; return accountRow;')(esc, {}, () => '', v => String(v ?? 0),
     () => '<ck-stub>', () => '<delta-stub>',
-    (a) => { TB.calls++; return (a && a.isTeam) ? '<team-stub>' : ''; });
+    (a) => { TB.calls++; return (a && a.isTeam) ? '<team-stub>' : ''; },
+    () => '<q-stub>');
   const base = { uid: 'ent-uid-1', nickname: 'Ent One', realm: 'cn', enabled: true,
     source: 'pat', expiresIn: '23h', lastError: '', credits: null };
   const entHtml = row(Object.assign({}, base, { enterpriseDomain: 'acme' }));

@@ -231,6 +231,35 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
+**基线（2026-11-09 · 上游 v1.7.20–v1.9.4 同步）**：
+
+| 口径 | 数值 |
+|---|---|
+| 套件数 | **150 suites** |
+| 全部断言 | **4049 checks** |
+| 结果 | 0 failed / exit 0 |
+| 上一基线 | 114 suites / 2959 checks |
+
+> 本版新增（上游 v1.7.20–v1.9.4）：
+> - `_test_admin_dashboard.js`、`_test_admin_groups.py`、`_test_admin_overview.py`、`_test_admin_routing.py`、
+>   `_test_agents_catalog.py`、`_test_anthropic_autostop.py`、`_test_anthropic_tool_input.py`、
+>   `_test_cache_keepalive.py`、`_test_dockerfile_modules.py`、`_test_dsh_504_args.py`、
+>   `_test_image_conversion_timeout.py`、`_test_issue129b_full_price.py`、`_test_issue129c_credit_split.py`、
+>   `_test_issue131_e2e.py`、`_test_issue132_134_update_and_test.py`、`_test_issue135_tool_echo_mode.py`、
+>   `_test_issue135b_echo_toggle.py`、`_test_issue136_cache_session.py`、`_test_issue137_e2e.py`、
+>   `_test_issue137_error_class.py`、`_test_issue137_tool_call_tags.py`、`_test_issue139_queue_diag.py`、
+>   `_test_issue141_credit_composition.py`、`_test_issue144_app_catalog.py`、`_test_issue146_anthropic_thinking.py`、
+>   `_test_log_paths.py`、`_test_models_catalog_realm.js`、`_test_performance_v180.py`、`_test_routing_board.js`、
+>   `_test_routing_cache.py`、`_test_routing_workbench.py`、`_test_session_output_http.py`、
+>   `_test_session_output_integrity.py`、`_test_shared_quota_display.js`、`_test_shared_quota_only.py`。
+> - fork 契约继续钉住：`_test_echo_salvage_fork.py` / `_test_issues_1_4_4.py` / `_test_issue72_empty_echo.py`
+>   保持「半截 JSON 数组吞掉、仅纯 marker 空壳 fail-closed」；`_test_issue79_structured_realm.py`
+>   等保持 INTL 默认文本化；`_test_enterprise_pat.py` / `_test_quota_guard.py` 保持企业资源包入
+>   `packages`（含 `source`）与有效余额口径。
+> - 与上游断言分歧处已就地标注 fork 契约（`_test_issue138_502_forms.py`、`_test_issue55_system_prefix.py`、
+>   `_test_anthropic_autostop.py`、`_test_anthropic_wiring.py`、`_test_dashboard_enterprise_pat.js`）。
+> - 全量在 `env -u NO_PROXY -u no_proxy` 下运行。
+
 **基线（2026-11-03 · 上游 v1.7.10–v1.7.19 同步）**：
 
 | 口径 | 数值 |

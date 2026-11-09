@@ -129,44 +129,46 @@ try:
     check("item[1..3].arguments 合法",
           all(isinstance(json.loads(x.get("arguments")), dict)
               for x in _arr[1:]))
-    check("严格 parse 整体拒绝", P.parse_leaked_tool_calls(
-        _echo_block_src, _ALLOWED)[0] is None)
+    check("严格 parse 先修复坏参数、整体还原 4 条", (lambda r: (
+        r[0] is not None and len(r[0]) == 4
+        and json.loads(r[0][0]["function"]["arguments"])["command"]))(
+            P.parse_leaked_tool_calls(_echo_block_src, _ALLOWED)),)
     _salv = P.salvage_leaked_tool_calls(_echo_block_src, _ALLOWED)
-    check("salvage 3 还原 / 1 弃（idx=0:args-not-json）",
-          _salv is not None and len(_salv[0]) == 3
-          and _salv[1] == [(0, "args-not-json")],
+    check("salvage 4 还原 / 0 弃（idx=0 坏引号已修复）",
+          _salv is not None and len(_salv[0]) == 4
+          and _salv[1] == [],
           (_salv[0][:1] if _salv else None,
            _salv[1] if _salv else None))
 
     print()
-    print("[1] chat 流式：事故样本 8 种分块 × 2 轮，3 还原 / 1 弃 / 零泄漏")
+    print("[1] chat 流式：事故样本 8 种分块 × 2 轮，4 还原 / 零泄漏")
     for size in (1, 4, 7, 16, 64, 128, 512, None):
         for round_no in range(2):
             _t, _calls, _fins = _feed_chat(_SAMPLE, size)
             label = "整段" if size is None else str(size)
-            check("3 calls / size=%s round=%d" % (label, round_no + 1),
-                  len(_calls) == 3, (_t[:60], len(_calls), _fins))
+            check("4 calls / size=%s round=%d" % (label, round_no + 1),
+                  len(_calls) == 4, (_t[:60], len(_calls), _fins))
             check("finish=tool_calls / size=%s round=%d" % (label, round_no + 1),
                   _fins and _fins[-1] == "tool_calls", _fins)
             check("正文只留散文、零泄漏 / size=%s round=%d" % (label, round_no + 1),
                   _t == _prose and _no_leak(_t), _t[:120])
 
     print()
-    print("[2] chat 非流式：事故样本 3 tool_calls + finish=tool_calls")
+    print("[2] chat 非流式：事故样本 4 tool_calls + finish=tool_calls")
     _agg = P.aggregate_stream(
         _Stream([_envelope_chunk(_SAMPLE[:600]),
                  _envelope_chunk(_SAMPLE[600:]),
                  _envelope_chunk("", fin="stop")]),
         "m", None, holder={}, allowed_names=_ALLOWED)
     _msg = _agg["choices"][0]["message"]
-    check("content=散文、3 calls、finish=tool_calls",
+    check("content=散文、4 calls、finish=tool_calls",
           _msg.get("content") == _prose
-          and len(_msg.get("tool_calls") or []) == 3
+          and len(_msg.get("tool_calls") or []) == 4
           and _agg["choices"][0]["finish_reason"] == "tool_calls",
           (_msg.get("content") or "")[:80])
 
     print()
-    print("[3] Responses 流：3 个 function_call、零泄漏、正常 completed")
+    print("[3] Responses 流：4 个 function_call、零泄漏、正常 completed")
     _evs = _resp_events(_SAMPLE)
     _parsed = [json.loads(_ln[6:]) for _fr in _evs
                for _ln in _fr.splitlines() if _ln.startswith("data: ")]
@@ -176,8 +178,8 @@ try:
             if e.get("type") == "response.output_item.done"
             and (e.get("item") or {}).get("type") == "function_call"]
     _joined = "".join(_evs)
-    check("正文=散文、3 个 function_call",
-          _txt == _prose and len(_fcs) == 3
+    check("正文=散文、4 个 function_call",
+          _txt == _prose and len(_fcs) == 4
           and all(f.get("name") == "bash" for f in _fcs),
           (_txt[:80], len(_fcs)))
     check("无 response.failed、正常 completed、零泄漏",
@@ -186,7 +188,7 @@ try:
           _joined[:120])
 
     print()
-    print("[4] Anthropic 桥：3 个 tool_use、message_stop、无 error")
+    print("[4] Anthropic 桥：4 个 tool_use、message_stop、无 error")
     _ant = "".join(f if isinstance(f, str) else f.decode("utf-8", "replace")
                    for f in AN.stream_anthropic_events(
                        P.recover_leaked_tool_calls(
@@ -194,8 +196,8 @@ try:
                             _dc("", "stop")], _ALLOWED),
                        "m", {"usage": None, "custom_names": set(),
                              "allowed_names": _ALLOWED}))
-    check("tool_use 3 个、message_stop、无 event: error",
-          _ant.count("tool_use") >= 3 and "message_stop" in _ant
+    check("tool_use 4 个、message_stop、无 event: error",
+          _ant.count("tool_use") >= 4 and "message_stop" in _ant
           and "event: error" not in _ant and _no_leak(_ant),
           _ant[-300:])
 
@@ -290,9 +292,9 @@ try:
     print("[9] 观测：salvage / dropped-all WARN 留痕")
     _logs = P.get_logs(limit=0, level="WARN")
     _msgs = [x.get("msg") or "" for x in (_logs.get("logs") or [])]
-    check("含 salvaged leaked tool-call echo（事故样本）",
-          any("salvaged leaked tool-call echo" in m
-              and "idx=0:args-not-json" in m for m in _msgs), _msgs[:2])
+    check("含参数修复计数（RECOVERY_STATS.args_repaired）",
+          P.RECOVERY_STATS.get("args_repaired", 0) >= 1,
+          P.RECOVERY_STATS)
     check("含 dropped all leaked tool-call echo（0 合法/空数组）",
           any("dropped all leaked tool-call echo" in m for m in _msgs),
           _msgs[:4])

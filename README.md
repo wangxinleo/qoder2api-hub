@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.7.19--wangxinleo-2496ED?style=flat-square" alt="Version 1.7.19-wangxinleo">
+  <img src="https://img.shields.io/badge/Release-v1.9.4--wangxinleo-2496ED?style=flat-square" alt="Version 1.9.4-wangxinleo">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -118,6 +118,8 @@ docker compose logs -f
 ```bash
 docker compose up -d --build
 ```
+
+看板「智能体配置」覆盖 **31 个热门客户端 / Harness**，其中 **13 类支持自动配置与还原**：Claude Code、Codex CLI、OpenCode、DSH、Crush、Aider、Continue、Pi、Factory Droid、GitHub Copilot CLI、OpenHands CLI、Kilo CLI、Mistral Vibe。其他客户端按实际能力提供安装检测和手动接入指引；API 示例和客户端模板只使用 `YOUR_API_KEY`。详见[客户端接入](docs/clients.md)。
 
 或直接 `docker run`：
 
@@ -509,6 +511,19 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/wangxinleo/qoder2api-hub/releases)。
+
+### v1.9.4-wangxinleo
+
+**同步上游 v1.7.20–v1.9.4（39 个提交）**
+
+- **工具流协议**：新增伪 XML 调用标签解析（#137，`<tool_call>Name {json}</tool_call>`）与工具参数修复（#127/v1.7.30，内层未转义引号等可修复参数不再整轮失败）；四条出口（chat 流式/非流式、Responses、Anthropic）共用同一套判定。
+- **额度与计费**：额度「构成」归一（套餐内 / 资源包 / SOTA / 共享池，#141）并直接展示在账号积分旁；共享/企业资源包单独成行且计入 `remain_effective`（#145）；账号行主数字改用统一额度组件（个人 + 共享合并口径）。
+- **会话与缓存**：会话缓存与轮次复用（#136）、上游 keepalive（#142，新模块 `qoder_keepalive.py`）、图片转换超时修复、chunked 请求体解析（#148）、Anthropic thinking block（#146）。
+- **面板与路由**：新增「路由编排」工作台（账号优先层、草稿预览、高级匹配规则）、v1.9.4 全站视觉/动效重构；模型目录新增 QoDuck（#144）与区域目录切换；新增管理概览/分组/路由等面板 API（`qoder_admin.py`、`qoder_routing.py`）。
+- **保留 fork 语义**：企业 VPC（无公共回退、签到/活动/积分/成就零出站、Cosy 头、配额三形态、PAT 自愈）、`enterprise_first` 分层派单与会话亲和、排队 403 收尾、非流式 429 + `Retry-After`、积分面板 `daily=[]` 渲染、**CN 全模型结构化（INTL 默认文本化，需显式 `QD_STRUCTURED_TOOL_HISTORY_REALMS=cn,intl`）**、echo partial salvage（半截 JSON 数组整块吞掉、仅纯 marker 空壳 fail-closed）。
+- **版本线**：`VERSION = 1.9.4-wangxinleo`；`qoder_updater.REPO = "wangxinleo/qoder2api-hub"`，镜像仍推 `ghcr.io/wangxinleo/qoder2api-hub`。
+
+**验证**：全量 **150 suites / 4049 checks / 0 failed**（含 fork 契约套件与上游新增套件）。
 
 ### v1.7.19-wangxinleo
 

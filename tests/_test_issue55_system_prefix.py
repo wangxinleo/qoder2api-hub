@@ -108,7 +108,8 @@ check("#55/#49 CN 全模型结构化（carve-out 为空）",
 check("#55/#49 DeepSeek-CN + id 齐备 -> 结构化直传",
       P.structured_tool_history_enabled(model="DeepSeek-Flash", realm="cn",
                                         messages=_MSGS) is True)
-check("#55/#49 INTL 仍不自动启用（未经端到端验证）",
+# fork 契约：INTL 默认文本化（仅 CN 全模型结构化）；需显式 REALMS=cn,intl 开启。
+check("#55/#49 INTL 默认不启用结构化历史（fork 契约）",
       P.structured_tool_history_enabled(model="DeepSeek-Flash", realm="intl",
                                         messages=_MSGS) is False)
 check("#55/#49 id 不齐备时回退文本化",

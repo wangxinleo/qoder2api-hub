@@ -76,8 +76,13 @@ _salv_good = P.salvage_leaked_tool_calls(_echo(_GOOD), {"Write"})
 check("#37 合法参数：salvage 1 还原 / 0 弃",
       _salv_good is not None and len(_salv_good[0]) == 1
       and _salv_good[1] == [], _salv_good)
+# v1.7.30：内层未转义引号先尝试 _repair_args_json，修好则还原成真实调用。
+_salv_quote = P.salvage_leaked_tool_calls(_echo(_BAD_QUOTE), {"Write"})
+check("#37 内层未转义引号：修复后 1 还原 / 0 弃",
+      _salv_quote is not None and len(_salv_quote[0]) == 1
+      and _salv_quote[1] == []
+      and json.loads(_salv_quote[0][0]["function"]["arguments"]), _salv_quote)
 for _label, _args in (("内层真实 LF", _BAD_LF),
-                      ("内层未转义引号", _BAD_QUOTE),
                       ("内层截断（缺右花括号）", '{"file_path":"D:/x.txt"')):
     _salv = P.salvage_leaked_tool_calls(_echo(_args), {"Write"})
     check("#37 %s：0 合法 -> 丢弃（args-not-json）" % _label,
@@ -100,7 +105,7 @@ check("#37 合法 JSON 示例（无 marker）：不识别",
       P.salvage_leaked_tool_calls('A JSON example: [{"content":"probe"}]',
                                   {"Write"}) is None)
 
-# v1.5.6：坏参数不再 fail-closed；整块吞掉、finish=stop、零泄漏
+# v1.5.6：坏参数不再 fail-closed；可修复的还原，修不好的整块吞掉、finish=stop、零泄漏
 _stream = _echo(_BAD_LF)
 _frames37 = [("data: " + json.dumps(
     {"id": "c", "model": "m", "choices": [{"index": 0,
