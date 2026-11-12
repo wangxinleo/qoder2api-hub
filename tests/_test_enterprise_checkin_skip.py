@@ -12,6 +12,7 @@ P, A = bootstrap()
 declare_suite(__file__, ["qoder_accounts.py", "qoder_tasks.py",
                          "qoder_scheduler.py"])
 
+import qoder_scheduler  # noqa: E402
 import qoder_tasks  # noqa: E402
 
 
@@ -127,5 +128,17 @@ check("接受裸域名",
       == "fixture-a")
 check("Account 拒绝 scheme", rejected(
     lambda: account(endpoint="https://fixture-a.vpc.qoder.com.cn")))
+
+print("\n[vpc-skip] 7) 余额快照刷新开关")
+with mock.patch.dict(os.environ, {}, clear=False):
+    os.environ.pop("QD_VPC_CREDITS_REFRESH", None)
+    check("余额刷新默认开启",
+          qoder_scheduler.vpc_credits_refresh_enabled() is True)
+with mock.patch.dict(os.environ, {"QD_VPC_CREDITS_REFRESH": "0"}):
+    check("余额刷新可关闭",
+          qoder_scheduler.vpc_credits_refresh_enabled() is False)
+with mock.patch.dict(os.environ, {"QD_VPC_CREDITS_REFRESH": "1"}):
+    check("余额刷新可开启",
+          qoder_scheduler.vpc_credits_refresh_enabled() is True)
 
 finish()
