@@ -34,9 +34,16 @@ CYCLE_STARTUP = "startup"
 CYCLE_HOUR = "hour"
 CYCLE_MANUAL = "manual"
 
-# 业务决定：VPC 账号只参与推理 + token 刷新，不参与签到/活动。
-# 余额快照默认也不刷新；如以后需要看板余额，改成 True。
-VPC_CREDITS_REFRESH = False
+# 企业 VPC 账号默认参与余额快照刷新；需要省请求时用 QD_VPC_CREDITS_REFRESH=0 关闭。
+VPC_CREDITS_REFRESH_DEFAULT = True
+
+
+def vpc_credits_refresh_enabled():
+    """VPC 余额快照刷新开关，默认开启。"""
+    raw = os.environ.get("QD_VPC_CREDITS_REFRESH")
+    if raw is None:
+        return VPC_CREDITS_REFRESH_DEFAULT
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 class Scheduler(object):
@@ -479,7 +486,8 @@ class Scheduler(object):
         vpc_targets = [a for a in targets if getattr(a, "is_vpc", False)]
         checkin_targets = [a for a in targets
                            if not getattr(a, "is_vpc", False)]
-        credit_targets = targets if VPC_CREDITS_REFRESH else checkin_targets
+        credit_targets = (targets if vpc_credits_refresh_enabled()
+                          else checkin_targets)
         if vpc_targets:
             self.log("企业 VPC 账号不参与签到/活动，跳过 %d 个"
                      % len(vpc_targets))
