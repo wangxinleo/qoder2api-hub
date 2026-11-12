@@ -103,15 +103,13 @@ _MSGS = [
          "function": {"name": "Bash", "arguments": "{}"}}]},
     {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
 ]
-check("#55/#49 CN 全模型结构化（carve-out 为空）",
-      P.STRUCTURED_TOOL_HISTORY_EXCLUDE == ())
+check("#55/#49 deepseek 在白名单里", "deepseek" in P.STRUCTURED_TOOL_HISTORY_WHITELIST)
 check("#55/#49 DeepSeek-CN + id 齐备 -> 结构化直传",
       P.structured_tool_history_enabled(model="DeepSeek-Flash", realm="cn",
                                         messages=_MSGS) is True)
-# fork 契约：INTL 默认文本化（仅 CN 全模型结构化）；需显式 REALMS=cn,intl 开启。
-check("#55/#49 INTL 默认不启用结构化历史（fork 契约）",
+check("#55/#49 INTL 默认启用结构化历史",
       P.structured_tool_history_enabled(model="DeepSeek-Flash", realm="intl",
-                                        messages=_MSGS) is False)
+                                        messages=_MSGS) is True)
 check("#55/#49 id 不齐备时回退文本化",
       P.structured_tool_history_enabled(
           model="DeepSeek-Flash", realm="cn",

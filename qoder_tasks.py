@@ -127,7 +127,7 @@ def fetch_task_view(account):
             "task_code": "daily_checkin_legacy",
             "name": "每日签到（旧活动批次）",
             "description": l_desc,
-            "jump_url": get_realm_config(account.realm)["website"] + "/",
+            "jump_url": qoder_accounts.account_realm_config(account)["website"] + "/",
             "status": l_status,
             "current": 1,
             "target": 1,
@@ -272,7 +272,7 @@ def _campaign_task_row(account, camp, summary):
       全部 CLAIMED              -> "claimed"  （今日已领取）
       其它/无活动               -> "not_accepted"
     """
-    website = get_realm_config(account.realm)["website"]
+    website = qoder_accounts.account_realm_config(account)["website"]
     jump = (camp.get("campaign_url") or website + "/activities") \
         if camp.get("ok") else website + "/activities"
     items = [{"key": c["campaign_key"] or c["campaign_id"],
@@ -730,18 +730,16 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
                       跟随 gap。0 是合法值（不等待），因此这里只做 is None 判断，
                       既不用 falsy 判断，也不在本层 max(1.0, ...) 之类地 clamp。
     """
-    if account.is_enterprise():
-        # 企业 VPC 账号不参与个人签到/活动：首行早退，零出站（防御双闸之二，
-        # 另一闸在 Account.can_checkin/campaign_checkin）。
-        name = account.nickname or account.uid[:8]
-        return {"ok": True, "logs": [f"— [{name}] 企业版账号不参与每日签到/活动，本步跳过"],
-                "earned_credit": 0, "skipped_enterprise": True}
     settle = 1.0 if gap is None else max(0.0, float(gap))
     # 透传给活动平台内部：只有调用方显式给了 claim_gap 才覆盖 gap（gap=0 不丢）
     camp_gap = settle if claim_gap is None else max(0.0, float(claim_gap))
     only_kinds = ("", "CREDITS") if only_daily else None
     logs = []
     name = account.nickname or account.uid[:8]
+    if getattr(account, "is_vpc", False):
+        logs.append(f"— [{name}] {qoder_accounts.VPC_SKIP_MSG}，跳过")
+        return {"ok": True, "skipped_vpc": True, "logs": logs,
+                "earned_credit": 0, "credits": account.credits}
     logs.append(f"开始为账号 [{name}] 执行每日签到...")
 
     # --- 1) 活动平台（官方现行机制） ---
@@ -870,15 +868,14 @@ def run_pro_claim(account):
       · state="already_claimed" 本就已领取   → earned_credit 记 0，只如实回报事实。
     否则批量汇总的 credit_added 每次都会虚增 +1800（历史缺陷）。
     """
-    if account.is_enterprise():
-        # 企业 VPC 账号不参与签到/活动（Pro 包同族）：零出站早退。
-        name = account.nickname or account.uid[:8]
-        return {"ok": True, "logs": [f"— [{name}] 企业版账号不参与签到/活动，本步跳过"],
-                "earned_credit": 0, "already_claimed": False,
-                "state": "skipped_enterprise",
-                "msg": "企业版账号不参与签到/活动"}
     logs = []
     name = account.nickname or account.uid[:8]
+    if getattr(account, "is_vpc", False):
+        logs.append(f"— [{name}] {qoder_accounts.VPC_SKIP_MSG}，跳过")
+        return {"ok": True, "skipped_vpc": True, "logs": logs,
+                "earned_credit": 0, "already_claimed": False,
+                "state": "skipped_vpc", "msg": qoder_accounts.VPC_SKIP_MSG,
+                "credits": account.credits}
     ok, elig = account.pro_eligibility()
     if not ok:
         logs.append(f"! [{name}] Pro 升级包资格查询失败: {elig}")
@@ -1034,40 +1031,15 @@ def run_keepalive(pool, force=False, threshold_seconds=4 * 3600):
     failed_uids = []
     now = time.time()
     for acc in list(pool.accounts if pool else []):
-        # 旧版本缺陷：jrt- 刷新先置 disabled，PAT 兜底成功却没恢复 enabled。
-        # 真实落盘态可能是 enabled=false + lastError 空（PAT 成功时清空过）——
-        # 旧文件没有 disabledBySessionDead 标记，只能按 source=pat + 空 lastError
-        # 做一次保守识别；新文件由标记精确区分。disabledByUser 优先于一切自愈。
-        _legacy_empty = (str(getattr(acc, "source", "") or "") == "pat"
-                         and not str(getattr(acc, "last_error", "") or "").strip())
-        recover = (not acc.enabled and getattr(acc, "personal_token", "")
-                   and not getattr(acc, "disabled_by_user", False)
-                   and (getattr(acc, "disabled_by_session_dead", False)
-                        or qoder_accounts.session_dead(acc.last_error)
-                        or _legacy_empty))
-        if not acc.enabled and not recover:
-            continue
-        if not acc.access_token and not getattr(acc, "personal_token", ""):
+        if not acc.enabled or not acc.access_token:
             continue
         remain = (acc.expires_at or 0) - now
-        if not force and not recover and remain > threshold_seconds:
+        if not force and remain > threshold_seconds:
             continue
         nick = acc.nickname or acc.uid[:8]
-        if force or recover or remain <= threshold_seconds:
-            if recover and not getattr(acc, "disabled_by_session_dead", False):
-                # 旧文件靠 lastError 命中：先持久化标记，避免本次刷新失败
-                # 覆盖 lastError 后，下一次保活不再尝试恢复。
-                acc.disabled_by_session_dead = True
-                if pool is not None and getattr(pool, "dir", ""):
-                    acc.save(pool.dir)
+        if force or remain <= threshold_seconds:
             logs.append(f"账号 [{nick}] Token 剩余 {_fmt_eta(remain)}，执行主动保活刷新...")
             if acc.refresh():
-                if recover and not acc.enabled:
-                    acc.enabled = True
-                    acc.disabled_by_session_dead = False
-                    if pool is not None and getattr(pool, "dir", ""):
-                        acc.save(pool.dir)
-                    logs.append(f"✓ 账号 [{nick}] 已自动恢复（PAT 刷新成功）")
                 refreshed += 1
                 logs.append(f"✓ 账号 [{nick}] Token 保活刷新成功（{_fmt_eta((acc.expires_at or 0) - time.time())}）")
             else:

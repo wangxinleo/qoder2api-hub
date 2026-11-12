@@ -34,6 +34,10 @@ CYCLE_STARTUP = "startup"
 CYCLE_HOUR = "hour"
 CYCLE_MANUAL = "manual"
 
+# 业务决定：VPC 账号只参与推理 + token 刷新，不参与签到/活动。
+# 余额快照默认也不刷新；如以后需要看板余额，改成 True。
+VPC_CREDITS_REFRESH = False
+
 
 class Scheduler(object):
     def __init__(self, pool, state_dir=None):
@@ -472,10 +476,17 @@ class Scheduler(object):
         # stale_uids（凭证失效）始终排除——签了必然失败还会覆盖余额快照。
         targets = [a for a in self.pool.accounts
                    if a.checkin_eligible() and a.uid not in stale_uids]
+        vpc_targets = [a for a in targets if getattr(a, "is_vpc", False)]
+        checkin_targets = [a for a in targets
+                           if not getattr(a, "is_vpc", False)]
+        credit_targets = targets if VPC_CREDITS_REFRESH else checkin_targets
+        if vpc_targets:
+            self.log("企业 VPC 账号不参与签到/活动，跳过 %d 个"
+                     % len(vpc_targets))
         if checkin_due:
-            pending = targets          # 09:00 / 21:00 窗口不受启动闸门影响
+            pending = checkin_targets  # 09:00 / 21:00 窗口不受启动闸门影响
         elif allow_complement:
-            pending = [a for a in targets if a.can_checkin()]
+            pending = [a for a in checkin_targets if a.can_checkin()]
         else:
             pending = []               # 当日已补签：不发起任何领取
         checkin_count = 0
@@ -489,10 +500,10 @@ class Scheduler(object):
                 if line.startswith("✓") or line.startswith("!"):
                     self.log(line)
         elif checkin_due:
-            self.log("所有账号今日已签到")
+            self.log("无可签到账号")
 
         # 3. 刷新额度快照（看板积分卡片依赖）
-        for acc in targets:
+        for acc in credit_targets:
             try:
                 acc.fetch_credits()
             except Exception:

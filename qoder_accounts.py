@@ -6,8 +6,6 @@
   - OAuth 设备授权（PKCE S256，浏览器授权 + /deviceToken/poll 轮询，
     dt- 30 天 / drt- 1 年）——免桌面客户端一键登录
   - PAT 导入（pt- 长期令牌 -> jobToken 交换 jt-/jrt-）
-  - 企业私有化（VPC）实例：PAT 只在企业专属域名兑换/刷新/查询（无公共域回退），
-    对话走企业 gateway 单 host，账号不参与个人签到/活动
   - 按 token 前缀路由的刷新（drt- -> deviceToken/refresh；
     jrt- -> jobToken/refresh，失败回落 PAT 重新交换）
   - 每日签到 / 额度（quota）/ 套餐（plan）查询
@@ -16,6 +14,7 @@
 """
 import base64
 import collections
+import copy
 import datetime
 import hashlib
 import ipaddress
@@ -32,11 +31,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 import uuid
+import weakref
 
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
-from qoder_enterprise import enterprise_origins, normalize_vpc_domain
 from qoder_sign import COSY_MACHINE_OS
 
 # ---------------------------------------------------------------------------
@@ -217,7 +216,6 @@ def normalize_quota_payload(payload, realm=""):
                     for idx, item in enumerate(items):
                         bucket = _bucket_from(item, kind, name)
                         if bucket:
-                            bucket["source"] = key
                             if len(items) > 1:
                                 bucket["name"] = "%s #%d" % (name, idx + 1)
                             sig = (bucket["kind"], bucket.get("size"),
@@ -256,15 +254,161 @@ def normalize_quota_payload(payload, realm=""):
     return out
 
 
+VPC_DOMAIN_SUFFIX = "vpc.qoder.com.cn"
+
+
+def parse_vpc_endpoint(value):
+    """把 QD_CN_VPC_ENDPOINT 解析成企业 VPC 的三个官方主机。
+
+    只接受裸实例名（acme）或三个按服务拆分的裸域名
+    （acme.vpc.qoder.com.cn / acme-openapi.vpc.qoder.com.cn /
+    acme-gateway.vpc.qoder.com.cn）。
+    空值返回 None；scheme、路径、端口、凭据、query、fragment 或空白一律拒绝，
+    避免一个值只改掉流程里的一部分端点。
+    """
+    raw = str(value or "")
+    if not raw.strip():
+        return None
+    if "://" in raw:
+        raise ValueError("invalid VPC endpoint: expected a bare instance name or "
+                         "a bare domain under %s" % VPC_DOMAIN_SUFFIX)
+    if raw != raw.strip() or any(ch in raw for ch in "\r\n\t"):
+        raise ValueError("invalid VPC endpoint: surrounding whitespace or "
+                         "control characters")
+    target = "https://" + raw
+    try:
+        parsed = urllib.parse.urlsplit(target)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid VPC endpoint: malformed host or port")
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or ":" in parsed.netloc or "?" in raw
+            or port is not None or parsed.username is not None
+            or parsed.password is not None or parsed.query
+            or parsed.fragment or "#" in raw
+            or parsed.path not in ("", "/")):
+        raise ValueError("invalid VPC endpoint: expected an instance name or a "
+                         "domain under %s" % VPC_DOMAIN_SUFFIX)
+    host = parsed.hostname.lower()
+    instance = host
+    if host.endswith("." + VPC_DOMAIN_SUFFIX):
+        instance = host[:-len("." + VPC_DOMAIN_SUFFIX)]
+        if instance.endswith("-openapi"):
+            instance = instance[:-len("-openapi")]
+        elif instance.endswith("-gateway"):
+            instance = instance[:-len("-gateway")]
+    elif "." in host:
+        raise ValueError("invalid VPC endpoint: expected an instance name or a "
+                         "domain under %s" % VPC_DOMAIN_SUFFIX)
+    # 最长服务后缀 -gateway 占 8 字节，推导后的 DNS label 不能超过 63。
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?", instance):
+        raise ValueError("invalid VPC endpoint: bad instance name %r" % instance)
+    domain = instance + "." + VPC_DOMAIN_SUFFIX
+    return {
+        "instance": instance,
+        "domain": domain,
+        "website": "https://" + domain,
+        "openapi": "https://" + instance + "-openapi." + VPC_DOMAIN_SUFFIX,
+        "gateway": "https://" + instance + "-gateway." + VPC_DOMAIN_SUFFIX,
+    }
+
+
+_VPC_CN = None
+VPC_CONFIG_ERROR = ""
+try:
+    _VPC_CN = parse_vpc_endpoint(os.environ.get("QD_CN_VPC_ENDPOINT"))
+except ValueError as exc:
+    VPC_CONFIG_ERROR = str(exc)
+
+_VPC_HOSTS = frozenset(
+    urllib.parse.urlsplit(_VPC_CN[key]).hostname.lower()
+    for key in ("website", "openapi", "gateway")
+    if _VPC_CN and urllib.parse.urlsplit(_VPC_CN[key]).hostname
+)
+
+
+def vpc_configured():
+    return _VPC_CN is not None
+
+
+def vpc_instance():
+    return (_VPC_CN or {}).get("instance", "")
+
+
+def vpc_config_error():
+    return VPC_CONFIG_ERROR
+
+
+_VPC_ACCOUNTS = weakref.WeakSet()
+_VPC_SCOPES = weakref.WeakSet()
+_VPC_LOCK = threading.RLock()
+
+
+def _vpc_hosts(config):
+    return frozenset(urllib.parse.urlsplit(config[key]).hostname
+                     for key in ("website", "openapi", "gateway"))
+
+
+class _VpcEndpointScope:
+    """Keep an instance registered while a pre-account credential flow runs."""
+    def __init__(self, config):
+        self.config = dict(config)
+        with _VPC_LOCK:
+            _VPC_SCOPES.add(self)
+
+
+def _configured_vpc_groups():
+    groups = []
+    if _VPC_CN:
+        groups.append(_vpc_hosts(_VPC_CN))
+    with _VPC_LOCK:
+        accounts = list(_VPC_ACCOUNTS)
+        scopes = list(_VPC_SCOPES)
+    for scope in scopes:
+        if scope.config.get("vpc_instance"):
+            groups.append(_vpc_hosts(scope.config))
+    for account in accounts:
+        cfg = account.realm_config()
+        if cfg.get("vpc_instance"):
+            groups.append(_vpc_hosts(cfg))
+    pool = globals().get("_ACTIVE_POOL")
+    if pool is not None:
+        with pool._lock:
+            pending = list(pool.logins.values())
+        for info in pending:
+            if time.time() - info.get("created", 0) <= LOGIN_TTL_SECONDS:
+                cfg = info.get("endpoint_config") or {}
+                if cfg.get("vpc_instance"):
+                    groups.append(_vpc_hosts(cfg))
+    return groups
+
+
+def vpc_endpoint_hosts():
+    return frozenset(host for group in _configured_vpc_groups() for host in group)
+
+
+def is_configured_vpc_host(host):
+    """仅对 QD_CN_VPC_ENDPOINT 推导出的三个主机放行解析级 SSRF 校验。
+
+    企业 VPC 域名通常解析到公司内网地址，通用规则会把它当内网目标拒绝；
+    但这是用户显式配置的固定主机，不是请求里可注入的 URL。
+    """
+    name = str(host or "").strip().strip("[]").lower()
+    return bool(name) and name in vpc_endpoint_hosts()
+
+
 REALM_CONFIGS = {
     "cn": {
         "name": "国内版 (China)",
-        "openapi": "https://openapi.qoder.com.cn",
-        "gateway": "https://gateway.qoder.com.cn",
-        "website": "https://qoder.com.cn",
+        "openapi": (_VPC_CN or {}).get("openapi")
+                   or "https://openapi.qoder.com.cn",
+        "gateway": (_VPC_CN or {}).get("gateway")
+                   or "https://gateway.qoder.com.cn",
+        "website": (_VPC_CN or {}).get("website") or "https://qoder.com.cn",
+        "domain": (_VPC_CN or {}).get("domain") or "qoder.com.cn",
+        "vpc_instance": (_VPC_CN or {}).get("instance", ""),
         "client_id": "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
         "redirect_uri": "qoder-work-cn://",
-        "domain": "qoder.com.cn",
         "ua": "QoderWork/1.1.75",
         # has_checkin 只是"历史上该区域曾开放 sash 签到"的提示位，**不再作为
         # 门控**：能力改为运行时探测（见 Account.checkin_capability）。官方把
@@ -307,7 +451,7 @@ REALM_CONFIGS = {
 CLIENT_UA = "Go-http-client/2.0"
 LOGIN_TTL_SECONDS = 600
 # 账号文件写入锁（/tasks 并行刷新时多个字段各自 save，必须串行落盘）
-_SAVE_LOCK = threading.Lock()
+_SAVE_LOCK = threading.RLock()
 DEFAULT_USER_TYPE = "personal_professional_trial"
 
 # 业务端点（全部挂 openapi 基址，纯 Bearer，无 COSY 签名）
@@ -1095,6 +1239,10 @@ def native_machine_identity(realm, account_id, force=False):
 # 签到能力探测缓存：404（接口不存在）后 N 秒内不再重复探测，避免每次巡检都
 # 打一个必然失败的请求；到期自动重探，官方上线即可自动恢复。
 CHECKIN_PROBE_TTL = 6 * 3600
+# 企业 VPC 账号只参与推理和 token 刷新，不参与个人签到/活动。
+# 该策略是业务决定，不提供运行时开关；需要变更请改这里并跑回归。
+VPC_SKIP_REASON = "vpc_account"
+VPC_SKIP_MSG = "企业 VPC 账号不参与个人签到/活动"
 # 活动列表缓存 TTL：活动状态变化很慢（每日一轮），20 秒内复用可让看板切换视图
 # /账号不再等那 1–4 秒的上游请求；领取动作会强制绕过并立即失效缓存。
 CAMPAIGNS_TTL = 20
@@ -1147,9 +1295,6 @@ _CAMPAIGN_FAILURE_CN = {
     "RISK_DEPENDENCY_UNAVAILABLE": "风控服务不可用，稍后重试",
 }
 CHECKIN_REASON_NOT_FOUND = "checkin_endpoint_not_found"
-# 企业 VPC 账号不参与个人签到/活动：独立的跳过原因（与"本区域无接口"区分）
-CHECKIN_REASON_ENTERPRISE = "enterprise_account"
-ENTERPRISE_ACTIVITY_MSG = "企业版账号不参与每日签到/活动"
 
 # 会话死亡标记：上游主动吊销离线会话，刷新已无意义，需要重新登录。
 SESSION_DEAD_MARKERS = ("TOKEN_EXPIRE", "12153", "Offline user session not found")
@@ -1179,15 +1324,18 @@ def _machine_minimal_disabled():
     return raw in ("0", "off", "false", "no", "disable", "disabled")
 
 
-def openapi_candidates(realm):
+def openapi_candidates(realm, cfg=None):
     """该区域 openapi 基址候选（issue: 国际版签不到到）。
 
     官方把业务端点都挂在 openapi 基址上；国际版历史上是 openapi.qoder.sh，
     但该域名在部分网络/时期不可达，表现为「活动列表拿不到 -> 签到无效」。
     这里给出候选顺序，调用方**只在连接失败或 404 时**换下一个，业务错误不重试。
     """
-    cfg = get_realm_config(realm)
+    cfg = cfg if cfg is not None else get_realm_config(realm)
     r = str(realm or "cn")
+    # 专属实例配置优先于遗留的 OPENAPI 覆盖；不得将企业凭据先送往公网。
+    if cfg.get("vpc_instance"):
+        return [str(cfg["openapi"]).rstrip("/")]
     out = []
     env = str(os.environ.get("QD_%s_OPENAPI" % r.upper()) or "").strip()
     if env:
@@ -1210,30 +1358,75 @@ def get_realm_config(realm):
     return REALM_CONFIGS.get(realm) or REALM_CONFIGS["cn"]
 
 
-def gateway_candidates(realm):
+def normalize_vpc_override(value):
+    """None inherits the deployment default; empty string explicitly uses public CN."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("VPC endpoint must be a string or null")
+    parsed = parse_vpc_endpoint(value)
+    return parsed["instance"] if parsed else ""
+
+
+def realm_config_for(realm, vpc=None):
+    override = normalize_vpc_override(vpc)
+    if realm != "cn":
+        if override:
+            raise ValueError("VPC is only available for CN accounts")
+        return dict(get_realm_config(realm))
+    if override is None:
+        if VPC_CONFIG_ERROR:
+            raise ValueError(VPC_CONFIG_ERROR)
+        return dict(get_realm_config("cn"))
+    cfg = dict(get_realm_config("cn"))
+    parsed = parse_vpc_endpoint(override)
+    cfg.update({"openapi": "https://openapi.qoder.com.cn",
+                "gateway": "https://gateway.qoder.com.cn",
+                "website": "https://qoder.com.cn", "domain": "qoder.com.cn",
+                "vpc_instance": "", "gateway_fallbacks": ()})
+    if parsed:
+        cfg.update({key: parsed[key] for key in ("openapi", "gateway", "website", "domain")})
+        cfg["vpc_instance"] = parsed["instance"]
+    return cfg
+
+
+def account_realm_config(account):
+    # Legacy integrations may pass a minimal account stub without the method.
+    method = getattr(account, "realm_config", None)
+    return method() if callable(method) else get_realm_config(account.realm)
+
+
+def gateway_candidates(realm, cfg=None):
     """该区域的推理主机候选列表（官方客户端同款：主选 + 故障切换域名）。
 
     签名只覆盖 path，因此同一请求换主机后签名依旧有效。
     """
-    cfg = get_realm_config(realm)
+    cfg = cfg if cfg is not None else get_realm_config(realm)
     out = [cfg["gateway"]]
+    # 企业 VPC 只有实例专属推理域，公网 api1/api2/api3 不能作为故障回退。
+    if cfg.get("vpc_instance"):
+        return out
     for host in cfg.get("gateway_fallbacks") or ():
         if host and host not in out:
             out.append(host)
     return out
 
 
-def gateway_candidates_for(account):
-    """账号级推理主机候选：企业 VPC 账号只走 {instance}-gateway 单 host。
+def cli_auth_dirs(realm, vpc=None):
+    """官方 CLI 的凭据目录：公网 ``.auth`` +（VPC 模式）实例专属 ``.auth``。
 
-    企业实例没有 api2/api3 类故障切换域名证据（参考实现仅用单 host），
-    因此这里刻意不拼接任何公共域；公共账号返回值与 gateway_candidates(realm)
-    逐项一致（回归测试对照）。
+    企业 VPC 账号可能由官方 CLI 登录在 ``~/.qoder-cn/.auth``，也可能按
+    实例隔离在 ``~/.qoder-cn/.vpc/<instance>/.auth``；扫描两者，导入时
+    的 realm 仍是 cn。
     """
-    ent = str(getattr(account, "enterprise_domain", "") or "").strip()
-    if ent:
-        return [enterprise_origins(ent)["gateway"]]
-    return gateway_candidates(getattr(account, "realm", "cn"))
+    cfg = realm_config_for(realm, vpc)
+    root = os.path.join(os.path.expanduser("~"), cfg["home_dir"])
+    out = []
+    instance = str(cfg.get("vpc_instance") or "")
+    if instance:
+        out.append(os.path.join(root, ".vpc", instance, ".auth"))
+    out.append(os.path.join(root, ".auth"))
+    return out
 
 
 def detect_realm_from_domain(domain):
@@ -1490,6 +1683,19 @@ _FAKEIP_NETS = [
     ipaddress.ip_network("2001:2::/48"),
     ipaddress.ip_network("fdfe:dcba:9876::/48"),
 ]
+# macOS 的 getaddrinfo 会把 fake-IP 以 IPv4-translated 形式（::ffff:0:c612:2d）
+# 一并返回；只认纯 IPv4 会让 all(...) 失败，于是所有公网域名都被误判成内网。
+_FAKEIP_V4_TRANSLATED = ipaddress.ip_network("::ffff:0:0:0/96")
+
+
+def _is_fake_ip(ip):
+    candidates = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            candidates.append(ip.ipv4_mapped)
+        elif ip in _FAKEIP_V4_TRANSLATED:
+            candidates.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return any(addr in net for addr in candidates for net in _FAKEIP_NETS)
 
 
 def _host_boundary_violation(ip, allow_local):
@@ -1516,6 +1722,10 @@ def validate_public_http_url(url, allow_local=False):
     host = (parsed.hostname or "").strip().strip("[]").lower()
     if not host:
         raise ValueError("URL host is required")
+    # 企业 VPC 专属域通常解析到公司内网，不能按公网目标拒绝；只放行
+    # QD_CN_VPC_ENDPOINT 推导出的固定主机。
+    if is_configured_vpc_host(host):
+        return url
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
         if not allow_local:
             raise ValueError("requests to localhost are not allowed")
@@ -1541,7 +1751,7 @@ def validate_public_http_url(url, allow_local=False):
             addrs.append(ipaddress.ip_address(addr))
         except ValueError:
             raise ValueError("URL host resolved to a non-IP address: %r" % addr)
-    if addrs and all(any(ip in net for net in _FAKEIP_NETS) for ip in addrs):
+    if addrs and all(_is_fake_ip(ip) for ip in addrs):
         return url  # fake-IP DNS：真实 IP 不可见，名称级校验已通过
     for ip in addrs:
         if _host_boundary_violation(ip, allow_local):
@@ -1604,6 +1814,28 @@ def _proxy_map_from_env():
     return out
 
 
+class _VpcRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """VPC 请求只允许在本实例的 HTTPS 默认端口之间重定向。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source = urllib.parse.urlsplit(req.full_url)
+        if is_configured_vpc_host(source.hostname):
+            target = urllib.parse.urlsplit(newurl)
+            try:
+                allowed = (target.scheme == "https"
+                           and target.port in (None, 443)
+                           and target.username is None and target.password is None
+                           and any(source.hostname in group and target.hostname in group
+                                   for group in _configured_vpc_groups()))
+            except ValueError:
+                allowed = False
+            if not allowed:
+                raise urllib.error.HTTPError(req.full_url, code,
+                                             "VPC redirect outside configured instance",
+                                             headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _opener_for_request():
     """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
 
@@ -1611,7 +1843,8 @@ def _opener_for_request():
     首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
     """
     proxies = _proxy_map_from_env()
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies),
+                                       _VpcRedirectHandler())
 
 
 def upstream_clock_skew(timeout=4.0):
@@ -1622,7 +1855,8 @@ def upstream_clock_skew(timeout=4.0):
     """
     from email.utils import parsedate_to_datetime
     try:
-        req = urllib.request.Request("https://openapi.qoder.com.cn/", method="HEAD")
+        base = openapi_candidates("cn")[0]
+        req = urllib.request.Request(base.rstrip("/") + "/", method="HEAD")
         with _opener_for_request().open(req, timeout=timeout) as resp:
             date_hdr = resp.headers.get("Date")
         if not date_hdr:
@@ -1695,8 +1929,24 @@ class Account(object):
         self.realm = str(data.get("realm") or detect_realm_from_domain(self.domain))
         if self.realm not in REALM_CONFIGS:
             self.realm = "cn"
-        if not self.domain:
-            self.domain = get_realm_config(self.realm)["domain"]
+        self.vpc_source = "account"
+        if "vpcEndpoint" in data:
+            override = normalize_vpc_override(data["vpcEndpoint"])
+        elif self.realm == "cn" and self.domain.lower().endswith("." + VPC_DOMAIN_SUFFIX):
+            override = normalize_vpc_override(self.domain)
+            self.vpc_source = "domain"
+        else:
+            override = None
+        self.vpc_override = override
+        cfg = realm_config_for(self.realm, override)
+        self.vpc_endpoint = cfg.get("vpc_instance", "")
+        if override is None:
+            self.vpc_source = "default" if self.vpc_endpoint else "public"
+        elif not override:
+            self.vpc_source = "public"
+        self.domain = cfg["domain"]
+        with _VPC_LOCK:
+            _VPC_ACCOUNTS.add(self)
         self.platform = str(data.get("platform") or "CLI")
         self.access_token = str(data.get("accessToken") or "")
         self.refresh_token = str(data.get("refreshToken") or "")
@@ -1706,11 +1956,6 @@ class Account(object):
         self.source = str(data.get("source") or "oauth")
         self.enabled = data.get("enabled", True)
         self.last_error = str(data.get("lastError") or "")
-        # 仅用于「旧缺陷遗留的 disabled PAT 账号」保活自愈：标记本次停用原因是
-        # session dead。旧文件没有该键 -> False，靠 lastError 文本兜底。
-        self.disabled_by_session_dead = bool(data.get("disabledBySessionDead"))
-        # 手动启停标记：用户主动停用的账号不得被保活自愈（旧文件缺键 -> False）。
-        self.disabled_by_user = bool(data.get("disabledByUser"))
         self.cooldown_until = float(data.get("cooldownUntil") or 0)
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
         self.model_cooldowns = {}
@@ -1728,11 +1973,6 @@ class Account(object):
         # issue #56：团队/企业账号的自用保护（并发闸门 + 最小间隔 + 客户端统计）。
         # 全部是**内存态**，不落盘，不影响凭证文件格式。
         self._team_lock = threading.Lock()
-        # PAT 刷新：并发请求可能同时发现 token 过期；锁内 2s 去重，
-        # 避免重复轮换 jrt-/PAT（旧 token 已被上游作废后再刷会互相踩）。
-        self._refresh_lock = threading.Lock()
-        self.token_refreshed_at = 0.0    # 最近一次成功刷新（运行期）
-        self.token_recovery_at = 0.0     # 最近一次登录错误自愈尝试（失败也计时）
         self.team_leases = {}
         self.team_last_start = 0.0
         self.team_client_ips = {}
@@ -1778,9 +2018,6 @@ class Account(object):
         self.user_type = str(data.get("userType") or "") or DEFAULT_USER_TYPE
         self.organization_id = str(data.get("organizationId") or "")
         self.organization_name = str(data.get("organizationName") or "")
-        # 企业私有化（VPC）实例名，如 acme（归一化后；公共账号为空串）。
-        # 旧账号 JSON 无该键 -> 防御式读空，行为与历史完全一致。
-        self.enterprise_domain = str(data.get("enterpriseDomain") or "").strip()
         # 签到能力：None=未探测 / True=接口存在 / False=接口不存在（404）。
         # 运行时探测而非按区域硬编码——官方随时可能在任一区域增删活动接口。
         self._checkin_cap = None
@@ -1798,6 +2035,29 @@ class Account(object):
         self.machine_headers_state = MACHINE_HEADERS_OMITTED
 
     # -- 持久化 ------------------------------------------------------------
+    def realm_config(self):
+        return realm_config_for(self.realm, self.vpc_override)
+
+    def endpoint_scope(self):
+        cfg = self.realm_config()
+        return (self.realm + ":vpc:" + cfg["vpc_instance"]
+                if cfg.get("vpc_instance") else self.realm)
+
+    @property
+    def is_vpc(self):
+        """账号实际生效的端点是否为企业 VPC 实例。
+
+        VPC 账号只参与推理和必要的 token 刷新，不参与个人签到/活动。
+        """
+        return bool(self.vpc_endpoint)
+
+    def _credits_source_allowed(self, host):
+        cfg = self.realm_config()
+        if cfg.get("vpc_instance"):
+            return host in (cfg["openapi"], cfg["website"])
+        name = (urllib.parse.urlsplit(host).hostname or "").lower()
+        return not name.endswith("." + VPC_DOMAIN_SUFFIX)
+
     def to_dict(self):
         return {
             "uid": self.uid,
@@ -1805,6 +2065,7 @@ class Account(object):
             "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
+            "vpcEndpoint": self.vpc_override,
             "platform": self.platform,
             "accessToken": self.access_token,
             "refreshToken": self.refresh_token,
@@ -1814,8 +2075,6 @@ class Account(object):
             "source": self.source,
             "enabled": self.enabled,
             "lastError": self.last_error,
-            "disabledBySessionDead": bool(self.disabled_by_session_dead),
-            "disabledByUser": bool(self.disabled_by_user),
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
             "lastQuotaAnomaly": self.last_quota_anomaly,
@@ -1830,7 +2089,6 @@ class Account(object):
             "userType": self.user_type,
             "organizationId": self.organization_id,
             "organizationName": self.organization_name,
-            "enterpriseDomain": self.enterprise_domain,
             "note": self.note,
         }
 
@@ -1890,6 +2148,9 @@ class Account(object):
             "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
+            "vpcEndpoint": self.vpc_endpoint,
+            "vpcOverride": self.vpc_override,
+            "vpcSource": self.vpc_source,
             "platform": self.platform,
             "enabled": bool(self.enabled),
             "source": self.source,
@@ -1948,7 +2209,6 @@ class Account(object):
                                         else "not_found")),
             "checkinReason": self.checkin_capability()[1],
             "userType": self.user_type,
-            "enterpriseDomain": self.enterprise_domain,
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": derive_id(self.uid, "session"),
             # issue #74：#69 只给 to_dict（写文件/导出）加了 note，public()
@@ -1972,6 +2232,8 @@ class Account(object):
         # 并发保护：/tasks 面板接口会并行刷新同一账号的多个字段（credits/plan/…），
         # 每个都可能触发 save；同一 tmp 路径被两个线程同时写会落出坏 JSON。
         with _SAVE_LOCK:
+            if getattr(self, "_superseded", False):
+                return str(path)  # obsolete refresh cannot overwrite endpoint edits
             tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
                            encoding="utf-8")
             os.replace(tmp, path)
@@ -2169,35 +2431,6 @@ class Account(object):
                 best = days
         return best
 
-    def top_expiry_days(self, now=None):
-        """顶层 credits["expires_at"] 的剩余天数（企业层内加权的数据源）；不可用 None。
-
-        占位（归一后 >= _EXPIRY_NEVER_EPOCH）、缺失、非法 -> None；未归一毫秒
-        防御性 /1000（判据与 normalize_epoch 一致：> 1e11 即毫秒）。已过期
-        （< 0）如实返回负数，由调用方决定是否采用。
-
-        注：CN 占位 253402214400（毫秒原始值）按同判据归一为 253402214
-        （= fetch_credits 落库形态），days 为负 -> 由权重函数按"已过期"归 1；
-        真正的占位（如 253402214400000 归一后 == _EXPIRY_NEVER_EPOCH）在此
-        返回 None。两条护栏都保证占位值不进加权、不会被顶格。
-        """
-        cred = self.credits
-        if not isinstance(cred, dict):
-            return None
-        exp = cred.get("expires_at")
-        if exp is None:
-            return None
-        try:
-            exp_f = float(exp)
-        except (TypeError, ValueError):
-            return None
-        if exp_f > 1e11:                     # 防御：未归一毫秒
-            exp_f /= 1000.0
-        if exp_f >= _EXPIRY_NEVER_EPOCH:     # 永不过期占位 -> 不参与
-            return None
-        now = now if now is not None else time.time()
-        return (exp_f - now) / 86400.0
-
     def in_expiring_window(self, now=None):
         """是否落在「即将过期」窗口内（window <= 0 直接 False 短路）。"""
         window = self.expiring_window_days
@@ -2374,8 +2607,8 @@ class Account(object):
 
     # -- 出站头 ------------------------------------------------------------
     def headers(self, purpose="openapi"):
-        cfg = get_realm_config(self.realm)
-        h = {
+        cfg = self.realm_config()
+        return {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
             # UA 必须与所属区域的官方客户端一致。此前这里用全局 CLIENT_UA
@@ -2391,13 +2624,6 @@ class Account(object):
             "Origin": cfg["website"],
             "Referer": cfg["website"] + "/",
         }
-        if self.enterprise_domain:
-            # 企业 VPC 实测：配额/套餐等 openapi 端点要求 Cosy 两头（缺失或
-            # 只有裸 Bearer 时会回登录页/错误体，被 #25-d 守卫判为退化响应）。
-            # 公共账号不叠加，公共路径逐字节不变。
-            h["Cosy-Version"] = "1.0.1"
-            h["Cosy-ClientType"] = "5"
-        return h
 
     def desktop_headers(self, minimal=False):
         """桌面端同款出站头（活动平台 /sash/... 必需）。
@@ -2483,67 +2709,37 @@ class Account(object):
                     "可能不可见、领取可能失败。这是已知限制，不等于今天没有活动。")
         return ""
 
-    # -- 企业 VPC（Qoder CN 私有化实例）-----------------------------------
-    def is_enterprise(self):
-        """企业 VPC 实例账号（enterpriseDomain 非空即真；公共账号恒 False）。"""
-        return bool(self.enterprise_domain)
-
-    def openapi_base(self):
-        """账号级 openapi 基址：企业 -> VPC openapi；公共 -> realm 配置。
-
-        企业 PAT 只在企业专属域名有效，**绝不允许**回退公共域；路径与公共
-        CN 完全一致，仅替换 host。
-        """
-        if self.enterprise_domain:
-            return enterprise_origins(self.enterprise_domain)["openapi"]
-        return get_realm_config(self.realm)["openapi"]
-
     # -- 刷新（按 token 前缀路由） ----------------------------------------
     def refresh(self):
         """刷新 access token。drt- 走 deviceToken，jrt-/PAT 走 jobToken。
 
-        PAT 永不覆盖活跃的 OAuth 会话；drt-/jrt- 刷新失败后才做最终兜底。
-        并发请求共用一把账号级锁：2s 内已成功刷新则直接复用结果。
-
-        停用只在**最后一次**尝试失败且确认 session dead 时发生：
-        jrt- 失败还有 PAT 兜底，提前 disable 会把本可恢复的账号永久打死。
+        PAT 永不覆盖活跃的 OAuth 会话，只做 jrt- 过期后的最终兜底。
         """
-        with self._refresh_lock:
-            now = time.time()
-            if now - self.token_refreshed_at < 2:
+        cfg = self.realm_config()
+        base = cfg["openapi"]
+        # 1) OAuth 设备族
+        if self.refresh_token.startswith("drt-"):
+            return self._post_token(base + PATH_DEVICE_REFRESH,
+                                    {"refresh_token": self.refresh_token}, kind="device")
+        # 2) jobToken 族：jrt- 优先，失败回落 PAT 重新交换
+        if self.refresh_token:
+            if self._post_token(base + PATH_JOB_REFRESH,
+                                {"refresh_token": self.refresh_token}, kind="job"):
                 return True
-            base = self.openapi_base()
-            # 1) OAuth 设备族：drt- 失败时若还存有 PAT，仍允许最终兜底
-            if self.refresh_token.startswith("drt-"):
-                if self._post_token(base + PATH_DEVICE_REFRESH,
-                                    {"refresh_token": self.refresh_token},
-                                    kind="device",
-                                    allow_disable=not self.personal_token):
-                    return True
-                if not self.personal_token:
-                    return False
-            # 2) jobToken 族：jrt- 优先，失败回落 PAT 重新交换
-            elif self.refresh_token:
-                if self._post_token(base + PATH_JOB_REFRESH,
-                                    {"refresh_token": self.refresh_token},
-                                    kind="job",
-                                    allow_disable=not self.personal_token):
-                    return True
-            if self.personal_token:
-                if self._post_token(base + PATH_JOB_EXCHANGE,
-                                    {"personal_token": self.personal_token},
-                                    kind="job", allow_disable=True):
-                    return True
-            if not self.refresh_token and not self.personal_token:
-                self.last_error = "no refresh token; sign in again"
-            return False
+        if self.personal_token:
+            if self._post_token(base + PATH_JOB_EXCHANGE,
+                                {"personal_token": self.personal_token}, kind="job"):
+                return True
+        if not self.refresh_token and not self.personal_token:
+            self.last_error = "no refresh token; sign in again"
+        return False
 
-    def _post_token(self, url, payload, kind, allow_disable=True):
+    def _post_token(self, url, payload, kind):
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             # 与 headers() 同口径：token 刷新同样要发官方客户端 UA。
-            "User-Agent": get_realm_config(self.realm).get("ua") or CLIENT_UA,
+            "User-Agent": self.realm_config().get("ua") or CLIENT_UA,
         }
         try:
             data = http_json(url, data=json.dumps(payload).encode(), method="POST",
@@ -2555,14 +2751,8 @@ class Account(object):
                 body = ""
             self.last_error = "refresh failed: HTTP %d %s" % (exc.code, body[:160])
             if exc.code in (401, 403) and session_dead(body):
+                self.enabled = False
                 self.last_error = "session dead (TOKEN_EXPIRE): re-login required"
-                # 有 PAT 兜底时延迟到下一次尝试：jrt- 失效不等于 PAT 失效。
-                if allow_disable:
-                    self.enabled = False
-                    self.disabled_by_session_dead = True
-                    # 旧实现只在内存里停用；必须落盘，否则重启后又变回 enabled。
-                    if self.path and os.path.exists(os.path.dirname(self.path)):
-                        self.save(os.path.dirname(self.path))
             return False
         except Exception as exc:
             self.last_error = "refresh failed: %s" % exc
@@ -2575,16 +2765,16 @@ class Account(object):
         else:
             token = data.get("token") or ""
             refresh = data.get("refresh_token") or self.refresh_token
-            exp = _job_expiry(data)
+            if data.get("expires_in"):
+                exp = int(time.time() + int(data["expires_in"]) / 1000)
+            else:
+                exp = self.expires_at
         if not token:
             self.last_error = "refresh returned no token"
             return False
         self.access_token = token
         self.refresh_token = refresh
         self.expires_at = exp or self.expires_at
-        self.token_refreshed_at = time.time()
-        self.disabled_by_session_dead = False
-        self.disabled_by_user = False
         self.last_error = ""
         self.cooldown_until = 0
         if self.path and os.path.exists(os.path.dirname(self.path)):
@@ -2609,6 +2799,8 @@ class Account(object):
         True  = 本账号所在区域存在 /daily-check-in 接口
         False = 接口不存在（404/405/410，实测国际版即如此）——缓存 TTL 内跳过
         """
+        if self.is_vpc:
+            return False, VPC_SKIP_REASON
         if self._checkin_cap is None:
             return None, ""
         if time.time() - self._checkin_cap_at > CHECKIN_PROBE_TTL:
@@ -2616,12 +2808,8 @@ class Account(object):
         return self._checkin_cap, self._checkin_cap_reason
 
     def can_checkin(self):
-        """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。
-
-        企业 VPC 账号一律 False：sash/campaign 语义对企业实例未知，排除即
-        零风险（额度可见性不受影响，仍走企业 openapi 刷新）。
-        """
-        if self.is_enterprise():
+        """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。"""
+        if self.is_vpc:
             return False
         capable, _ = self.checkin_capability()
         if capable is False:
@@ -2636,10 +2824,10 @@ class Account(object):
         接口在本区域不存在时返回 (False, {"unavailable": True, reason:...})，
         并记录能力探测结果（活动上线后 TTL 到期会自动重探）。
         """
-        if self.is_enterprise():
-            return False, {"unavailable": True, "reason": CHECKIN_REASON_ENTERPRISE,
-                           "error": ENTERPRISE_ACTIVITY_MSG}
-        # 国际版签不到到 —— 基址走候选（openapi.qoder.sh 在部分网络不可达），
+        if self.is_vpc:
+            return False, {"unavailable": True, "reason": VPC_SKIP_REASON,
+                           "error": VPC_SKIP_MSG}
+        # issue: 国际版签不到到 —— 基址走候选（openapi.qoder.sh 在部分网络不可达），
         # 只在连接失败 / 404 时换下一个，业务 4xx 不换。
         q, _code, _err = self._openapi_json(PATH_CHECKIN_STATUS,
                                             headers=self.headers(),
@@ -2648,7 +2836,7 @@ class Account(object):
         if q is None:
             body = _err or ""
             if _code in (404, 405, 410):
-                mark_openapi_missing(self.realm, PATH_CHECKIN_STATUS)
+                mark_openapi_missing(self.endpoint_scope(), PATH_CHECKIN_STATUS)
                 self._mark_checkin_capability(
                     False, "%s (HTTP %d)" % (CHECKIN_REASON_NOT_FOUND, _code))
                 return False, {
@@ -2699,10 +2887,10 @@ class Account(object):
         不再按区域门控：接口不存在（国际版 404）按"本区域无此接口"跳过并给
         出明确原因，而不是静默什么都不做（历史问题：看板点签到毫无反应）。
         """
-        if self.is_enterprise():
+        if self.is_vpc:
             return {"ok": True, "unavailable": True,
-                    "reason": CHECKIN_REASON_ENTERPRISE,
-                    "msg": ENTERPRISE_ACTIVITY_MSG + "，已跳过"}
+                    "reason": VPC_SKIP_REASON, "msg": VPC_SKIP_MSG,
+                    "skipped_vpc": True}
         ok, st = self.checkin_status()
         if not ok:
             if st.get("unavailable"):
@@ -2767,17 +2955,7 @@ class Account(object):
           peak       —— 单日峰值；peak_date 对应日期
           daily      —— 逐日消耗，可直接画热力图
         结果缓存 CREDIT_USAGE_TTL 秒（该接口是全量聚合，别跟着 5 秒轮询打）。
-
-        企业版（VPC）账号：该接口只在公共 openapi 域上存在，企业 PAT 不得出站到公共域
-        （见 `.trellis/spec/backend/enterprise-vpc-accounts.md`），故首行零出站早退；
-        与 checkin / campaign 族的排除口径一致。
         """
-        if self.is_enterprise():
-            return {"ok": False, "unavailable": True,
-                    "reason": CHECKIN_REASON_ENTERPRISE,
-                    "error": ENTERPRISE_ACTIVITY_MSG,
-                    "total": 0, "peak": 0, "peak_date": "", "daily": [],
-                    "unit": "credits"}
         now = time.time()
         if not force and self._credit_usage_cache \
                 and now - self._credit_usage_cache[0] < CREDIT_USAGE_TTL:
@@ -2816,13 +2994,10 @@ class Account(object):
         return out
 
     def fetch_achievements(self, force=False):
-        """已获得的成就 key 列表（用于解释活动「需先完成某成就」）。
-
-        企业版（VPC）账号：成就属于活动族，企业 PAT 零出站（不得访问公共 openapi 域）。
-        """
-        if self.is_enterprise():
+        """已获得的成就 key 列表（用于解释活动「需先完成某成就」）。"""
+        if self.is_vpc:
             return {"ok": False, "unavailable": True, "keys": [],
-                    "error": ENTERPRISE_ACTIVITY_MSG}
+                    "error": VPC_SKIP_MSG, "skipped_vpc": True}
         now = time.time()
         if not force and self._achievements_cache \
                 and now - self._achievements_cache[0] < CREDIT_USAGE_TTL:
@@ -2858,10 +3033,10 @@ class Account(object):
         last = (None, 0, "no openapi candidate")
         # 已知 404：直接返回（否则 intl 的 legacy 端点每次都要 0.x~10s 才失败，
         # 签到因此慢到不可用；TTL 6h 后允许重探，端点上线仍能被发现）。
-        if openapi_missing(self.realm, path):
+        if openapi_missing(self.endpoint_scope(), path):
             return None, 404, "cached 404 (known missing in %s)" % self.realm
         tried = 0
-        _bases = openapi_candidates(self.realm)
+        _bases = openapi_candidates(self.realm, self.realm_config())
         if not fallback:
             _bases = _bases[:1]
         for base in _bases:
@@ -2880,7 +3055,7 @@ class Account(object):
                 last = (None, exc.code, "HTTP %d %s" % (exc.code, body[:120]))
                 if exc.code in (404, 405, 410):
                     if tried >= 2:
-                        mark_openapi_missing(self.realm, path)
+                        mark_openapi_missing(self.endpoint_scope(), path)
                         return last
                     continue          # 首个基址 404：再试一个候选
                 return last
@@ -2895,8 +3070,6 @@ class Account(object):
 
         返回 (payload|None, http_code, error_str)；payload 为服务端 JSON。
         """
-        if self.is_enterprise():
-            return None, 0, ENTERPRISE_ACTIVITY_MSG
         q, code, err = self._openapi_json(PATH_CAMPAIGNS,
                                           headers=self.desktop_headers())
         if q is None and code in (401, 403):
@@ -2907,6 +3080,7 @@ class Account(object):
             return None, code2, ("HTTP %d (desktop) / HTTP %d (plain)"
                                  % (code, code2))
         return q, code, err
+
 
     def campaigns(self, force=False):
         """GET /sash/api/v1/me/campaigns -> 官方活动平台状态（双区域通用）。
@@ -2925,6 +3099,16 @@ class Account(object):
         返回 {ok, available, show_campaign, claimable, campaign_url, campaigns,
               identity}，每条活动含 action_type / claim_status / benefit / end_at。
         """
+        if self.is_vpc:
+            st = {"ok": True, "available": False, "show_campaign": False,
+                  "claimable": False, "campaign_url": "", "campaigns": [],
+                  "identity": getattr(self, "machine_identity_source", "derived"),
+                  "machine_headers": getattr(self, "machine_headers_state",
+                                             MACHINE_HEADERS_OMITTED),
+                  "hint": VPC_SKIP_MSG, "skipped_vpc": True}
+            self.campaign_status = st
+            self._campaigns_cache = (time.time(), st)
+            return st
         now = time.time()
         if not force and self._campaigns_cache \
                 and now - self._campaigns_cache[0] < CAMPAIGNS_TTL:
@@ -2936,7 +3120,7 @@ class Account(object):
                 and getattr(self, "machine_headers_state", "") == MACHINE_HEADERS_OMITTED \
                 and not _machine_minimal_disabled():
             try:
-                q2 = http_json(get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS,
+                q2 = http_json(self.realm_config()["openapi"] + PATH_CAMPAIGNS,
                                method="GET",
                                headers=self.desktop_headers(minimal=True),
                                timeout=15, retries=1)
@@ -3037,9 +3221,9 @@ class Account(object):
 
     def campaign_reward(self, campaign_id):
         """GET …/campaigns/{id}/reward -> 该活动的发放状态（幂等，只读）。"""
-        if self.is_enterprise():
-            return {"error": ENTERPRISE_ACTIVITY_MSG}
-        cfg = get_realm_config(self.realm)
+        if self.is_vpc:
+            return {"error": VPC_SKIP_MSG, "skipped_vpc": True}
+        cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_REWARD % campaign_id)
         try:
             return http_json(url, method="GET", headers=self.desktop_headers(),
@@ -3057,9 +3241,9 @@ class Account(object):
             （实测：同机多号共享每轮一次的额度，第二个号会被 BLOCKED 且列表里
             隐藏该活动——官方文档写"每账号"，实际执行是"每人"）。
         """
-        if self.is_enterprise():
-            return {"ok": False, "error": ENTERPRISE_ACTIVITY_MSG}
-        cfg = get_realm_config(self.realm)
+        if self.is_vpc:
+            return {"ok": False, "error": VPC_SKIP_MSG, "skipped_vpc": True}
+        cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
             headers = self.desktop_headers()
@@ -3146,13 +3330,12 @@ class Account(object):
             的 epoch 秒与可读文本（见 next_checkin_window）；**无论本次是否真的
             领到都给出**，前端只在"没到账"时渲染。
         """
-        if self.is_enterprise():
-            # 防御双闸之一（另一闸在 can_checkin/run_checkin）：企业账号零出站。
-            return {"ok": True, "claimed": [], "already": [], "blocked": [],
-                    "pending": [], "locked": [], "codes": [], "views": [],
-                    "campaigns": [], "errors": [], "earned": 0,
-                    "skipped_enterprise": True,
-                    "message": ENTERPRISE_ACTIVITY_MSG + "，本步跳过"}
+        if self.is_vpc:
+            return {"ok": True, "skipped_vpc": True, "earned": 0,
+                    "claimed": [], "already": [], "blocked": [], "pending": [],
+                    "locked": [], "codes": [], "views": [], "campaigns": [],
+                    "message": VPC_SKIP_MSG, "next_available_at": 0,
+                    "next_available_note": ""}
         claim_gap = CLAIM_GAP_DEFAULT if gap is None else max(0.0, float(gap))
         # 领取前只需"身份有效"（内存 → 落盘 → 组件），**不要** force 刷新：
         # force 会让每次签到都换一套身份并把落盘缓存刷掉，「重建不换」就失效了
@@ -3359,6 +3542,9 @@ class Account(object):
         打另一区的 quota 会成功。只在 403 时探测一次，不发任何写操作。
         返回可读提示字符串；不属于该情形返回空串。
         """
+        if self.realm_config().get("vpc_instance") or get_realm_config(
+                "cn" if self.realm != "cn" else "intl").get("vpc_instance"):
+            return ""  # 不将任何令牌用于 VPC / 公网之间的跨区试探。
         other = "cn" if self.realm != "cn" else "intl"
         try:
             url = get_realm_config(other)["openapi"] + PATH_QUOTA
@@ -3382,16 +3568,17 @@ class Account(object):
         limit: 只探测前 N 个候选（None = 全部）。命中者写入
         accounts/credits-source.json，之后 fetch_credits 优先用它。
         """
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         hosts = []
         for h in (cfg.get("openapi"), cfg.get("website")):
             h = str(h or "").rstrip("/")
             if h and h not in hosts:
                 hosts.append(h)
         # 已知来源优先：命中过就第一个试，正常情况下 1 次请求就返回。
-        known = load_credits_sources(accounts_dir or "").get(str(self.realm or "cn"))
+        known = load_credits_sources(accounts_dir or "").get(self.endpoint_scope())
         order = []
-        if isinstance(known, dict) and known.get("host") and known.get("path"):
+        if (isinstance(known, dict) and known.get("host") and known.get("path")
+                and self._credits_source_allowed(str(known["host"]).rstrip("/"))):
             order.append((str(known["host"]).rstrip("/"), str(known["path"])))
         for host in hosts:
             for path in CREDITS_PATHS:
@@ -3437,7 +3624,7 @@ class Account(object):
             if limit is not None and tried >= limit:
                 break
         if hit and accounts_dir:
-            save_credits_source(accounts_dir, self.realm, hit[0], hit[1],
+            save_credits_source(accounts_dir, self.endpoint_scope(), hit[0], hit[1],
                                 hit[2]["fields"])
         return {"ok": bool(hit), "realm": self.realm, "rows": rows,
                 "hit": ({"host": hit[0], "path": hit[1],
@@ -3454,19 +3641,13 @@ class Account(object):
         previous = effective_remain(self.credits)
         packages = []
         for b in comp:
+            if b.get("kind") == "shared":
+                continue
             item = {"name": b.get("name") or "额度",
                     "remain": int(b.get("remain") or 0),
                     "used": int(b.get("used") or 0),
                     "size": int(b.get("size") or 0),
                     "kind": b.get("kind") or "pack"}
-            # 企业体只有 orgResourcePackage 时，用户可见名称沿用「企业资源包」，
-            # 与公共体/团队体的「共享额度」区分（fork A6 契约）。
-            if b.get("kind") == "shared" and self.is_enterprise():
-                item["name"] = "企业资源包"
-            if b.get("source"):
-                item["source"] = b["source"]
-            if b.get("available") is not None:
-                item["available"] = b["available"]
             for key in ("expires_at", "days_left", "no_expiry"):
                 if b.get(key) is not None:
                     item[key] = b[key]
@@ -3509,6 +3690,9 @@ class Account(object):
         path = str(src.get("path") or "")
         if not host or not path:
             return None
+        cfg = self.realm_config()
+        if not self._credits_source_allowed(host):
+            return None  # 忽略公网或其它实例遗留的额度来源缓存。
         try:
             body = http_json(host + path, method="GET", headers=self.headers(),
                              timeout=20, retries=0)
@@ -3522,23 +3706,21 @@ class Account(object):
         return self._credits_from_composition(norm)
 
     def fetch_credits(self):
-        """GET /api/v2/quota/usage -> 聚合套餐额度 + 赠送/签到额度 + 共享/企业资源包。
+        """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度。
 
-        issue #141：INTL 上默认端点经常 404/403，先尝试自动探测到的
-        （主机, 路径）。企业账号（VPC 专属域名）禁止探测与公共回退，
-        始终走 self.openapi_base()。
+        issue #141：INTL 上这个端点经常 404/403，所以先用**自动探测**到的
+        （主机, 路径）组合；没有记录或取不到时再走默认路径，全部失败则
+        触发一次探测并重试——探测结果按区域缓存 6 小时。
         """
-        url = self.openapi_base() + PATH_QUOTA
         _dir = os.path.dirname(self.path) if self.path else None
-        if self.enterprise_domain:
-            _dir = None          # 企业零出站：不读写探测源
-        if _dir:
-            _srcs = load_credits_sources(_dir)
-            _src = _srcs.get(str(self.realm or "cn"))
-            if _src:
-                _hit = self._fetch_credits_via_source(_dir, _src)
-                if _hit:
-                    return _hit
+        _srcs = load_credits_sources(_dir) if _dir else {}
+        _src = _srcs.get(self.endpoint_scope())
+        if _src:
+            _hit = self._fetch_credits_via_source(_dir, _src)
+            if _hit:
+                return _hit
+        cfg = self.realm_config()
+        url = cfg["openapi"] + PATH_QUOTA
         hint = ""
         try:
             q = http_json(url, method="GET", headers=self.headers(), timeout=30)
@@ -3591,7 +3773,6 @@ class Account(object):
             return self._note_quota_anomaly(q, "non-dict response")
         uq = q.get("userQuota") or {}
         aq = q.get("addOnQuota") or {}
-        org = q.get("orgResourcePackage") or {}
 
         def _num(d, k):
             try:
@@ -3626,9 +3807,6 @@ class Account(object):
                 out["package_code"] = str(code)
             return out
 
-        # 套餐口径（userQuota + addOnQuota）保持上游语义：共享/企业资源包
-        # 不并入 remain/size，而是单独放进 credits.shared 与 packages；
-        # 护栏与展示走 remain_effective（套餐 + 可用共享）。
         remain = int(_num(uq, "remaining") + _num(aq, "remaining"))
         used = int(_num(uq, "used") + _num(aq, "used"))
         size = int(_num(uq, "total") + _num(aq, "total"))
@@ -3646,13 +3824,9 @@ class Account(object):
         # 判定**不依赖** expiresAt=253402214400——那是 CN 号「永不过期」的
         # 正常占位，健康号同样返回它，拿它当判据会误伤。
         # 判据：exceeded=true 且 remain 合计=0 且 size 合计=0（「从没有过
-        # 额度」；真·耗尽的特征是 size>0 而 remain=0，会被放行）；或三个
-        # 额度键（userQuota/addOnQuota/orgResourcePackage）都缺失
-        # （解析不了 -> 拒绝写入比写 0 诚实）。
+        # 额度」；真·耗尽的特征是 size>0 而 remain=0，会被放行）；或两个
+        # quota 键都缺失（解析不了 -> 拒绝写入比写 0 诚实）。
         # 保守性：任一信号单独出现都放行——真·余额归零与新号不受影响。
-        all_missing = (not isinstance(q.get("userQuota"), dict)
-                       and not isinstance(q.get("addOnQuota"), dict)
-                       and not isinstance(q.get("orgResourcePackage"), dict))
         both_missing = (not isinstance(q.get("userQuota"), dict)
                         and not isinstance(q.get("addOnQuota"), dict))
         if both_missing and _comp:
@@ -3660,17 +3834,12 @@ class Account(object):
             _norm["source"] = url
             return self._credits_from_composition(_norm)
         has_shared = any(b.get("kind") == "shared" for b in _comp)
-        # 套餐口径已排除共享包，退化判定需把 org 资源包加回来，否则企业体
-        # （user/addOn 全 0 + org 有余额）会被误判为「从没有过额度」。
-        _org_remain = int(_num(org, "remaining"))
-        _org_size = int(_num(org, "cap") or _num(org, "total"))
         degenerate = both_missing or (bool(q.get("isQuotaExceeded"))
-                                      and remain + _org_remain == 0
-                                      and size + _org_size == 0
+                                      and remain == 0 and size == 0
                                       and not has_shared)
         if degenerate:
             return self._note_quota_anomaly(
-                q, "no quota objects (user/addOn/org all absent)" if all_missing
+                q, "both quota objects missing" if both_missing
                 else "exceeded=true with zero size/remain")
         # issue #39：上游若有**共享额度池**（团队/企业/池化），原样纳入
         # packages 与 credits.shared——此前只显示套餐内 + 赠送，共享额度被漏掉。
@@ -3706,26 +3875,16 @@ class Account(object):
                 shared = {"remain": int(_src), "used": 0, "size": int(_src),
                           "available": True, "source": _key}
                 break
-        # 行按来源形态是否出现发出：公共体照旧两行；企业体 / 团队体只多出
-        # 共享额度一行（企业账号沿用「企业资源包」的用户可见名称）。
-        packages = []
-        if isinstance(q.get("userQuota"), dict):
-            packages.append({"name": "基础额度", "remain": int(_num(uq, "remaining")),
-                             "used": int(_num(uq, "used")),
-                             "size": int(_num(uq, "total")),
-                             **_expiry_of(uq)})
-        if isinstance(q.get("addOnQuota"), dict):
-            packages.append({"name": "赠送/签到额度",
-                             "remain": int(_num(aq, "remaining")),
-                             "used": int(_num(aq, "used")),
-                             "size": int(_num(aq, "total")),
-                             **_expiry_of(aq)})
+        _pkgs = [
+            {"name": "基础额度", "remain": int(_num(uq, "remaining")),
+             "used": int(_num(uq, "used")), "size": int(_num(uq, "total")),
+             **_expiry_of(uq)},
+            {"name": "赠送/签到额度", "remain": int(_num(aq, "remaining")),
+             "used": int(_num(aq, "used")), "size": int(_num(aq, "total")),
+             **_expiry_of(aq)},
+        ]
         if shared:
-            _shared_name = ("企业资源包"
-                            if (self.is_enterprise()
-                                and shared.get("source") == "orgResourcePackage")
-                            else "共享额度")
-            packages.append({"name": _shared_name, **shared})
+            _pkgs.append({"name": "共享额度", **shared})
         # issue #39：团队账号的 userQuota 可能已用满（remain=0）而共享池仍有余额
         # ——有效余额 = 套餐 remain + 可用的共享 remain。护栏与汇总按它判断，
         # 否则「套餐用满但共享池还有 952」会被误判为余额耗尽。
@@ -3747,7 +3906,7 @@ class Account(object):
             "usage_pct": q.get("totalUsagePercentage"),
             "expires_at": normalize_epoch(q.get("expiresAt")),
             "shared": shared,
-            "packages": packages,
+            "packages": _pkgs,
             # issue #141：把响应归一成「构成」（套餐内 / 资源包 / SOTA / 共享池）。
             # 归一器认得字段名，认不出就为空——不臆造。
             "composition": _comp,
@@ -3789,7 +3948,8 @@ class Account(object):
 
     def fetch_plan(self):
         """GET /api/v2/user/plan -> 套餐名（Pro Trial 等）。"""
-        url = self.openapi_base() + PATH_PLAN
+        cfg = self.realm_config()
+        url = cfg["openapi"] + PATH_PLAN
         try:
             p = http_json(url, method="GET", headers=self.headers(), timeout=15,
                           retries=1)
@@ -3804,9 +3964,9 @@ class Account(object):
 
     # -- Pro 升级包（一次性 +1800） ---------------------------------------
     def pro_eligibility(self):
-        if self.is_enterprise():
-            return False, ENTERPRISE_ACTIVITY_MSG
-        cfg = get_realm_config(self.realm)
+        if self.is_vpc:
+            return True, False
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_ELIGIBILITY
         try:
             m = http_json(url, method="GET", headers=self.headers(), timeout=15,
@@ -3821,9 +3981,9 @@ class Account(object):
             return False, str(exc)
 
     def pro_claim(self):
-        if self.is_enterprise():
-            return {"ok": False, "error": ENTERPRISE_ACTIVITY_MSG}
-        cfg = get_realm_config(self.realm)
+        if self.is_vpc:
+            return {"ok": False, "error": VPC_SKIP_MSG, "skipped_vpc": True}
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_CLAIM
         try:
             m = http_json(url, data=b"{}", method="POST", headers=self.headers(),
@@ -3853,24 +4013,6 @@ def token_family(acc):
     if (acc.access_token or "").startswith("pt-"):
         return "pat"
     return "unknown"
-
-
-JOB_TOKEN_TTL_SECONDS = 24 * 3600
-
-
-def _job_expiry(data):
-    """jobToken 响应的过期时间：expires_in(ms)，缺省/非法按文档 24h 推进。
-
-    旧实现缺 expires_in 时保留旧 expires_at：过期的账号会永远停在“已过期”
-    （每次请求都刷新），而本地时间偏晚时又不会触发刷新（上游 login 错误）。
-    """
-    raw = (data or {}).get("expires_in")
-    if raw:
-        try:
-            return int(time.time() + int(raw) / 1000)
-        except (TypeError, ValueError):
-            pass
-    return int(time.time()) + JOB_TOKEN_TTL_SECONDS
 
 
 def _device_expiry(data):
@@ -4242,10 +4384,6 @@ class AccountPool(object):
         self.quota_refresher = None
         # task-61 §2.6：临期加权轮询的运行期状态（uid -> 当前累计权重，重启即重置）
         self._expiry_weights = {}
-        # task 10-16（R2）：企业优先派单的池级作用域值（未配置 = None = 关）。
-        # 由 apply_settings 从 limits_data 捕获——这是池策略，不是每账号预算，
-        # 故不 setattr 到账号。
-        self._enterprise_first_scope = None
         _ACTIVE_POOL = self
 
     def load(self):
@@ -4287,6 +4425,8 @@ class AccountPool(object):
         with self._lock:
             existing = self.get(account.uid)
             if existing is not None:
+                if existing.realm_config()["domain"] != account.realm_config()["domain"]:
+                    raise ValueError("account uid already belongs to a different endpoint; use a distinct uid")
                 account.added_at = existing.added_at
                 account.path = existing.path
                 if not account.credits and existing.credits:
@@ -4297,10 +4437,6 @@ class AccountPool(object):
                     account.last_checkin = existing.last_checkin
                 if not account.personal_token and existing.personal_token:
                     account.personal_token = existing.personal_token
-                if not account.enterprise_domain and existing.enterprise_domain:
-                    # 同 uid 重导入（可能来自不带企业域名的渠道）不得把企业属性
-                    # 覆盖为空——与 personalToken 的合并先例同款。
-                    account.enterprise_domain = existing.enterprise_domain
                 self.accounts[self.accounts.index(existing)] = account
             else:
                 self.accounts.append(account)
@@ -4401,10 +4537,6 @@ class AccountPool(object):
         keys = ("reserve_credits", "daily_token_limit", "daily_credit_limit",
                 "model_daily_token_limit", "expiring_window_days")
         limits = limits_data if isinstance(limits_data, dict) else {}
-        # task 10-16（R2）：企业优先是**池级**策略（不是每账号预算），单独捕获：
-        # 不加入上面的 keys 元组、不做 setattr；None/非 dict 推送不覆写现值（防御）。
-        if isinstance(limits_data, dict):
-            self._enterprise_first_scope = limits_data.get("enterprise_first")
         flips = []
         with _QUOTA_LOCK:
             accounts = list(self.accounts)
@@ -4493,14 +4625,6 @@ class AccountPool(object):
         return sum(1 for a in snapshot if a.enabled and a.access_token and
                    a.ready(model=model))
 
-    def enterprise_first_enabled(self, realm=None):
-        """企业优先派单是否开启（池级策略；未配置 = 关）。
-
-        三级作用域与护栏同语义（realm override > global）；生效值 > 0 = 开。
-        这是调度偏好，不是拦截护栏——只影响 pick() 的分层，不影响 ready()。
-        """
-        return _scope_limit_value(self._enterprise_first_scope, realm) > 0
-
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
                          allowed_uids=None):
         exclude = exclude or set()
@@ -4538,37 +4662,15 @@ class AccountPool(object):
         except (TypeError, ValueError):
             return 1
 
-    def _enterprise_expiry_weight(self, account):
-        """企业层内临期权重 = max(1, int(round(window - days)) + 1)（与包级同式）。
-
-        窗口 = account.expiring_window_days（三级作用域已由 apply_settings 落到
-        账号，默认 0）；数据源 = 顶层 credits.expires_at。窗口 0 / 无数据 / 已过期
-        -> 1（等权 = 企业子集纯轮转，默认行为不变）。
-        """
-        window = account.expiring_window_days or 0
-        if window <= 0:
-            return 1
-        days = account.top_expiry_days()
-        if days is None or days < 0:
-            return 1
-        try:
-            return max(1, int(round(float(window) - float(days))) + 1)
-        except (TypeError, ValueError):
-            return 1
-
-    def _weighted_pick(self, candidates, weight_fn=None):
+    def _weighted_pick(self, candidates):
         """nginx smooth weighted round-robin（wb:2422 同算法）。
 
         每轮各账号累加权重、最大者胜、胜者回吐本轮总权重 —— 等权时退化为严格轮转。
         状态在 self._lock 内读写；_expiry_weights 是运行期状态（重启重置）。
-        weight_fn：可选权重函数（默认 _expiry_weight = 包级临期；企业层传
-        _enterprise_expiry_weight，数据源为顶层 expires_at）。默认参数路径与
-        既有调用点行为逐字节一致。
         """
         if not candidates:
             return None
-        weight_fn = weight_fn or self._expiry_weight
-        weights = [weight_fn(a) for a in candidates]
+        weights = [self._expiry_weight(a) for a in candidates]
         total = sum(weights) or 1
         with self._lock:
             state = self._expiry_weights
@@ -4598,29 +4700,6 @@ class AccountPool(object):
         if not cands:
             return None
         return self._weighted_pick(cands)
-
-    def _pick_enterprise_first(self, realm=None, exclude=None, model=None,
-                                allowed_uids=None):
-        """企业优先层：企业子集内先降权两轮、再临期加权（smooth WRR）。
-
-        等权（窗口 0 / 无数据）时平滑加权退化为严格轮转 = 企业子集纯轮询；
-        无企业候选返回 None（由 pick 回落既有路径 = 个人兜底）。不推进 _cursor——
-        企业层公平性由 smooth WRR 保证，天然无偶数池奇异。
-        """
-        exclude = exclude or set()
-        allowed = None if allowed_uids is None else frozenset(allowed_uids)
-        with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
-        cands = [a for a in snapshot
-                 if a.uid not in exclude and a.is_enterprise()
-                 and (allowed is None or a.uid in allowed)
-                 and a.ready(model=model)]
-        if not cands:
-            return None
-        now = time.time()
-        healthy = [a for a in cands if not a.degraded(now)]
-        return self._weighted_pick(healthy or cands,
-                                   weight_fn=self._enterprise_expiry_weight)
 
     def _rotate_pick(self, realm=None, exclude=None, model=None, allowed_uids=None):
         """纯 round-robin + 两轮降权扫描（task-74 三族之三）。
@@ -4654,20 +4733,11 @@ class AccountPool(object):
         return None
 
     def pick(self, realm=None, exclude=None, model=None, allowed_uids=None):
-        """选号：企业优先分层（可配置）> 临期积分优先（平滑加权）> 普通轮转。
+        """选号：临期积分优先（平滑加权），否则回落普通轮转。
 
-        enterprise_first 默认 0（关）-> 短路，与旧行为逐字节一致。
         `expiring_window_days` 默认 0（R7）-> in_expiring_window() 恒 False ->
         _pick_expiring_first 返回 None -> 与旧的纯 round-robin **完全一致**。
         """
-        if self.enterprise_first_enabled(realm):
-            account = self._pick_enterprise_first(realm=realm, exclude=exclude,
-                                                  model=model)
-            if account is not None:
-                return account
-            # 企业子集无候选 -> 落回既有路径：此刻不存在"就绪且未被 exclude 的
-            # 企业号"，既有 _pick_expiring_first/_rotate_pick 只会选到个人号
-            # （个人兜底），无需再写一层个人分支。
         account = self._pick_expiring_first(realm=realm, exclude=exclude,
                                             model=model, allowed_uids=allowed_uids)
         if account is not None:
@@ -4690,14 +4760,42 @@ class AccountPool(object):
         if account is None:
             return None
         account.enabled = bool(enabled)
-        # 手动启停覆盖自动恢复意图：不再保留 session-dead 自愈标记，
-        # 并记录“用户主动停用”，防止保活把账号又拉起来。
-        account.disabled_by_session_dead = False
-        account.disabled_by_user = not bool(enabled)
         if enabled:
             account.clear_error()
         account.save(self.dir)
         return account.public()
+
+    def set_vpc(self, uid, value):
+        """Publish a snapshot so in-flight requests keep their original endpoint."""
+        override = normalize_vpc_override(value)
+        with self._lock:
+            existing = self.get(uid)
+            if existing is None:
+                return None
+            realm_config_for(existing.realm, override)
+            data = existing.to_dict()
+            data["vpcEndpoint"] = override
+            validated = Account(data, existing.path)
+            replacement = copy.copy(existing)
+            replacement.vpc_override = validated.vpc_override
+            replacement.vpc_endpoint = validated.vpc_endpoint
+            replacement.vpc_source = validated.vpc_source
+            replacement.domain = validated.domain
+            with _VPC_LOCK:
+                _VPC_ACCOUNTS.add(replacement)
+            if existing.realm_config()["domain"] != replacement.realm_config()["domain"]:
+                replacement.credits = replacement.plan = None
+                replacement.last_checkin = ""
+                replacement.last_error = ""
+                replacement.cooldown_until = 0
+            with _SAVE_LOCK:
+                replacement.save(self.dir)
+                existing._superseded = True
+                existing.path = None
+                self.accounts[self.accounts.index(existing)] = replacement
+            from qoder_sign import SESSIONS
+            SESSIONS.invalidate(uid)
+            return replacement.public()
 
     def set_all_enabled(self, enabled, realm=None):
         with self._lock:
@@ -4705,8 +4803,6 @@ class AccountPool(object):
                 if realm and account.realm != realm:
                     continue
                 account.enabled = bool(enabled)
-                account.disabled_by_session_dead = False
-                account.disabled_by_user = not bool(enabled)
                 if enabled:
                     account.clear_error()
                 account.save(self.dir)
@@ -4775,21 +4871,20 @@ class AccountPool(object):
 
     # -- OAuth 设备授权登录 ------------------------------------------------
     @staticmethod
-    def _local_machine_id(realm):
+    def _local_machine_id(realm, vpc=None):
         """读取本机官方客户端的 machine_id（优先，保持设备一致），缺则生成。"""
-        cfg = get_realm_config(realm)
-        home = os.path.join(os.path.expanduser("~"), cfg["home_dir"], ".auth")
-        p = os.path.join(home, "machine_id")
-        try:
-            with open(p, encoding="utf-8") as fh:
-                mid = fh.read().strip()
-            if mid:
-                return mid
-        except Exception:
-            pass
+        for auth_dir in cli_auth_dirs(realm, vpc):
+            try:
+                with open(os.path.join(auth_dir, "machine_id"),
+                          encoding="utf-8") as fh:
+                    mid = fh.read().strip()
+                if mid:
+                    return mid
+            except Exception:
+                pass
         return str(uuid.uuid4())
 
-    def start_login(self, realm="cn", platform="CLI"):
+    def start_login(self, realm="cn", platform="CLI", vpc=None):
         """构造 PKCE 设备授权 URL（浏览器打开完成授权）。
 
         双区 URL 参数差异（官方逆向）：
@@ -4798,7 +4893,7 @@ class AccountPool(object):
           Intl : challenge, challenge_method, nonce(32-hex), client_id,
                  machine_id（新协议带 client_id/machine_id、不带 redirect_uri）
         """
-        cfg = get_realm_config(realm)
+        cfg = realm_config_for(realm, vpc)
         verifier, challenge = _make_pkce()
         nonce = uuid.uuid4().hex if not cfg["nonce_dashed"] else str(uuid.uuid4())
         q = {
@@ -4810,7 +4905,7 @@ class AccountPool(object):
             q["redirect_uri"] = cfg["redirect_uri"]
         if cfg.get("send_client_id"):
             q["client_id"] = cfg["client_id"]
-            q["machine_id"] = self._local_machine_id(realm)
+            q["machine_id"] = self._local_machine_id(realm, vpc)
         auth_url = cfg["website"] + "/device/selectAccounts?" + urllib.parse.urlencode(q)
         state = "qd-%d" % time.time_ns()
         with self._lock:
@@ -4820,9 +4915,11 @@ class AccountPool(object):
                 "nonce": nonce,
                 "region": realm,
                 "platform": platform,
+                "endpoint_config": dict(cfg),
+                "vpc_override": normalize_vpc_override(vpc),
             }
         return {"state": state, "authUrl": auth_url, "realm": realm,
-                "platform": platform}
+                "platform": platform, "vpcEndpoint": cfg.get("vpc_instance", "")}
 
     def poll_login(self, state):
         state = str(state or "").strip()
@@ -4836,7 +4933,7 @@ class AccountPool(object):
                 self.logins.pop(state, None)
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("region") or "cn"
-        cfg = get_realm_config(realm)
+        cfg = info.get("endpoint_config") or get_realm_config(realm)
         q = urllib.parse.urlencode({
             "nonce": info["nonce"],
             "verifier": info["verifier"],
@@ -4905,6 +5002,7 @@ class AccountPool(object):
             "nickname": nickname or ("u" + (uid[-8:] if uid else "")),
             "domain": cfg["domain"],
             "realm": realm,
+            "vpcEndpoint": info.get("vpc_override"),
             "platform": info.get("platform") or "CLI",
             "accessToken": token,
             "refreshToken": data.get("refresh_token") or "",
@@ -4915,8 +5013,10 @@ class AccountPool(object):
             "organizationId": org_id,
             "organizationName": org_name,
         })
-        self.add(account)
         with self._lock:
+            if self.logins.get(state) is not info:
+                return {"status": "cancelled", "message": "login was cancelled"}
+            self.add(account)
             self.logins.pop(state, None)
         return {"status": "ok", "account": account.public()}
 
@@ -4925,45 +5025,26 @@ class AccountPool(object):
             return self.logins.pop(state, None) is not None
 
     # -- PAT 导入 ----------------------------------------------------------
-    def import_pat(self, pat, realm="cn", enterprise_domain=""):
-        """导入 pt- 个人访问令牌：交换 jobToken 并拉取身份后入库。
-
-        enterprise_domain 非空 = 企业私有化（VPC）实例（实例名或域名均可）：
-        兑换与 userinfo 只走 {instance}-openapi.vpc.qoder.com.cn，realm 恒为 cn；
-        **绝不对公共域名回退**（企业 PAT 在公共域无效，回退既误导排障，也把
-        凭据发到错误的区域）。失败信息统一包装为含企业 host 的 RuntimeError。
-        """
+    def import_pat(self, pat, realm="cn", vpc=None):
+        """导入 pt- 个人访问令牌：交换 jobToken 并拉取身份后入库。"""
         pat = str(pat or "").strip()
         if not pat.startswith("pt-"):
             raise ValueError("PAT must start with pt-")
-        instance = ""
-        if str(enterprise_domain or "").strip():
-            # 归一化失败 -> ValueError（中文消息）原样上抛，路由层回 400 且不落库
-            instance = normalize_vpc_domain(enterprise_domain)
-            realm = "cn"       # VPC 仅 CN 域
-        cfg = get_realm_config(realm)
-        base = enterprise_origins(instance)["openapi"] if instance else cfg["openapi"]
-        try:
-            data = http_json(base + PATH_JOB_EXCHANGE,
-                             data=json.dumps({"personal_token": pat}).encode(),
-                             method="POST",
-                             headers={"Content-Type": "application/json",
-                                      "Accept": "application/json",
-                                      "User-Agent": cfg.get("ua") or CLIENT_UA},
-                             timeout=30)
-            token = data.get("token") or ""
-        except Exception as exc:
-            if instance:
-                raise RuntimeError("企业版 PAT 验证失败 (%s): %s" % (base, exc))
-            raise
+        cfg = realm_config_for(realm, vpc)
+        endpoint_scope = _VpcEndpointScope(cfg)  # retain until exchange and save finish
+        data = http_json(cfg["openapi"] + PATH_JOB_EXCHANGE,
+                         data=json.dumps({"personal_token": pat}).encode(),
+                         method="POST",
+                         headers={"Content-Type": "application/json",
+                                  "Accept": "application/json",
+                                  "User-Agent": cfg.get("ua") or CLIENT_UA},
+                         timeout=30)
+        token = data.get("token") or ""
         if not token:
-            if instance:
-                raise RuntimeError("企业版 PAT 验证失败 (%s): "
-                                   "jobToken exchange returned no token" % base)
             raise ValueError("jobToken exchange returned no token")
         uid, nickname, user_type, org_id, org_name = "", "", DEFAULT_USER_TYPE, "", ""
         try:
-            ui = http_json(base + PATH_USERINFO, method="GET",
+            ui = http_json(cfg["openapi"] + PATH_USERINFO, method="GET",
                            headers={"Accept": "application/json",
                                     "User-Agent": cfg.get("ua") or CLIENT_UA,
                                     "Authorization": "Bearer " + token},
@@ -4975,12 +5056,16 @@ class AccountPool(object):
             org_name = str(ui.get("organization_name") or ui.get("organizationName") or "")
         except Exception:
             pass
-        exp = _job_expiry(data)
+        if data.get("expires_in"):
+            exp = int(time.time() + int(data["expires_in"]) / 1000)
+        else:
+            exp = int(time.time()) + 24 * 3600
         account = Account({
             "uid": uid or ("p-" + uuid.uuid4().hex[:24]),
             "nickname": nickname or ("u" + (uid[-8:] if uid else uid[:8])),
             "domain": cfg["domain"],
             "realm": realm,
+            "vpcEndpoint": normalize_vpc_override(vpc),
             "platform": "CLI",
             "accessToken": token,
             "refreshToken": data.get("refresh_token") or "",
@@ -4991,7 +5076,6 @@ class AccountPool(object):
             "userType": user_type,
             "organizationId": org_id,
             "organizationName": org_name,
-            "enterpriseDomain": instance,
         })
         self.add(account)
         return account
@@ -5072,6 +5156,29 @@ def _load_cli_user(realm, path, machine_key):
     return json.loads(pt.decode("utf-8"))
 
 
+def _scan_cli_auth_dirs(realm):
+    """Only public and explicitly configured instance paths, never all home dirs."""
+    directories = list(cli_auth_dirs(realm))
+    pool = globals().get("_ACTIVE_POOL")
+    if realm == "cn" and pool is not None:
+        with pool._lock:
+            instances = {a.vpc_endpoint for a in pool.accounts
+                         if a.realm == "cn" and a.vpc_endpoint}
+        for instance in sorted(instances):
+            for directory in cli_auth_dirs(realm, instance):
+                if directory not in directories:
+                    directories.append(directory)
+    return directories
+
+
+def _cli_path_vpc(realm, directory):
+    root = os.path.join(os.path.expanduser("~"), get_realm_config(realm)["home_dir"])
+    relative = Path(os.path.relpath(directory, root)).parts
+    if realm == "cn" and len(relative) == 3 and relative[0] == ".vpc" and relative[2] == ".auth":
+        return normalize_vpc_override(relative[1])
+    return None
+
+
 def scan_desktop_credentials():
     """只读探测本机双区已登录凭证。返回候选列表（不含任何明文令牌）。"""
     found = []
@@ -5120,9 +5227,12 @@ def scan_desktop_credentials():
             item["error"] = str(exc)
         found.append(item)
 
-        # 2) CLI 端 user / user.{profile}
-        auth_dir = os.path.join(os.path.expanduser("~"), cfg["home_dir"], ".auth")
-        if os.path.isdir(auth_dir):
+        # 2) CLI 端 user / user.{profile}（含 VPC 实例专属目录）
+        for auth_dir in _scan_cli_auth_dirs(realm):
+            if not os.path.isdir(auth_dir):
+                continue
+            path_vpc = _cli_path_vpc(realm, auth_dir)
+            cli_cfg = realm_config_for(realm, path_vpc)
             machine_key = ""
             try:
                 with open(os.path.join(auth_dir, "machine_id"),
@@ -5143,7 +5253,8 @@ def scan_desktop_credentials():
                     "file": n,
                     "realm": realm,
                     "realmName": cfg["name"],
-                    "domain": cfg["domain"],
+                    "domain": cli_cfg["domain"],
+                    "vpcEndpoint": path_vpc,
                     "readable": False,
                     "valid": False,
                     "uid": "",
@@ -5195,10 +5306,14 @@ def import_desktop_credential(path=None, realm=None):
             break
     if target_realm not in REALM_CONFIGS:
         target_realm = "cn"
-    cfg = get_realm_config(target_realm)
+    imported_vpc = matched.get("vpcEndpoint") if matched else _cli_path_vpc(
+        target_realm, os.path.dirname(path))
+    cfg = realm_config_for(target_realm, imported_vpc)
 
     token = refresh = ""
     uid = nickname = ""
+    user_type = DEFAULT_USER_TYPE
+    org_id = org_name = ""
     exp = 0
     base = os.path.basename(path)
     if base == "auth.v1.dat":
@@ -5208,6 +5323,12 @@ def import_desktop_credential(path=None, realm=None):
         user = data.get("user") or {}
         uid = str(user.get("id") or "")
         nickname = str(user.get("name") or "")
+        user_type = (str(user.get("user_type") or user.get("userType") or "")
+                     or DEFAULT_USER_TYPE)
+        org_id = str(user.get("organization_id")
+                     or user.get("organizationId") or "")
+        org_name = str(user.get("organization_name")
+                       or user.get("organizationName") or "")
         try:
             import datetime
             exp = int(datetime.datetime.strptime(
@@ -5229,6 +5350,12 @@ def import_desktop_credential(path=None, realm=None):
         refresh = str(data.get("refresh_token") or "")
         uid = str(data.get("uid") or "")
         nickname = str(data.get("name") or "")
+        user_type = (str(data.get("user_type") or data.get("userType") or "")
+                     or DEFAULT_USER_TYPE)
+        org_id = str(data.get("organization_id")
+                     or data.get("organizationId") or "")
+        org_name = str(data.get("organization_name")
+                       or data.get("organizationName") or "")
         exp = normalize_epoch(data.get("expire_time"))
 
     if not token:
@@ -5240,12 +5367,16 @@ def import_desktop_credential(path=None, realm=None):
         "nickname": nickname or uid[:8],
         "domain": cfg["domain"],
         "realm": target_realm,
+        "vpcEndpoint": imported_vpc,
         "platform": "CLI",
         "accessToken": token,
         "refreshToken": refresh,
         "expiresAt": exp or (int(time.time()) + 30 * 86400),
         "source": "desktop-app",
         "enabled": True,
+        "userType": user_type,
+        "organizationId": org_id,
+        "organizationName": org_name,
     })
     return add_to_pool(account)
 
@@ -5344,12 +5475,16 @@ def normalise_import_row(row, realm=None, group=None):
     detected = str(realm or pick("realm") or "").strip().lower()
     if detected not in ("cn", "intl"):
         detected = detect_realm_from_domain(pick("domain"))
-    # 企业 VPC 实例（归一化实例名；非法值该行 ValueError 拒收）；带域名恒为 cn
-    ent_raw = str(pick("enterpriseDomain") or "").strip()
-    enterprise = normalize_vpc_domain(ent_raw) if ent_raw else ""
-    if enterprise:
-        detected = "cn"
-    cfg = get_realm_config(detected)
+    endpoint = None
+    for layer in (row, auth, profile):
+        if isinstance(layer, dict) and "vpcEndpoint" in layer:
+            endpoint = normalize_vpc_override(layer["vpcEndpoint"])
+            break
+    else:
+        domain = str(pick("domain") or "")
+        if detected == "cn" and domain.lower().endswith("." + VPC_DOMAIN_SUFFIX):
+            endpoint = normalize_vpc_override(domain)
+    cfg = realm_config_for(detected, endpoint)
     raw_uid = str(pick("uid") or "").strip()
     uid = re.sub(r"[^A-Za-z0-9_-]", "_", raw_uid).strip("_ ")
     if not uid:
@@ -5366,8 +5501,9 @@ def normalise_import_row(row, realm=None, group=None):
         "uid": uid,
         "nickname": str(pick("nickname") or ""),
         "group": str(group if group is not None else pick("group") or "").strip(),
-        "domain": str(pick("domain") or cfg["domain"]),
+        "domain": cfg["domain"],
         "realm": detected,
+        "vpcEndpoint": endpoint,
         "platform": str(pick("platform") or "CLI"),
         "accessToken": token,
         "refreshToken": str(pick("refreshToken") or ""),
@@ -5378,7 +5514,6 @@ def normalise_import_row(row, realm=None, group=None):
         "userType": str(pick("userType") or "") or DEFAULT_USER_TYPE,
         "organizationId": str(pick("organizationId") or ""),
         "organizationName": str(pick("organizationName") or ""),
-        "enterpriseDomain": enterprise,
         "lastError": "",
         "cooldownUntil": 0.0,
     }

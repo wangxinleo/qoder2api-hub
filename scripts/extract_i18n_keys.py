@@ -229,17 +229,17 @@ def find_acorn_root(root):
         Path(__file__).resolve().parent,  # scripts/
         root,  # project root
     ]
-
+    
     # Check local paths first
     for c in candidates:
         if (c / 'node_modules' / 'acorn' / 'package.json').is_file():
             return c
-
+    
     # Check global node_modules
     global_nm = find_global_node_modules()
     if global_nm and (global_nm / 'acorn' / 'package.json').is_file():
         return global_nm.parent  # return parent so NODE_PATH works
-
+    
     return None
 
 

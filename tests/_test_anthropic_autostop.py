@@ -78,35 +78,22 @@ with mock.patch.object(socket.socket, 'connect', local_only), mock.patch.object(
         conn.close()
         return status, raw
     try:
-        # fork 契约（v1.5.6）：半截 JSON 数组整块吞掉、正常结束（issue #9），
-        # 只有纯 marker 空壳才 fail-closed；伪 Bash 调用（协议残片）仍必须报错。
-        for text, label, must_error in ((PARTIAL, '截断数组', False),
-                                        (NAMED, '伪 Bash 调用', True)):
+        for text, label in ((PARTIAL, '截断数组'), (NAMED, '伪 Bash 调用')):
             for size in (1, 7, len(text)):
                 CURRENT.update(text=text, size=size)
                 status, raw = post(True)
                 evs = events(raw)
-                if must_error:
-                    check(label + '：流式必须报错，不能正常 message_stop，分片=%d' % size,
-                          any(e.get('type') == 'error' for e in evs) and not any(e.get('type') == 'message_stop' for e in evs), raw[-250:])
-                    status, raw = post(False)
-                    check(label + '：非流式必须 502，分片=%d' % size, status == 502, (status, raw[-250:]))
-                else:
-                    check(label + '：流式整块吞掉、正常 message_stop、零泄漏，分片=%d' % size,
-                          status == 200 and events(raw)[-1]['type'] == 'message_stop'
-                          and not any(e.get('type') == 'error' for e in evs)
-                          and '请求调用工具' not in raw.decode('utf-8', 'replace'), raw[-250:])
-                    status, raw = post(False)
-                    check(label + '：非流式整块吞掉、HTTP 200、零泄漏，分片=%d' % size,
-                          status == 200 and '请求调用工具' not in raw.decode('utf-8', 'replace'), (status, raw[-250:]))
+                check(label + '：流式必须报错，不能正常 message_stop，分片=%d' % size,
+                      any(e.get('type') == 'error' for e in evs) and not any(e.get('type') == 'message_stop' for e in evs), raw[-250:])
+                status, raw = post(False)
+                check(label + '：非流式必须 502，分片=%d' % size, status == 502, (status, raw[-250:]))
         CURRENT.update(text=GOOD, size=3)
         status, raw = post(True)
         evs = events(raw)
         args = ''.join(e['delta']['partial_json'] for e in evs if e.get('type') == 'content_block_delta' and e['delta']['type'] == 'input_json_delta')
         check('完整双重编码工具仍正常恢复对象', status == 200 and json.loads(args) == ARGS)
         check('真实工具返回 tool_use，随后 message_stop', evs[-2]['delta']['stop_reason'] == 'tool_use' and evs[-1]['type'] == 'message_stop')
-        # fork 契约：INTL 默认结构化关闭（CN 才是全模型结构化），需显式 REALMS=cn,intl。
-        check('国际区 Anthropic 路由默认文本化（fork 契约）', CURRENT['requests'][-1].get('_qd_structured') is False, CURRENT['requests'][-1].get('_qd_structured'))
+        check('真实国际区 Anthropic 路由启用结构化历史', CURRENT['requests'][-1].get('_qd_structured') is True, CURRENT['requests'][-1].get('_qd_structured'))
         for plain in ('这是普通回复。', '格式示例：\n```text\n[Bash 工具调用]\n{"command":"echo demo"}\n```', '[Undeclared 工具调用]\n{"x":1}'):
             CURRENT.update(text=plain, size=2)
             status, raw = post(True)

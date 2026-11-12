@@ -24,8 +24,7 @@ import threading
 import time
 import urllib.request
 
-# fork 版本线：只从本 fork 的 release 拉取，避免一键更新把代码覆盖回上游。
-REPO = "wangxinleo/qoder2api-hub"
+REPO = "shuishuipingan/qoder2api-hub"
 TARBALL_URL = "https://github.com/%s/archive/refs/tags/%s.tar.gz" % (REPO, "%s")
 
 PROTECTED_TOP = {

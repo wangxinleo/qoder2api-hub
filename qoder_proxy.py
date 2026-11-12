@@ -68,10 +68,10 @@ import qoder_updater
 import qoder_webtools
 from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import (get_realm_config, gateway_candidates,
-                            gateway_candidates_for, local_vm_status)
+                            local_vm_status)
 from pathlib import Path
 
-VERSION = "1.9.4-wangxinleo"
+VERSION = "1.9.7-wangxinleo"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -119,6 +119,19 @@ _FAKEIP_NETS = [
     ipaddress.ip_network("2001:2::/48"),
     ipaddress.ip_network("fdfe:dcba:9876::/48"),
 ]
+# 与 qoder_accounts 同款：macOS 的 getaddrinfo 会同时返回 IPv4 与
+# IPv4-translated IPv6（::ffff:0:c612:2d），需要按内嵌 IPv4 识别 fake-IP。
+_FAKEIP_V4_TRANSLATED = ipaddress.ip_network("::ffff:0:0:0/96")
+
+
+def _is_fake_ip(ip):
+    candidates = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            candidates.append(ip.ipv4_mapped)
+        elif ip in _FAKEIP_V4_TRANSLATED:
+            candidates.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return any(addr in net for addr in candidates for net in _FAKEIP_NETS)
 
 
 def _host_boundary_violation(ip, allow_local):
@@ -145,6 +158,10 @@ def validate_public_http_url(url, allow_local=False):
     host = (parsed.hostname or "").strip().strip("[]").lower()
     if not host:
         raise ValueError("URL host is required")
+    # 企业 VPC 专属域通常解析到公司内网；只放行 QD_CN_VPC_ENDPOINT
+    # 推导出的固定主机，普通公网 URL 的校验逻辑保持不变。
+    if qoder_accounts.is_configured_vpc_host(host):
+        return url
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
         if not allow_local:
             raise ValueError("requests to localhost are not allowed")
@@ -170,7 +187,7 @@ def validate_public_http_url(url, allow_local=False):
             addrs.append(ipaddress.ip_address(addr))
         except ValueError:
             raise ValueError("URL host resolved to a non-IP address: %r" % addr)
-    if addrs and all(any(ip in net for net in _FAKEIP_NETS) for ip in addrs):
+    if addrs and all(_is_fake_ip(ip) for ip in addrs):
         return url  # fake-IP DNS：真实 IP 不可见，名称级校验已通过
     for ip in addrs:
         if _host_boundary_violation(ip, allow_local):
@@ -3128,7 +3145,6 @@ def read_dynamic_models(realm=None):
 
     主机按官方的候选顺序尝试（国际版 api1 → api2 → api3）：切换主机不影响
     签名（签名只覆盖 path），单个域名故障不再导致模型清单整体拉取失败。
-    企业 VPC 账号只有单一 gateway host（无 api2/api3 类回退）。
     """
     r = realm or CURRENT_REALM
     account = POOL.pick(realm=r) if POOL else None
@@ -3137,7 +3153,7 @@ def read_dynamic_models(realm=None):
     # 签名以 qoder_encode("{}") 作为 body 参与 MD5；请求同样携带该 body。
     sign_body = qoder_encode(b"{}")
     payload = None
-    for host in gateway_candidates_for(account):
+    for host in gateway_candidates(r, qoder_accounts.account_realm_config(account)):
         raw_url = host + MODELS_PATH
         try:
             sess = SESSIONS.get(account)
@@ -3146,7 +3162,10 @@ def read_dynamic_models(realm=None):
             url = validate_public_http_url(raw_url)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            opener = (qoder_accounts._opener_for_request().open
+                      if qoder_accounts.account_realm_config(account).get("vpc_instance")
+                      else urllib.request.urlopen)
+            with opener(req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             break
         except Exception as exc:
@@ -4285,6 +4304,19 @@ def _dsml_tail_holdable(tail):
     return s == "<"
 
 
+# issue #37：回声块**外层数组合法、内层 arguments 非法**（未转义换行/引号、
+# 截断、尾部多余文本、非法转义）。这种块能确定是工具协议回声（marker + 数组 +
+# 已声明的工具名），只是参数坏了——绝不能当正文放出去（协议泄漏），也不能
+# 伪造一个可执行调用（会写坏文件）。统一替换为一句明确的失败说明。
+BAD_ARGS_NOTICE = ("（上游返回的工具调用参数不是合法 JSON，网关已丢弃该调用，"
+                   "未执行任何工具；请重试。）")
+
+# issue #37（fail-closed）：错误详情是**固定串**——它会写进日志与客户端响应，
+# 绝不能把实际参数、路径或正文带出去。
+BAD_ARGS_ERROR_DETAIL = ("upstream tool-call echo contains invalid JSON "
+                         "arguments; no tools were emitted")
+
+
 # issue #49 方向 C 的节流状态：一分钟最多一条 WARN，其余只计数——
 # 形态3（54 组空壳）一次会话就能刷出几十条，不节流会把日志淹掉。
 _LEAK_WARN_STATE = {"last": 0.0, "suppressed": 0, "total": 0}
@@ -4327,6 +4359,20 @@ EMPTY_ECHO_ERROR_DETAIL = (
     "the turn was failed on purpose so the client retries instead of "
     "silently treating the task as finished (issue #72)"
 )
+
+
+def _echo_names_declared(text, allowed_names):
+    """回声里出现的工具名**全部**在本次声明集合里（issue #72 收紧判据）。
+
+    只按「声明了 tools」就 fail-closed 太宽：模型复述**未声明**工具时我们本来就
+    恢复不了（#27），把它判成失败会误伤一批正常回合。
+    """
+    if not allowed_names:
+        return False
+    names = re.findall(r'"name"\s*:\s*"([^"]{1,120})"', str(text or ""))
+    if not names:
+        return False
+    return all(n in allowed_names for n in names)
 
 
 def _marker_only_echo(text):
@@ -4379,22 +4425,6 @@ _LEAK_TAG_RE = re.compile(r"<\s*/?\s*[A-Za-z_][\w:.-]*\s*/?\s*>")
 _DSML_TOKEN_RE = re.compile(r"<[^<>]{0,4}DSML|DSML[^<>]{0,4}>|｜DSML｜")
 
 
-def _leak_array_echo_candidate(text):
-    """marker 之后是否进入 JSON 数组/对象回声（而非散落的协议标签）。
-
-    上游 #120 的 fail-closed 只应覆盖「认不出的协议残片」；fork 自 v1.5.6 起
-    对「marker + 数组回声」的未闭合/非法形态走 droppable / fail-open 链
-    （_test_echo_recovery [9]、_test_echo_salvage_fork [8]）。两者用 marker
-    之后是否以 JSON 容器开头区分，避免上游守卫覆盖 fork 语义。
-    """
-    state, body = _leak_body_offset(text or "")
-    if state != "body":
-        return False
-    rest = _strip_dsml_tail(body or "").lstrip()
-    rest = rest.lstrip(chr(34) + chr(39) + ">=: ]").lstrip()
-    return rest[:1] in ("[", "{")
-
-
 def _dsml_residue_present(text):
     """有 DSML 协议令牌或别的协议结构 —— **不要求出现 LEAK_MARKER**。
 
@@ -4429,10 +4459,6 @@ def _residue_text_only(text):
     t = str(text or "")
     if not t or _leak_garbage_only(t):
         return False
-    if _marker_only_echo(t):
-        # 孤立 marker 同样没有信息量：fork 的 hold 切分可能把它与后续 DSML
-        # 残片分开，回读成功后只剩这一个标记，不能当正文补发。
-        return True
     return bool(_leak_residue_present(t) or _dsml_residue_present(t))
 
 
@@ -4484,23 +4510,28 @@ if TOOL_ECHO_MODE not in ("strict", "lenient"):
 
 
 class InvalidToolArguments(UpstreamStatus):
-    """Fail-closed 协议错误的分类基类（issue #72）。
+    """已确认是工具协议回声，但内层 arguments 不是合法 JSON（issue #37）。
 
-    本 fork 对坏参数仍走 partial salvage，不会在坏参数路径上抛本类；
-    保留它是为了让 EmptyToolEcho 复用上游的四出口 / 重试 / 冷却分类。
+    fail-closed：不泄漏协议文本、不伪造可执行调用，也**不伪装成成功结束**。
+    抛到上层后由各协议的错误出口转成明确失败：
+      · chat 流式   -> data: {"error": ...} + [DONE]（不再发正常 finish）
+      · Responses   -> response.failed（不再发 response.completed）
+      · Anthropic   -> event: error（不再发 message_stop）
+      · 非流式      -> HTTP 502 + 标准错误信封
+    重试与账号冷却入口都显式排除本异常（见 should_retry_envelope /
+    _handle_envelope_account_cooldown）：它不是账号问题，也不该自动重发收费请求。
     """
-    pass
+
+    def __init__(self):
+        super(InvalidToolArguments, self).__init__(502, BAD_ARGS_ERROR_DETAIL)
 
 
 class EmptyToolEcho(InvalidToolArguments):
     """模型本轮只吐了工具协议回声、没有可用调用（issue #72）。
 
-    四条协议出口通过既有 UpstreamStatus 处理，转成明确失败而不是正常 stop：
-      · chat 流式   -> data: {"error": ...} + [DONE]
-      · Responses   -> response.failed
-      · Anthropic   -> event: error
-      · 非流式      -> HTTP 502 + 标准错误信封
-    重试与账号冷却入口显式排除本异常，避免重复计费或误冷却健康账号。
+    继承 InvalidToolArguments：四条协议出口（chat 流式 / Responses / Anthropic /
+    非流式 502）已经统一按 fail-closed 处理，重试与账号冷却入口也显式排除。
+    区别只是错误文案——告诉客户端「这是残缺回声，请重试」，而不是让它误判完成。
     """
 
     def __init__(self, chars=0, kind="marker_only"):
@@ -4618,21 +4649,9 @@ _MARKER_HOLD_WINDOW = max(len(LEAK_MARKER), len(LEAK_MARKER_ALT),
 # issue #16 兜底：hold 缓冲上限。正常文本长期"看起来仍是候选"时（模型写超长
 # JSON/正则示例），hold 会持续增长 -> 内存与首字延迟风险。超限即 fail-open
 # 放行并记一条 WARN：宁可漏一次，也不无限压住客户端。
-# issue #36 后续：帧上限只防**空转**（连续空帧不增长），有增长的合法回声块
-# （每帧 1 字符也会推进长度）交给字符上限兜底——否则 201 字符的合法块在
-# 1 字符/帧下会在 200 帧处被误伤 fail-open。
 _HOLD_MAX_CHARS = 32768            # 32KB（真实回声块远小于此；见档案 §13）
 _HOLD_MAX_FRAMES = 200             # 连续空转帧上限（帧不增长才算一帧）
 
-
-# ---------------------------------------------------------------------------
-# DSML 收尾残留清理（2026-10-15）
-# ---------------------------------------------------------------------------
-# 上游在「marker + JSON 数组」回声块尾部偶尔附带 DSML 闭标签
-# （</｜｜DSML｜｜ parameter> / invoke / calls），且沿用细粒度帧下发，标签会被
-# 切成任意前缀。这些标签不属于正文：候选判定与终局还原前先剔除，否则标签到达
-# 的瞬间会把回声块误证伪 -> fail-open 放行原始协议文本（客户端可见泄漏）。
-_DSML_SUFFIX_RE = re.compile(r"(?:\s*" + TAG_START + r">)+\s*$")
 
 _ECHO_LOOSE_RE = re.compile(
     r'^\[\s*\{\s*"name"\s*:\s*"([^"]{1,200})"\s*,\s*"arguments"\s*:\s*"(.*)"\s*\}\s*\]$',
@@ -4933,40 +4952,18 @@ def parse_tool_call_tags(text, allowed_names=None):
     return calls, out.strip()
 
 
-def _strip_dsml_tail(text):
-    """剥掉文本**尾部**的 DSML 残留（完整标签后缀 + 「写作中」前缀），直到稳定。
+def parse_leaked_tool_calls(text, allowed_names=None):
+    """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
 
-    只处理后缀：避免误删 JSON 字符串字面量里出现的 DSML 形态文本。
-    跨帧切分时残留可能是任意形态：`</｜`、`</｜｜DS`、`</｜｜DSML｜｜ calls>`
-    或「完整标签 + 未写完前缀」的混合；循环处理直到不再变化。
+    严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
+      1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
+      2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
+      3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
+
+    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为空串
+    （整段都是该块）；未识别时原样返回 text。
     """
-    t = text or ""
-    while True:
-        t2 = _DSML_SUFFIX_RE.sub("", t)
-        i = t2.rfind("<")
-        if i >= 0:
-            tail = t2[i:]
-            if ">" not in tail and ("DSML" in tail or "｜" in tail
-                                    or "|" in tail
-                                    or set(tail) <= set("</|｜")):
-                t2 = t2[:i]
-        if t2 == t:
-            return t
-        t = t2
-
-
-def _leak_echo_array(text):
-    """归一化「marker + JSON 数组」，返回 (arr, prefix) 或 None。
-
-    与 #49 语义一致：取最后一个 marker、跳过连续重复 marker、剥围栏/DSML 尾；
-    只校验外层数组可解析，不校验条目。条目校验由 parse / salvage 各自完成，
-    确保判据层只有这一份归一化副本。
-    """
-    raw = text or ""
-    # 保留 hold 开头的空白：1 字符/帧时 marker 前的换行会先进入 hold，
-    # strip() 后再取 prefix 会把这些正文空白丢掉。
-    leading = raw[:len(raw) - len(raw.lstrip())]
-    t = raw.strip()
+    t = (text or "").strip()
     # issue #36 follow-up: normalize the angle-bracket marker variant.
     t = _normalize_leak_marker(t)
     # issue #36：整段解析前先剥尾部 DSML 闭合标签残片。
@@ -4978,7 +4975,7 @@ def _leak_echo_array(text):
             inner = inner[4:]
         t = inner[:-3].strip()
     # issue #49：模型在长会话里会写成「散文 + marker + marker + 数组 + DSML 尾」。
-    # 取**最后一个** marker 起算（前面散文作为 prefix 返回，由调用方补发），
+    # 取**最后一个** marker 起算（前面散文作为 clean 返回，由调用方补发），
     # 再剥掉连续重复的 marker 与尾部围栏——这些都不放松后面的严格校验。
     # issue #51：截图里出现「闭标签 + 数组」（无 marker）与「marker + 杂字 + 数组」。
     # 先剥掉前导的 DSML 闭合标签，再决定起点。
@@ -4992,14 +4989,9 @@ def _leak_echo_array(text):
             t = LEAK_MARKER + chr(10) + t     # 复用同一套解析路径
             _mpos, _mend = 0, len(LEAK_MARKER)
         else:
-            return None
-    # 前缀里残留的任何 marker 变体都不能当正文发给客户端；普通散文的
-    # 原始空白（含跨帧暂存的换行）必须原样保留，否则 1 字符/帧时正文会少掉尾随换行。
-    prefix = _LEAK_MARKER_RE.sub("", t[:_mpos])
-    for _mk in (LEAK_MARKER, LEAK_MARKER_ALT):
-        while prefix.rstrip().endswith(_mk):
-            prefix = prefix.rstrip()[:-len(_mk)]
-    prefix = leading + prefix
+            return None, text
+    # 前缀里残留的任何 marker 变体都不能当正文发给客户端。
+    prefix = _LEAK_MARKER_RE.sub("", t[:_mpos]).rstrip()
     t = t[_mend:]
     while True:
         _m = _LEAK_MARKER_RE.match(t.lstrip())
@@ -5022,113 +5014,51 @@ def _leak_echo_array(text):
                 json.loads(_cand)
                 rest = _cand
             except Exception:
-                return None
+                return None, text
         else:
-            return None
+            return None, text
     try:
         arr = json.loads(rest)
     except Exception:
         # issue #60：内层引号未转义时外层也非法——按单调用形态抢救一次
         arr = _salvage_echo_array(rest)
         if arr is None:
-            return None
-    if not isinstance(arr, list):
-        return None
-    return arr, prefix
-
-
-def parse_leaked_tool_calls(text, allowed_names=None):
-    """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
-
-    严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
-      1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
-      2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
-      3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
-
-    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为最后一个 marker
-    之前的散文前缀（通常为空串）；未识别时原样返回 text。任一条目不合法即整体
-    失败；部分挽救见 salvage_leaked_tool_calls。
-    """
-    parsed = _leak_echo_array(text)
-    if parsed is None:
-        return None, text
-    arr, prefix = parsed
-    if not arr:
+            return None, text
+    if not isinstance(arr, list) or not arr:
         return None, text
     calls = []
     for item in arr:
-        call, _reason = _leaked_item_to_call(item, allowed_names)
-        if call is None:
+        if not isinstance(item, dict):
             return None, text
-        calls.append(call)
-    return calls, prefix
-
-
-def _leaked_item_to_call(item, allowed_names=None):
-    """逐条目校验并归一为一条结构化 call（parse 的唯一判据副本）。
-
-    返回 (call|None, reason)：reason 取值 not-dict / bad-name / bad-args-type /
-    args-not-json / undeclared-name（供审计日志；parse 只用 call，任一条目失败
-    即整体拒绝）。校验顺序与历史实现一致：dict -> name -> arguments 形态/合法性
-    -> 声明集合。
-    """
-    if not isinstance(item, dict):
-        return None, "not-dict"
-    name = item.get("name")
-    args = item.get("arguments")
-    if not isinstance(name, str) or not name.strip():
-        return None, "bad-name"
-    if isinstance(args, (dict, list)):
-        args = json.dumps(args, ensure_ascii=False)
-    if not isinstance(args, str):
-        return None, "bad-args-type"
-    if args.strip():
-        try:
-            json.loads(args)
-        except Exception:
-            _fixed = _repair_args_json(args)
-            if _fixed is None:
-                return None, "args-not-json"
-            args = _fixed
+        name = item.get("name")
+        args = item.get("arguments")
+        if not isinstance(name, str) or not name.strip():
+            return None, text
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args, ensure_ascii=False)
+        if not isinstance(args, str):
+            return None, text
+        if args.strip():
             try:
-                RECOVERY_STATS["args_repaired"] = \
-                    RECOVERY_STATS.get("args_repaired", 0) + 1
+                json.loads(args)
             except Exception:
-                pass
-    if allowed_names and name.strip() not in allowed_names:
-        return None, "undeclared-name"
-    return {
-        "id": _new_id("call_"),
-        "type": "function",
-        "function": {"name": name.strip(), "arguments": args},
-    }, ""
-
-
-def salvage_leaked_tool_calls(text, allowed_names=None):
-    """部分挽救：外层数组可解析时，保留合法条目、丢弃坏条目。
-
-    返回 (calls, dropped, prefix) | None：
-      - None：不是可识别的 marker + JSON 数组（回落既有 droppable/fail-open 链）；
-      - calls=[]：识别到回声但 0 个合法条目（含空数组）——调用方整块吞掉，
-        只补发 prefix、正常结束，不泄漏、不报错；
-      - calls 非空：calls 为合法条目，dropped 为 [(idx, reason)]，
-        prefix 为 marker 前散文。
-
-    不做损坏修复（丢弃而非猜测）；条目校验与 parse 共用 `_leaked_item_to_call`
-    （判据层唯一副本纪律，见 spec leak-recovery-guards）。
-    """
-    parsed = _leak_echo_array(text)
-    if parsed is None:
-        return None
-    arr, prefix = parsed
-    calls, dropped = [], []
-    for idx, item in enumerate(arr):
-        call, reason = _leaked_item_to_call(item, allowed_names)
-        if call is not None:
-            calls.append(call)
-        else:
-            dropped.append((idx, reason))
-    return calls, dropped, prefix
+                _fixed = _repair_args_json(args)
+                if _fixed is None:
+                    return None, text
+                args = _fixed
+                try:
+                    RECOVERY_STATS["args_repaired"] =                         RECOVERY_STATS.get("args_repaired", 0) + 1
+                except Exception:
+                    pass
+        calls.append({
+            "id": _new_id("call_"),
+            "type": "function",
+            "function": {"name": name.strip(), "arguments": args},
+        })
+    if allowed_names:
+        if not all(c["function"]["name"] in allowed_names for c in calls):
+            return None, text
+    return calls, prefix
 
 
 def _leak_body_offset(text):
@@ -5348,21 +5278,13 @@ def _tool_tag_candidate(text):
 
 
 def _still_leak_candidate(text):
-    """整段文本目前是否仍是「marker + JSON 数组」候选？（流式暂存判定用）
-
-    与 _json_array_prefix_ok 的「能否继续扩展成合法数组」不同：数组体已出现
-    **结构性非法**（解析不可能再成功，如模型复述时破坏内层转义）时也返回 True
-    —— 保持 hold，把最终处置交给流末三分支（还原 / 吞掉 / 补发）。非流式同
-    形态已被 issue #9 语义吞掉（P5 修复），流式若在此处 mid-block 证伪补发，
-    就是同一个泄漏（残余 #3）。Extra data（合法数组 + 尾随散文）除外——那是
-    正文混排，维持既有「立即证伪补发」语义。
-    """
+    """整段文本目前是否仍是「marker + JSON 数组」候选？（流式暂存判定用）"""
     state, body = _leak_body_offset(text)
     if state == "pre":
         return True
     if state == "no":
         return False
-    rest = _strip_dsml_tail(body or "").lstrip()
+    rest = (body or "").lstrip()
     if not rest:
         return True
     # issue #137：伪 XML 工具调用（`<tool_call>Name {json}</tool_call>`）不是
@@ -5383,15 +5305,7 @@ def _still_leak_candidate(text):
             return True
     if rest.endswith("```"):
         rest = rest[:-3]
-    if _json_array_prefix_ok(rest):
-        return True
-    if not rest.startswith("["):
-        return False
-    try:
-        json.loads(rest)
-        return True          # 理论不可达（prefix_ok 已 True）
-    except Exception as exc:
-        return not str(exc).startswith("Extra data")
+    return _json_array_prefix_ok(rest)
 
 
 def _leaked_partial_droppable(text, allowed_names=None):
@@ -5399,16 +5313,13 @@ def _leaked_partial_droppable(text, allowed_names=None):
     非法）时，应吞掉整段而不是透传给终端用户。三个条件同时成立才吞：
       1) strip 后以 LEAK_MARKER 开头（真实散文回复几乎不会这样开头）；
       2) 本次请求声明了 tools（allowed_names 非空）——与恢复路径同前置条件；
-      3) marker 之后（剥掉围栏后）是一个**不会/无法还原成合法调用**的 JSON
-         数组文本——要么还没写完，要么已闭合但解析非法（如模型复述时把
-         arguments 的内层转义破坏掉：`"arguments": "{\"command\": "echo ...`，
-         json 错误点落在中部，_json_array_prefix_ok 判 False）。
+      3) marker 之后（剥掉围栏后）仍是 JSON 数组字面量的前缀
+         （复用现成的 _json_array_prefix_ok）——即"本该是数组，只是没写完"。
     返回 True = 应吞掉正文（输出空 content）。
 
     完整且合法的 JSON 数组不算：那种情况下恢复失败另有原因（工具名未声明 /
     arguments 非法），保持既有 fail-open 透传语义（见 _test_qoder.py 的 [27]
-    断言"未声明工具名 -> 不吞正文"）。Extra data（合法数组 + 尾随散文）也不
-    吞——尾随文本可能是有意的正文混排。
+    断言"未声明工具名 -> 不吞正文"），只有"数组本身没写完 / 非法"才吞。
     """
     if not text or not allowed_names:
         return False
@@ -5421,24 +5332,16 @@ def _leaked_partial_droppable(text, allowed_names=None):
     state, body = _leak_body_offset(t)
     if state != "body":
         return False
-    rest = _strip_dsml_tail(body or "").strip()
+    rest = (body or "").strip()
     if rest.endswith("```"):
         rest = rest[:-3].strip()
-    if not rest:
-        return True
-    if not rest.startswith("["):
+    if not _json_array_prefix_ok(rest):
         return False
     try:
         json.loads(rest)
         return False
-    except Exception as exc:
-        if str(exc).startswith("Extra data"):
-            return False
-        if rest.endswith("]"):
-            # 闭合的 ] 定稿但解析非法：文本已不可能再扩展，正是 issue #9
-            # 要吞的「非法回声」（转义被复述破坏的实测样本即此形态）。
-            return True
-        return _json_array_prefix_ok(rest)
+    except Exception:
+        return True
 
 
 def _tool_echo_head(text):
@@ -5764,6 +5667,11 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                            + json.dumps(other, ensure_ascii=False)
                            + "\n\n").encode("utf-8")
                 continue
+            # issue #37 fail-closed：块虽已「证伪」（后续还有别的字/围栏/DSML
+            # 标签），但内容足以认定是**协议回声 + 内层参数非法**时，绝不能
+            # 当正文补发——直接升级为协议错误（提前判定，不等流末）。
+            if _echo_with_bad_args(hold, allowed_names):
+                raise InvalidToolArguments()
             # issue #60 follow-up：散文 + marker 落在同一个大块时，hold 以散文开头
             # 会直接证伪——整块（含协议正文）被当正文补发。这里先把散文前缀放行，
             # 只保留 marker 起的部分继续判候选。
@@ -5791,8 +5699,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             elif (allowed_names
                     and _leak_residue_present(hold)
                     and not parse_dsml_tool_calls(hold)[0]
-                    and not _echo_names_all_undeclared(hold, allowed_names)
-                    and not _leak_array_echo_candidate(hold)):
+                    and not _echo_names_all_undeclared(hold, allowed_names)):
                 # issue #120 后续：可被 DSML 解析器还原的残片要留给下游
                 # _sse_recover_dsml（它才是 DSML 回读者），这里只拦真正还原不了的。
                 # 注意：这条分支是**流中途**判定，绝不能把 `_dsml_residue_present`
@@ -5859,36 +5766,15 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
 
     if hold is not None:
         calls, clean = parse_leaked_tool_calls(hold, allowed_names)
-        salvaged_empty = False
         if not calls and TOOL_CALL_OPEN in (hold or "").lower():
             # issue #137：伪 XML 形态（`[marker] <tool_call>Name {json}</tool_call>`）
             calls, clean = parse_tool_call_tags(hold, allowed_names)
             if calls:
                 RECOVERY_STATS["tool_tag"] = \
                     RECOVERY_STATS.get("tool_tag", 0) + 1
-        if calls is None:
-            _salv = salvage_leaked_tool_calls(hold, allowed_names)
-            if _salv is not None:
-                calls, _dropped, clean = _salv
-                if calls:
-                    log("salvaged leaked tool-call echo: %d call(s) restored, "
-                        "%d dropped (%s)"
-                        % (len(calls), len(_dropped),
-                           ", ".join("idx=%d:%s" % (i, r)
-                                     for i, r in _dropped)),
-                        level="WARN", tag="chat")
-                else:
-                    salvaged_empty = True
-                    _why = (", ".join("idx=%d:%s" % (i, r)
-                                      for i, r in _dropped)
-                            or "empty array")
-                    log("dropped all leaked tool-call echo: %s" % _why,
-                        level="WARN", tag="chat")
         if calls:
             recovered = True
             RECOVERY_STATS["leak"] = RECOVERY_STATS.get("leak", 0) + 1
-            log("recovered leaked tool-call echo (%d chars / %d frames -> %d call(s))"
-                % (len(hold), hold_frames, len(calls)), level="INFO", tag="chat")
             for i, call in enumerate(calls):
                 yield _leak_chunk_frame(meta, {"tool_calls": [{
                     "index": i,
@@ -5902,30 +5788,29 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                     % len(clean), level="WARN", tag="chat")
             elif clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
-        elif salvaged_empty:
-            # 0 合法条目：整块吞掉，只补发 marker 前散文；不泄漏、不报错。
-            if finished is not None:
-                payload, fin = finished
-                if fin == "tool_calls":
-                    finished = (payload, "stop")
-            else:
-                yield _leak_chunk_frame(meta, {}, "stop")
-            if clean:
-                yield _leak_chunk_frame(meta, {"content": clean})
+        elif _echo_with_bad_args(hold, allowed_names):
+            # issue #37（fail-closed）**必须先于 #9/#11 判定**：坏参数块的外层
+            # 数组是**完整合法**的，只是后面跟着 DSML/围栏残片——这会让
+            # _leaked_partial_droppable 误判成"截断回声"并静默吞掉（正常 stop），
+            # 既不是失败语义也不是恢复。判定互斥：真截断的数组 parse 不过，
+            # 走不到这里（仍由 #9 吞掉）。
+            # issue #37（fail-closed）：能确定是工具协议回声（marker + 合法外层
+            # 数组 + 已声明工具名），只是内层 arguments 坏了——不泄漏协议、不
+            # 伪造可执行调用，也**不以普通 stop 结束**，改为协议级失败。
+            log("tool-call echo has invalid JSON arguments (%d chars) — "
+                "failing the turn closed (issue #37)" % len(hold),
+                level="WARN", tag="chat")
+            raise InvalidToolArguments()
         elif _leaked_partial_droppable(hold, allowed_names):
             # issue #72：**不要把「残缺工具回声」当成功结束**。此前吞掉后按
             # stop 收尾，coding agent 会认为任务做完了（静默中断，比报错更难查）。
-            # fork 边界（v1.5.6）：只有「纯 marker 空壳」fail-closed；半截 JSON
-            # 数组沿用 issue #9 的丢弃 + 正常结束，避免把可继续的会话打成 502 循环。
-            if allowed_names and _marker_only_echo(hold):
-                _kind = "marker_only"
-                log("dropped truncated leaked tool-call echo (%d chars, %s, "
-                    "tools_declared=%d) — failing the turn closed (issue #72)"
-                    % (len(hold), _kind, len(allowed_names)),
-                    level="WARN", tag="chat")
-                raise EmptyToolEcho(len(hold), _kind)
-            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
-                % len(hold), level="WARN", tag="chat")
+            # 客户端声明了 tools 且本轮没有一个可用调用 -> fail-closed，让客户端重试。
+            _kind = "marker_only" if _marker_only_echo(hold) else "partial_array"
+            log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                "tools_declared=%d) — failing the turn closed (issue #72)"
+                % (len(hold), _kind, len(allowed_names)),
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(hold), _kind)
         elif _tool_echo_droppable(hold, allowed_names):
             # issue #11：模型把 [工具结果...] 回声块当正文吐出（自造闭标记或
             # 未闭合的截断块）——吞掉，不还原（需 tool_call_id 配对）。
@@ -5945,9 +5830,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             elif (allowed_names
                     and (_leak_residue_present(hold) or _dsml_residue_present(hold))
                     and not parse_dsml_tool_calls(hold)[0]
-                    and not _echo_names_all_undeclared(hold, allowed_names)
-                    and not (_leak_array_echo_candidate(hold)
-                             and not _dsml_residue_present(hold))):
+                    and not _echo_names_all_undeclared(hold, allowed_names)):
                 log("unrecovered leak residue in tools session (%d chars) — "
                     "failing the turn closed (issue #49)" % len(hold),
                     level="WARN", tag="chat")
@@ -6585,18 +6468,14 @@ def recover_leaked_tool_calls(frames, allowed_names=None, audit=None):
     各阶段都是生成器，顺序即数据流方向；用具名中间变量而非层层嵌套 ——
     出口是包装器这一事实要能被静态断言钉住（见 _test_stream_tool_ids 第 7 节）。
     """
-    # 空回合守卫先看**上游原始输出**：声明了 tools 却既无可见正文、也无可执行
-    # 调用，才算假成功（issue #134）。放在回读/归一之前，是因为回读会把「协议
-    # 回声」整块吞掉（fork #37 契约：0 合法条目 -> finish=stop、不报错），
-    # 若在吞掉之后再判空，就会把 fork 的静默吞掉误判成上游空回答。
-    guarded = _sse_guard_empty_tool_turn(frames, allowed_names, audit=audit)
-    leaked = _recover_leaked_tool_calls_inner(guarded, allowed_names)
+    leaked = _recover_leaked_tool_calls_inner(frames, allowed_names)
     dsml = _sse_recover_dsml(leaked, allowed_names)
     tagged = _sse_recover_tool_tags(dsml, allowed_names)
     with_ids = _sse_fill_tool_call_ids(tagged)
     named = _sse_guard_nameless_tool_calls(with_ids)
     checked = _sse_guard_truncated_tool_args(named)
-    for frame in _sse_guard_unstructured_tool_echo(checked, allowed_names):
+    guarded = _sse_guard_unstructured_tool_echo(checked, allowed_names)
+    for frame in _sse_guard_empty_tool_turn(guarded, allowed_names, audit=audit):
         yield frame
 
 
@@ -6767,28 +6646,29 @@ def _current_turn_start(messages):
 # 接受结构化历史并被正确消费（含 3 轮链、结构化+旧文本信封混合、并行调用、
 # id 不匹配）；DeepSeek / Kimi 在 assistant.content=null 时被拒，**content=""
 # 即通过**。因此本实现恒用空字符串，绝不发 null。
-#
-# 2026-10-16（结构化默认化）：原 provider 白名单翻转为 carve-out 排除表。
-# auto = 「CN 出口 + id 齐备」全模型默认结构化——把工具历史序列化成文本正是
-# 制造「模型照抄 marker 文本」回声的根因（参考同通道 /workspace/QoderGateway
-# 全程原生透传、零工具调用问题）；默认空表不排除任何模型，E2E 验证失败/待验
-# 模型用前缀回填（命中即回退文本化，如 ("dfmodel",)）。
-STRUCTURED_TOOL_HISTORY_EXCLUDE = ()
+# issue #49 后续：DeepSeek 由报告者在真实长会话上端到端验证通过（v1.5.4，
+# Anthropic 入口，1,283 次工具调用 0 降级；同环境开启前基线 0.30%）。
+# 结构化直传后模型看不到 LEAK_MARKER 文本格式，也就无从复述——这是治本项。
+# _tool_ids_ok 守卫仍在：客户端 id 不齐备时自动回退文本化，不会踩坑。
+# issue #60 follow-up：DeepSeek 的**上游 key 是 `dfmodel`**（显示名 DeepSeek-V4-Flash），
+# 只写 "deepseek" 匹配不到 -> auto 一直是文本化，模型照抄伪协议。两个都保留。
+STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5",
+                                   "deepseek", "dfmodel")
 _STRUCTURED_LOG_ONCE = {"done": False}
 
 
 def _structured_realms():
-    """auto 模式允许结构化历史的出口，默认仅 cn（fork 契约）。
+    """auto 模式允许结构化历史的出口，默认 cn + intl。
 
-    fork 自 v1.5.3 起在 CN 全模型启用结构化；INTL 的 legacy 通道未完成实测，
-    保持文本化 + 回读守卫。需要时用 QD_STRUCTURED_TOOL_HISTORY_REALMS=cn,intl
-    显式开启（上游默认包含 intl，fork 不随其改变默认行为）。
+    国际区 GLM-5.3 已实测接受配对的 assistant.tool_calls / role:tool，
+    继续文本化会让模型照抄历史信封并静默结束。provider 白名单与 id 守卫
+    仍由 structured_tool_history_enabled 控制；显式设为 cn 可回退旧范围。
     """
     raw = os.environ.get("QD_STRUCTURED_TOOL_HISTORY_REALMS")
     if raw is None or not raw.strip():
-        return {"cn"}
+        return {"cn", "intl"}
     out = {p.strip().lower() for p in raw.split(",") if p.strip()}
-    return out or {"cn"}
+    return out or {"cn", "intl"}
 
 
 def _structured_mode():
@@ -6824,13 +6704,10 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
                                     messages=None):
     """本次请求是否走结构化工具历史。
 
-    - off          -> False（一键回退文本化 + 回读守卫兜底）
-    - on           -> True（显式强制）
-    - auto（默认） -> 「CN 出口 + id 齐备」全模型结构化；仅当模型前缀命中
-        carve-out 排除表（STRUCTURED_TOOL_HISTORY_EXCLUDE，默认空）时回退。
-        INTL 维持排除：legacy 通道未实测（task-31 超时未取得结果），故 auto
-        不在 INTL 启用；回读守卫 + issue #37 fail-closed 继续覆盖 INTL
-        的文本化残余路径。
+    - off          -> False（一键回退文本化）
+    - on           -> True（显式强制：DeepSeek / Kimi / INTL 补验证用）
+    - auto（默认） -> 「允许的出口 + provider 白名单 + id 齐备」为真：
+        默认允许 CN / INTL；QD_STRUCTURED_TOOL_HISTORY_REALMS 可缩小范围。
     任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
     """
     if not _tool_ids_ok(messages):
@@ -6844,13 +6721,13 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
         return False
     for cand in (str(model_key or ""), str(model or "")):
         low = cand.strip().lower()
-        if low and low.startswith(STRUCTURED_TOOL_HISTORY_EXCLUDE):
-            return False                    # carve-out 命中 -> 文本化
-    if not _STRUCTURED_LOG_ONCE["done"]:
-        _STRUCTURED_LOG_ONCE["done"] = True
-        log("structured tool history: ON (model=%s key=%s realm=%s)"
-            % (model, model_key, realm), tag="chat")
-    return True                             # CN 全模型默认结构化
+        if low and low.startswith(STRUCTURED_TOOL_HISTORY_WHITELIST):
+            if not _STRUCTURED_LOG_ONCE["done"]:
+                _STRUCTURED_LOG_ONCE["done"] = True
+                log("structured tool history: ON (model=%s key=%s realm=%s)"
+                    % (model, model_key, realm), tag="chat")
+            return True
+    return False
 
 
 def flatten_messages(messages, keep_reasoning=False, structured=False):
@@ -6957,15 +6834,6 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
                 item["reasoning_content"] = m.get("reasoning_content") or ""
             flat.append(item)
             continue
-        if role == "assistant" and not str(text or "").strip():
-            # 裸空 assistant（无 tool_calls、content 空）是合法客户端历史形态
-            # （如 reasoning-only 回合/中断残留），Kimi 族上游却以 400
-            # "assistant must not be empty" 拒绝整个请求 —— 有它在历史里，
-            # 切到 Kimi/K3 族的每一次请求都失败。空消息无信息量，直接丢弃；
-            # DeepSeek 族（keep_reasoning）带非空 reasoning 的形态维持原样。
-            _rsn = m.get("reasoning_content")
-            if not (keep_reasoning and isinstance(_rsn, str) and _rsn.strip()):
-                continue
         if role in ("user", "assistant"):
             if imgs:
                 # 上游只读消息 content 里的结构化 image_url parts，**不读**
@@ -8077,44 +7945,11 @@ def _note_quota_cooldown(account, status, detail, where, model=None):
     return True
 
 
-def _auth_expired_detail(detail):
-    """403 登录/会话失效的文本判据（401 由状态码直接判定，无需看 body）。"""
-    s = str(detail or "").lower()
-    return (qoder_accounts.session_dead(detail)
-            or "login" in s or "sign in" in s or "unauthor" in s)
-
-
-def _recover_account_token(account, where, model=None):
-    """登录错误自愈：强制刷新一次，成功则由调用方重试同一账号。
-
-    仅处理有刷新凭证的账号；队列 10605 / 额度 112/110 由调用方先排除。
-    10s 门限对**失败**也计时，避免信封重试在同一请求内重复消耗 PAT。
-    """
-    if not account or not (getattr(account, "personal_token", "")
-                           or getattr(account, "refresh_token", "")):
-        return False
-    now = time.time()
-    last = max(float(getattr(account, "token_refreshed_at", 0) or 0),
-               float(getattr(account, "token_recovery_at", 0) or 0))
-    if now - last < 10:
-        return False
-    account.token_recovery_at = now
-    if account.refresh():
-        log("account %s auth expired (%s%s) - refreshed, retrying without "
-            "penalty" % (account.uid[:8], where,
-                         " model=%s" % model if model else ""),
-            level="WARN", tag="chat")
-        return True
-    log("account %s auth expired (%s%s) - refresh failed: %s"
-        % (account.uid[:8], where, " model=%s" % model if model else "",
-           str(getattr(account, "last_error", ""))[:120]),
-        level="WARN", tag="chat")
-    return False
-
-
 def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
     """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
     if isinstance(exc, InvalidToolArguments):
+        # issue #37：坏参数是模型生成内容的问题，**不是账号不可用**——
+        # 记录成账号冷却会让一个健康账号被无辜停用（还会解绑会话）。
         return
     if not account or not hasattr(account, "note_error"):
         return
@@ -8133,13 +7968,6 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             "account (issue #71)" % (account.uid[:8], status_int),
             level="WARN", tag="chat")
         return
-    # 登录/会话失效：先尝试用 PAT 刷新，成功则不惩罚账号，调用方 reopen 重试。
-    # 401 无论 body 是否可解析都尝试；403 需 login/TOKEN_EXPIRE 文本标记。
-    if (status_int in (401, 403) and not _is_queue71
-            and (status_int == 401 or _auth_expired_detail(detail))
-            and not _quota_cooldown(detail)[0]):
-        if _recover_account_token(account, "envelope", model=model):
-            return
     if session_key and POOL:
         try:
             POOL.affinity.unbind(session_key)
@@ -8181,19 +8009,10 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             % (account.uid[:8], status_int, is_queue, float(actual or 0), cd,
                total), level="WARN", tag="chat")
         if dead:
-            if not account.enabled or not (
-                    getattr(account, "personal_token", "")
-                    or getattr(account, "refresh_token", "")):
-                if account.enabled:
-                    account.enabled = False
-                setattr(account, "disabled_by_session_dead", True)
-                account.save(ACCOUNTS_DIR) if account.path else None
-                log("account %s session dead via envelope (TOKEN_EXPIRE) - disabled"
-                    % account.uid[:8], level="ERROR")
-            else:
-                log("account %s session dead via envelope but refresh "
-                    "transiently failed - keeping enabled for retry"
-                    % account.uid[:8], level="WARN", tag="chat")
+            account.enabled = False
+            account.save(ACCOUNTS_DIR) if account.path else None
+            log("account %s session dead via envelope (TOKEN_EXPIRE) - disabled"
+                % account.uid[:8], level="ERROR")
     else:
         account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
                            cooldown=15, single_account=(total <= 1))
@@ -8974,13 +8793,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
     model_key = resolve_model_key(model, realm=realm)
 
-    # task 10-16（R3）：这里原为 `POOL.pick(realm=realm)`，但代表号只用于请求体
-    # 的占位 aliyun_user_type（发送前会被真实服务号覆写）——pick 会白耗一格轮询
-    # cursor，偶数池下固定一半账号服务数恒 0（根因见 tests/_test_alloc_parity.py）。
-    # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）。
-    representative = only_account
+    # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）
+    representative = (only_account if only_account is not None
+                      else (POOL.pick(realm=realm, **({"allowed_uids": allowed_uids}
+                           if allowed_uids is not None else {})) if POOL else None))
     body_obj = build_qoder_body(payload, representative, model_key, realm=realm,
-                                conversation=_conv)
+                                  conversation=_conv)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
         # 与真实出站内容同源，不做二次推算。
@@ -9016,9 +8834,6 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     if only_account is None and POOL and allowed_uids is not None:
         total = POOL.count_ready(realm, model=model, allowed_uids=allowed_uids)
     tried = set()
-    # 登录错误自愈预算按**请求**计：一次刷新已经能把过期 token 换成新的，
-    # 多账号连续过期时也只需要救回当前被选中的那个。
-    refresh_budget = 1
     route_round = 0
     route_round_retries = route_policy.get("request_retry", 0)
     route_account_cap = route_policy.get("max_retry_accounts", 0)
@@ -9095,9 +8910,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         if len(encoded) > MAX_UPSTREAM_BODY_BYTES:
             raise PayloadTooLarge(len(encoded), MAX_UPSTREAM_BODY_BYTES)
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
-        # 签名只覆盖 path，换主机不影响签名有效性。企业 VPC 账号为单 host
-        # （gateway_candidates_for：{instance}-gateway.vpc.qoder.com.cn）。
-        hosts = gateway_candidates_for(account)
+        # 签名只覆盖 path，换主机不影响签名有效性。
+        hosts = gateway_candidates(account.realm, qoder_accounts.account_realm_config(account))
         host_i = 0
         raw_url = hosts[host_i] + CHAT_PATH
 
@@ -9110,7 +8924,6 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         last_exc = None
         detail = ""
         tries = 0                 # 瞬时故障重试计数（1s/2s 退避）
-        auth_retry = 0            # 登录错误刷新重试（每账号一次）
         while True:
             try:
                 sess = SESSIONS.get(account)
@@ -9120,7 +8933,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 req = urllib.request.Request(chat_url,
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=600)
+                if qoder_accounts.is_configured_vpc_host(
+                        urllib.parse.urlsplit(chat_url).hostname):
+                    resp = qoder_accounts._opener_for_request().open(req, timeout=600)
+                else:
+                    resp = urllib.request.urlopen(req, timeout=600)
                 break
             except urllib.error.HTTPError as exc:
                 try:
@@ -9168,24 +8985,6 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     # 抖动 0~2s：多客户端同时被唤醒会一起打同一队列
                     time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
                     continue
-                # 登录错误自愈：401（或 403 login/TOKEN_EXPIRE）先刷新一次，
-                # 再在同一账号上重试。队列 10605 与额度 112/110 必须排除，
-                # 它们不是凭证问题，长冷却/排队语义保持不变。
-                _quota_kind = _quota_cooldown(detail)[0]
-                _auth_like = (exc.code == 401
-                              or _auth_expired_detail(detail))
-                _can_refresh = bool(getattr(account, "personal_token", "")
-                                    or getattr(account, "refresh_token", ""))
-                if (exc.code in (401, 403) and _auth_like
-                        and qwait <= 0 and not _quota_kind and _can_refresh
-                        and auth_retry == 0 and refresh_budget > 0):
-                    # 预算按“尝试”扣减：刷新失败也不在多账号间串行重试，
-                    # 否则一个请求可能叠加 N 次 token 交换的长尾。
-                    refresh_budget -= 1
-                    if _recover_account_token(
-                            account, "HTTP %d" % exc.code, model=model):
-                        auth_retry = 1
-                        continue
                 # 429/401/403 与客户端参数错：立即进入分类，不重试
                 if exc.code in (429, 401, 403):
                     break
@@ -9337,19 +9136,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                                    cooldown=300 if dead else 60,
                                    single_account=(total <= 1))
                 if dead:
-                    if not account.enabled or not (
-                            getattr(account, "personal_token", "")
-                            or getattr(account, "refresh_token", "")):
-                        if account.enabled:
-                            account.enabled = False
-                        setattr(account, "disabled_by_session_dead", True)
-                        account.save(ACCOUNTS_DIR) if account.path else None
-                        log("account %s session dead (TOKEN_EXPIRE) - disabled"
-                            % account.uid[:8], level="ERROR")
-                    else:
-                        log("account %s session dead but refresh transiently "
-                            "failed - keeping enabled for retry"
-                            % account.uid[:8], level="WARN", tag="chat")
+                    account.enabled = False
+                    account.save(ACCOUNTS_DIR) if account.path else None
+                    log("account %s session dead (TOKEN_EXPIRE) - disabled"
+                        % account.uid[:8], level="ERROR")
                 last_error = exc
                 continue
             if _is_transient_upstream(exc.code, detail):
@@ -9622,12 +9412,6 @@ def iter_inner_sse(resp, holder=None):
             inner = json.loads(body)
         except Exception:
             continue
-        if inner is None:
-            # 上游把 JSON null 当占位/心跳帧发（MiniMax 链路实测：真实帧后
-            # 常跟 1-2 个 body:"null"）。null 无信息量，透传却会让严格解析
-            # 的客户端在 `data: null` 帧上崩（payload 非对象）；其余非 dict
-            # 形态（裸数组/标量）保持「不清洗、原样透传」语义不变。
-            continue
         if isinstance(inner, dict):
             # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
             note_inner_upstream_error(inner, status=status)
@@ -9736,7 +9520,6 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
     message = {"role": "assistant", "content": "".join(content)}
     if reasoning:
         message["reasoning_content"] = "".join(reasoning)
-    _swallowed_echo = False
     # 回读（issue #8）：上游未给结构化 tool_calls，但正文恰好是网关自己写入
     # 历史的「LEAK_MARKER + JSON 数组」形态（模型照格式复述）——还原为结构化
     # 调用并从正文移除，避免客户端把 JSON 当正文显示、本轮调用不执行。
@@ -9748,61 +9531,39 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         _echo_src = _block16 or ""
         if _echo_src:
             _rec, _clean = parse_leaked_tool_calls(_echo_src, allowed_names)
-            _salvaged_empty = False
             if not _rec and TOOL_CALL_OPEN in _echo_src.lower():
                 # issue #137：marker 后面跟的是伪 XML 调用，不是 JSON 数组
                 _rec, _clean = parse_tool_call_tags(_echo_src, allowed_names)
                 if _rec:
                     RECOVERY_STATS["tool_tag"] = \
                         RECOVERY_STATS.get("tool_tag", 0) + 1
-            if _rec is None:
-                _salv = salvage_leaked_tool_calls(_echo_src, allowed_names)
-                if _salv is not None:
-                    _rec, _dropped, _clean = _salv
-                    if _rec:
-                        log("salvaged leaked tool-call echo: %d call(s) "
-                            "restored, %d dropped (%s)"
-                            % (len(_rec), len(_dropped),
-                               ", ".join("idx=%d:%s" % (i, r)
-                                         for i, r in _dropped)),
-                            level="WARN", tag="chat")
-                    else:
-                        _salvaged_empty = True
-                        _swallowed_echo = True
-                        _why = (", ".join("idx=%d:%s" % (i, r)
-                                          for i, r in _dropped)
-                                or "empty array")
-                        log("dropped all leaked tool-call echo: %s" % _why,
-                            level="WARN", tag="chat")
             if _rec:
                 message["content"] = _head16 + (_clean or "")
                 tool_calls_map = {i: c for i, c in enumerate(_rec)}
-            elif _salvaged_empty:
-                # 0 合法条目：整块吞掉，只保留 marker 前散文；正常结束。
-                message["content"] = _head16 + (_clean or "")
-                if finish == "tool_calls":
-                    finish = "stop"
+            elif _echo_with_bad_args(_echo_src, allowed_names):
+                # issue #37（fail-closed，**先于 #9/#11**）：外层数组完整合法、
+                # 只是内层参数坏了——不泄漏、不伪造调用，也不拼装成功对象：
+                # 整轮以协议错误失败（HTTP 502）。真截断的数组 parse 不过，
+                # 不会被这里抢走（仍由 #9 吞掉）。
+                log("tool-call echo has invalid JSON arguments (%d chars) — "
+                    "failing the turn closed (issue #37)" % len(_echo_src),
+                    level="WARN", tag="chat")
+                raise InvalidToolArguments()
             elif _leaked_partial_droppable(_echo_src, allowed_names):
-                # issue #72：声明了 tools 却只拿到残缺回声。fork 边界（v1.5.6）
-                # 与流式一致：纯 marker 空壳 fail-closed（502）；半截 JSON 数组
-                # 按 issue #9 丢弃 + 正常结束，避免把可继续的会话打成重试循环。
-                if allowed_names and _marker_only_echo(_echo_src):
-                    _kind72 = "marker_only"
-                    log("dropped truncated leaked tool-call echo (%d chars, %s, "
-                        "tools_declared=%d) — failing the turn closed (issue #72)"
-                        % (len(_echo_src), _kind72, len(allowed_names)),
-                        level="WARN", tag="chat")
-                    raise EmptyToolEcho(len(_echo_src), _kind72)
-                log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
-                    % len(_echo_src), level="WARN", tag="chat")
-                message["content"] = _head16
-                _swallowed_echo = True
+                # issue #72：声明了 tools 却只拿到残缺回声 -> fail-closed（502），
+                # 不再把「空调用 + 正常内容」当成成功返回。
+                _kind72 = ("marker_only" if _marker_only_echo(_echo_src)
+                           else "partial_array")
+                log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                    "tools_declared=%d) — failing the turn closed (issue #72)"
+                    % (len(_echo_src), _kind72, len(allowed_names)),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(_echo_src), _kind72)
             elif _tool_echo_droppable(_echo_src, allowed_names):
                 # issue #11：工具结果回声块同样不还原、不透传。
                 log("dropped leaked tool-result echo (%d chars) — issue #11"
                     % len(_echo_src), level="WARN", tag="chat")
                 message["content"] = _head16
-                _swallowed_echo = True
             else:
                 # issue #49 方向 C：四条路径都没认出来 -> 至少留痕（非流式侧）
                 _log_unrecovered_leak(_echo_src, "aggregate")
@@ -9891,8 +9652,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
     elif finish == "tool_calls":
         raise EmptyToolEcho(0, "missing_tool_call")
     if (allowed_names and not tool_calls_map and not message.get("content", "").strip()
-            and finish not in ("length", "content_filter")
-            and not _swallowed_echo):
+            and finish not in ("length", "content_filter")):
         raise EmptyToolEcho(0, "reasoning_only" if reasoning else "empty_tool_turn")
     out = {
         "id": resp_id or "chatcmpl-qoder",
@@ -10863,32 +10623,19 @@ def stream_responses_events(inner_lines, model, holder):
         leak_calls, leak_clean = (None, text_buffer)
         dropped_leak = False
         dropped_tool_echo = False
-        salvaged_empty = False
+        dropped_bad_args = False
         # issue #16-B1：散文已先发出时 any(text_parts) 为真，但缓冲本身若以
         # 标记开头（切分后剩下的回声块）仍必须走回读/吞掉判定，否则会漏。
         if not any(text_parts) or _marker_starts_at(text_buffer):
             leak_calls, leak_clean = parse_leaked_tool_calls(
                 text_buffer, holder.get("allowed_names"))
-            if leak_calls is None:
-                _salv = salvage_leaked_tool_calls(
-                    text_buffer, holder.get("allowed_names"))
-                if _salv is not None:
-                    leak_calls, _dropped, leak_clean = _salv
-                    if leak_calls:
-                        log("salvaged leaked tool-call echo: %d call(s) "
-                            "restored, %d dropped (%s)"
-                            % (len(leak_calls), len(_dropped),
-                               ", ".join("idx=%d:%s" % (i, r)
-                                         for i, r in _dropped)),
-                            level="WARN", tag="chat")
-                    else:
-                        salvaged_empty = True
-                        _why = (", ".join("idx=%d:%s" % (i, r)
-                                          for i, r in _dropped)
-                                or "empty array")
-                        log("dropped all leaked tool-call echo: %s" % _why,
-                            level="WARN", tag="chat")
-            if leak_calls is None and _leaked_partial_droppable(
+            # issue #37（fail-closed）**先于 #9/#11**：坏参数块的外层数组完整
+            # 合法，带 DSML/围栏残片时会被 _leaked_partial_droppable 误判成
+            # 「截断」并静默吞掉（正常完成）——那既不是失败也不是恢复。
+            if leak_calls is None and _echo_with_bad_args(
+                    text_buffer, holder.get("allowed_names")):
+                dropped_bad_args = True
+            elif leak_calls is None and _leaked_partial_droppable(
                     text_buffer, holder.get("allowed_names")):
                 dropped_leak = True
             elif leak_calls is None and _tool_echo_droppable(
@@ -10901,30 +10648,29 @@ def stream_responses_events(inner_lines, model, holder):
                  "arguments": (c.get("function") or {}).get("arguments") or "{}"}
                 for c in leak_calls)
             calls_rem, clean_rem = None, leak_clean
-        elif salvaged_empty:
-            # 0 合法条目：整块吞掉，只补发 marker 前散文；正常完成。
-            calls_rem, clean_rem = None, leak_clean
         elif dropped_leak:
             # issue #72：客户端声明了 tools、本轮又没恢复出任何调用时，
             # **不能以 response.completed 收尾**（agent 会误判任务完成）。
-            # fork 边界（v1.5.6）：只有纯 marker 空壳 fail-closed；半截 JSON
-            # 数组沿用 issue #9 的丢弃 + 正常完成。
             _allowed72 = holder.get("allowed_names") or set()
-            if _allowed72 and _marker_only_echo(text_buffer):
-                _kind72 = "marker_only"
-                log("dropped truncated leaked tool-call echo (%d chars, %s, "
-                    "tools_declared=%d) — failing the turn closed (issue #72)"
-                    % (len(text_buffer), _kind72, len(_allowed72)),
-                    level="WARN", tag="chat")
-                raise EmptyToolEcho(len(text_buffer), _kind72)
-            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
-                % len(text_buffer), level="WARN", tag="chat")
-            calls_rem, clean_rem = None, None
+            _kind72 = ("marker_only" if _marker_only_echo(text_buffer)
+                       else "partial_array")
+            log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                "tools_declared=%d) — failing the turn closed (issue #72)"
+                % (len(text_buffer), _kind72, len(_allowed72)),
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(text_buffer), _kind72)
         elif dropped_tool_echo:
             # issue #11：工具结果回声块 -> 同样吞掉，不走 DSML 回退。
             log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(text_buffer), level="WARN", tag="chat")
             calls_rem, clean_rem = None, None
+        elif dropped_bad_args:
+            # issue #37（fail-closed）：不输出协议，也不走正常完成——抛错，
+            # 由 Responses 出口发 response.failed。
+            log("tool-call echo has invalid JSON arguments (%d chars) — "
+                "failing the turn closed (issue #37)" % len(text_buffer),
+                level="WARN", tag="chat")
+            raise InvalidToolArguments()
         else:
             calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
             if not calls_rem:
@@ -11793,8 +11539,6 @@ class Handler(BaseHTTPRequestHandler):
                     "nickname": acc.nickname or acc.uid[:8],
                     "realm": getattr(acc, "realm", ""),
                     "ok": bool(cu.get("ok")),
-                    "unavailable": bool(cu.get("unavailable")),
-                    "reason": cu.get("reason") or "",
                     "total": cu.get("total") or 0,
                     "peak": cu.get("peak") or 0,
                     "peak_date": cu.get("peak_date") or "",
@@ -13097,7 +12841,9 @@ class Handler(BaseHTTPRequestHandler):
                 target_realm = "cn"
             try:
                 started = POOL.start_login(realm=target_realm,
-                                           platform=platform)
+                                           platform=platform, vpc=payload.get("vpc"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
             except Exception as exc:
                 return self._error(502, "could not start login: %s" % exc)
             log("oauth device login started (realm=%s, state=%s)"
@@ -13106,24 +12852,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts/login/cancel":
             state = payload.get("state") or ""
             return self._json(200, {"cancelled": POOL.cancel_login(state)})
-        if path == "/accounts/import/pat":
+        if path in ("/accounts/import/pat", "/accounts/import-pat"):
             pat = payload.get("pat") or ""
             realm = payload.get("realm") or CURRENT_REALM
             if realm not in ("intl", "cn"):
                 realm = "cn"
-            ent = str(payload.get("enterpriseDomain") or "").strip()
-            if ent:
-                # 企业 VPC 仅 CN 域：带域名时强制国内版（忽略区域入参）
-                realm = "cn"
             try:
-                account = POOL.import_pat(pat, realm=realm,
-                                          enterprise_domain=ent)
+                account = POOL.import_pat(pat, realm=realm, vpc=payload.get("vpc"))
             except Exception as exc:
                 return self._error(400, "PAT import failed: %s" % exc)
-            log("imported PAT account %s (realm=%s%s)"
-                % (account.uid[:8], realm,
-                   ", enterprise=%s" % account.enterprise_domain
-                   if account.enterprise_domain else ""))
+            log("imported PAT account %s (realm=%s)"
+                % (account.uid[:8], realm))
             return self._json(200, {"imported": [account.public()],
                                     "accounts": account_views()})
         if path == "/accounts/import/desktop":
@@ -13197,14 +12936,11 @@ class Handler(BaseHTTPRequestHandler):
                 "stream": False,
             }
             t0 = time.time()
-            # 一次性 session key：测试请求不得派生 pfx-*，更不得在失败路径
-            # unbind 掉真实对话的会话亲和（issue #69/#71 的亲和表污染）。
-            test_session_key = "acct-test-%s" % uuid.uuid4().hex
             try:
                 # issue #86：必须测试被点的那个号（此前会落到池里任意账号）
                 resp, acc, _ = open_upstream(
                     test_payload, target_realm=acc_realm(account),
-                    session_key=test_session_key, only_account=account)
+                    only_account=account)
                 with resp:
                     chat_obj = aggregate_stream(resp, test_model, None)
                 wall_ms = int((time.time() - t0) * 1000)
@@ -13227,52 +12963,27 @@ class Handler(BaseHTTPRequestHandler):
                                         "status": 429,
                                         "error": "rate limited: %s" % exc.detail[:150],
                                         "elapsed_ms": wall_ms})
-            except UpstreamQueued as exc:
-                # issue #87：HTTP 层排队是模型级容量问题，不是账号故障——
-                # 不冷却、不写 last_error，返回结构化 queued 让面板单独提示。
-                wall_ms = int((time.time() - t0) * 1000)
-                _msg, _et = friendly_upstream_error(503, exc.detail)
-                log("account test: uid=%s model=%s wall=%dms queued retry_after=%ds"
-                    % (account.uid[:8], test_model, wall_ms, exc.retry_after),
-                    level="WARN", tag="accounts")
-                return self._json(200, {
-                    "ok": False, "uid": account.uid, "status": 503,
-                    "queued": True, "retry_after": exc.retry_after,
-                    "error": _msg, "elapsed_ms": wall_ms})
             except UpstreamStatus as exc:
-                # 信封层（HTTP 200 + SSE statusCodeValue=403）同样可能是排队；
-                # 排队分支必须在 note_error 之前短路（issue #71 口径）。
+                # issue #123 后续：信封层 403/429 以前落到通用分支，只显示
+                # "upstream status 403"，看不到业务码（10605/112/110）——
+                # 把 detail 原样带回面板，并按已知码给出人话解释。
                 wall_ms = int((time.time() - t0) * 1000)
-                qwait = _queue_wait_seconds(exc.detail)
-                if qwait > 0:
-                    _msg, _et = friendly_upstream_error(503, exc.detail)
-                    log("account test: uid=%s model=%s wall=%dms envelope queued "
-                        "retry_after=%ds"
-                        % (account.uid[:8], test_model, wall_ms, qwait),
-                        level="WARN", tag="accounts")
-                    return self._json(200, {
-                        "ok": False, "uid": account.uid, "status": 503,
-                        "queued": True, "retry_after": qwait,
-                        "error": _msg, "elapsed_ms": wall_ms})
-                # issue #123 后续：非排队信封错误把 detail 原样带回面板，
-                # 并按已知业务码（10605/112/110/…）给出人话解释。
-                # issue #134：额度耗尽/每日上限/排队不是账号故障，**测试**不该
-                # 给号叠冷却；真正的凭证/服务端故障仍走既有冷却链路。
-                _detail_ai = str(getattr(exc, "detail", "") or "")
-                if ("112" not in _detail_ai and "110" not in _detail_ai
-                        and "10605" not in _detail_ai
-                        and "isQueued" not in _detail_ai):
-                    _handle_envelope_account_cooldown(account, exc, model=test_model)
-                _code = _to_int_status(exc.status)
                 _detail = str(getattr(exc, "detail", "") or "")[:400]
                 _hint = _quota_hint(_detail)
-                _msg, _et = friendly_upstream_error(_code, exc.detail)
+                # issue #134：额度耗尽的号本来就不能服务请求，**测试**再去给它
+                # 叠一分钟冷却纯属副作用（连点两次测试就把它压住了）。
+                # 只有真正的凭证/服务端故障才记冷却。
+                if "112" not in _detail and "110" not in _detail \
+                        and "10605" not in _detail and "isQueued" not in _detail:
+                    account.note_error(
+                        "HTTP %s: %s" % (exc.status, _detail[:80]), cooldown=60)
                 log("account test: uid=%s model=%s wall=%dms upstream=%s %s"
-                    % (account.uid[:8], test_model, wall_ms, _code,
+                    % (account.uid[:8], test_model, wall_ms, exc.status,
                        _hint or _detail[:120]), level="WARN", tag="accounts")
                 return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": _code,
-                                        "error": _msg[:150],
+                                        "status": exc.status,
+                                        "error": "upstream HTTP %s: %s"
+                                        % (exc.status, _detail[:200]),
                                         "detail": _detail,
                                         "hint": _hint,
                                         "elapsed_ms": wall_ms})
@@ -13302,13 +13013,22 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False, "uid": account.uid, "status": 500,
                     "error": _friendly_net_error(
                         exc,
-                        qoder_accounts.get_realm_config(
-                            acc_realm(account))["gateway"]),
+                        qoder_accounts.account_realm_config(account)["gateway"]),
                     "elapsed_ms": wall_ms})
         if path == "/accounts/set":
             uid = payload.get("uid")
             if not uid:
                 return self._error(400, "uid required")
+            if "vpcEndpoint" in payload:
+                try:
+                    changed = POOL.set_vpc(uid, payload["vpcEndpoint"])
+                except ValueError as exc:
+                    return self._error(400, str(exc), "invalid_request_error")
+                if changed is None:
+                    return self._error(404, "no such account")
+                import qoder_tasks
+                qoder_tasks.invalidate_panel_cache()
+                return self._json(200, {"account": changed})
             updated = POOL.set_enabled(uid, bool(payload.get("enabled")))
             if updated is None:
                 return self._error(404, "no such account")
@@ -13579,15 +13299,6 @@ class Handler(BaseHTTPRequestHandler):
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
                     holder, account, usage_ctx=usage_ctx)
-            except RateLimited as exc:
-                # issue #71/#100：信封排队耗尽抛的是 RateLimited（没有 .status），
-                # 以前落入下面的通用分支变成 502；必须显式回 429 + Retry-After。
-                record_error(model, 429, exc.detail[:200],
-                             elapsed_ms=int((time.time() - t_start) * 1000),
-                             stream=want_stream,
-                             account=account.uid if account else None,
-                             key_id=self._key_id_for_usage())
-                return self._rate_limited(exc)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -13657,10 +13368,6 @@ class Handler(BaseHTTPRequestHandler):
                     session_key=session_key)
             except RateLimited as exc:
                 return self._rate_limited(exc)
-            except UpstreamQueued as exc:
-                _msg, _et = friendly_upstream_error(503, exc.detail)
-                return self._error(503, _msg, _et,
-                                   retry_after=exc.retry_after)
             except urllib.error.HTTPError as exc:
                 detail = getattr(exc, "qoder_detail", "") or ""
                 msg, etype = friendly_upstream_error(exc.code, detail)
@@ -13668,23 +13375,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._error(502, str(exc)[:200], "upstream_error")
             _round_t0 = time.time()
-            try:
-                with resp:
-                    obj = aggregate_stream(resp, model,
-                                           holder={"usage": None},
-                                           allowed_names=names)
-            except UpstreamStatus as exc:
-                # aggregate_stream 只解析已建立的响应，不会抛 RateLimited
-                # （只有 open_upstream / aggregate_with_envelope_retry 会）。
-                # 信封排队与其它协议路径同口径：429 + Retry-After；
-                # 非排队错误保留真实 status，不再统一 502。
-                qwait = _queue_wait_seconds(exc.detail)
-                if qwait > 0:
-                    return self._rate_limited(
-                        RateLimited(None, exc.detail, wait=qwait))
-                _code = _to_int_status(exc.status)
-                _msg, _et = friendly_upstream_error(_code, exc.detail)
-                return self._error(_code, _msg, _et)
+            with resp:
+                obj = aggregate_stream(resp, model,
+                                       holder={"usage": None},
+                                       allowed_names=names)
             # issue #131-3：这条分支此前完全不记账 —— 看板/按 Key 账号统计、
             # 以及按本地流水折叠的每日限额都漏掉这部分消耗。每轮都记一条
             # （账号/Key/模型与真实出站一致），并累加成总数回给客户端。
@@ -14061,14 +13755,6 @@ class Handler(BaseHTTPRequestHandler):
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
                     holder, account, usage_ctx=usage_ctx)
-            except RateLimited as exc:
-                # issue #71/#100：信封排队耗尽 -> 429 + Retry-After（不要 502）
-                record_error(model, 429, exc.detail[:200],
-                             elapsed_ms=int((time.time() - t_start) * 1000),
-                             stream=want_stream,
-                             account=account.uid if account else None,
-                             key_id=self._key_id_for_usage())
-                return self._rate_limited(exc)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -14633,14 +14319,6 @@ class Handler(BaseHTTPRequestHandler):
                 result, account = aggregate_with_envelope_retry(
                     upstream, payload, session_key, req_realm, model,
                     holder, account, usage_ctx=usage_ctx)
-            except RateLimited as exc:
-                # issue #71/#100：信封排队耗尽 -> 429 + Retry-After（不要 502）
-                record_error(model, 429, exc.detail[:200],
-                             elapsed_ms=int((time.time() - t_start) * 1000),
-                             stream=want_stream,
-                             account=account.uid if account else None,
-                             key_id=self._key_id_for_usage())
-                return self._rate_limited(exc)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -14760,6 +14438,14 @@ def main():
                     help="write the server PID to this file (stop.bat uses it; "
                          "removed on exit)")
     args = ap.parse_args()
+    if qoder_accounts.vpc_config_error():
+        sys.stderr.write(
+            "[ERROR] invalid QD_CN_VPC_ENDPOINT: %s\n"
+            "        expected an instance name (e.g. acme) or one of\n"
+            "        acme.vpc.qoder.com.cn / acme-openapi.vpc.qoder.com.cn /\n"
+            "        acme-gateway.vpc.qoder.com.cn\n"
+            % qoder_accounts.vpc_config_error())
+        raise SystemExit(1)
     qoder_logpaths.install_stream_logging(os.path.dirname(os.path.abspath(__file__)))
     if not args.usage_dir and not os.environ.get("QD_PROXY_USAGE_DIR"):
         _migration = qoder_logpaths.migrate_legacy_usage(
@@ -14972,7 +14658,16 @@ def main():
                                   rep.domain if rep else "-"))
     log("realm      : %s (%s)" % (
         CURRENT_REALM,
-        "qoder.com" if CURRENT_REALM == "intl" else "qoder.com.cn"))
+        get_realm_config(CURRENT_REALM).get("domain") or "qoder.com.cn"))
+    if qoder_accounts.vpc_configured():
+        _cn = qoder_accounts.get_realm_config("cn")
+        log("vpc        : %s (openapi=%s gateway=%s)"
+            % (qoder_accounts.vpc_instance(), _cn["openapi"], _cn["gateway"]),
+            tag="realm")
+        if CURRENT_REALM != "cn":
+            log("VPC endpoint is CN-only, but the current realm is %s - "
+                "switch to CN in the dashboard or set QD_PROXY_DEFAULT_REALM=cn"
+                % CURRENT_REALM, level="WARN", tag="realm")
     log("catalog    : %s" % (BASEPROMPT_PATH if BASEPROMPT
                              else "baseprompt.json MISSING"))
 

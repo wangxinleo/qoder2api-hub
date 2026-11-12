@@ -76,10 +76,10 @@ docker run -d --name qoder-proxy --restart unless-stopped \
   -p 8790:8790 \
   -v "$(pwd)/accounts:/app/accounts" \
   -v "$(pwd)/usage:/app/usage" \
-  ghcr.io/wangxinleo/qoder2api-hub:latest
+  ghcr.io/shuishuipingan/qoder2api-hub:latest
 ```
 
-**镜像 tag**（[包页面](https://github.com/wangxinleo/qoder2api-hub/pkgs/container/qoder2api-hub)）：
+**镜像 tag**（[包页面](https://github.com/shuishuipingan/qoder2api-hub/pkgs/container/qoder2api-hub)）：
 
 | Tag | 含义 |
 |---|---|
@@ -166,7 +166,8 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 | 部署方式 | 升级步骤 |
 |---|---|
 | **一键更新（源码部署）** | 看板「运行信息」→ 有新版本时点 **一键更新**，见下 |
-| 源码（手动） | `git pull`，然后重启网关：Windows 先 `stop-qoder-proxy.bat` 再 `start-qoder-proxy.bat`；<br>Linux / macOS 先 `./stop-qoder-proxy.sh` 再 `./start-qoder-proxy.sh`（常驻/launchd 场景直接 restart 也可） |
+| 源码（手动） | `git pull`，然后重启网关：Windows 先 `stop-qoder-proxy.bat` 再 `start-qoder-proxy.bat`；
+Linux / macOS 先 `./stop-qoder-proxy.sh` 再 `./start-qoder-proxy.sh`（常驻/launchd 场景直接 restart 也可） |
 | Docker | `docker compose pull && docker compose up -d` |
 
 各版本的变更见[更新日志](../CHANGELOG.md)。

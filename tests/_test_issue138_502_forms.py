@@ -145,7 +145,7 @@ st, names, txt, _ = run(PREFIX21)
 check("纯 marker -> EmptyToolEcho/marker_only",
       st == "EmptyToolEcho" and names == [], (st, names))
 
-print("\n[138-8] 结构化历史：fork 默认仅 cn（INTL 需显式开启）")
+print("\n[138-8] 结构化历史：默认支持 intl，可显式回退 cn")
 _msgs = [
     {"role": "assistant", "content": "",
      "tool_calls": [{"id": "t1", "type": "function",
@@ -158,29 +158,27 @@ check("默认：cn + dfmodel 启用",
       P.structured_tool_history_enabled(model="DeepSeek-Flash",
                                        model_key="dfmodel", realm="cn",
                                        messages=_msgs) is True)
-# fork 契约（v1.5.3 起）：INTL legacy 通道未实测，auto 不默认启用；
-# 上游「默认 intl」断言在 fork 分支不成立（需显式 REALMS=cn,intl）。
-check("默认：intl 不启用（fork 仅 cn）",
+check("默认：intl 启用，避免复述历史信封",
       P.structured_tool_history_enabled(model="DeepSeek-Flash",
                                        model_key="dfmodel", realm="intl",
-                                       messages=_msgs) is False)
+                                       messages=_msgs) is True)
 os.environ["QD_STRUCTURED_TOOL_HISTORY_REALMS"] = "cn,intl"
 check("开关放开：intl + dfmodel 启用",
       P.structured_tool_history_enabled(model="DeepSeek-Flash",
                                        model_key="dfmodel", realm="intl",
                                        messages=_msgs) is True)
-check("开关放开后 fork 全模型结构化（kimi 也启用）",
+check("开关放开后非白名单仍排除（kimi）",
       P.structured_tool_history_enabled(model="kimi-k2", model_key="kimi",
-                                       realm="intl", messages=_msgs) is True)
+                                       realm="intl", messages=_msgs) is False)
 check("开关放开后 id 不齐仍回退（fail-safe）",
       P.structured_tool_history_enabled(
           model="DeepSeek-Flash", model_key="dfmodel", realm="intl",
           messages=[{"role": "tool", "content": "x"}]) is False)
 os.environ.pop("QD_STRUCTURED_TOOL_HISTORY_REALMS", None)
-check("移除开关后回到默认（intl 关闭）",
+check("移除开关后回到默认",
       P.structured_tool_history_enabled(model="DeepSeek-Flash",
                                        model_key="dfmodel", realm="intl",
-                                       messages=_msgs) is False)
+                                       messages=_msgs) is True)
 os.environ["QD_STRUCTURED_TOOL_HISTORY_REALMS"] = "cn"
 check("显式 cn 仍可回退国际区旧行为",
       P.structured_tool_history_enabled(model="GLM-5.3", realm="intl",

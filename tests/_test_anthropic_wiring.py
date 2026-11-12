@@ -234,10 +234,9 @@ def _split_frames(text, cuts=2):
 
 
 _out9 = _run_new_entry(_split_frames(_TRUNC9), {"terminal"})
-# fork 契约（v1.5.6）：半截 JSON 数组整块吞掉、正常收尾（issue #9），
-# 不把可继续的会话打成 error 重试循环；只要零泄漏即可。
-check("泄漏回归 · issue#9（截断的 marker+JSON 回声）-> 事件流里无标记",
-      _M not in _out9 and "工具结果" not in _out9)
+check("泄漏回归 · 截断回声不能静默结束：发 error，且无标记与成功收尾",
+      _M not in _out9 and "工具结果" not in _out9
+      and "event: error" in _out9 and "event: message_stop" not in _out9)
 _out11 = _run_new_entry(_split_frames(_TR11), {"terminal"})
 check("泄漏回归 · issue#11（[工具结果] 回声块）-> 事件流里无标记",
       "[工具结果" not in _out11 and _M not in _out11)

@@ -43,7 +43,7 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 - 每个 Key 有名称，可以单独启用 / 停用 / 删除，删除后立即失效
 - 每个 Key 可以绑定出口：
   - **国际版**：走 `api3.qoder.sh`，连不上时依次切换到 `api2` / `api1`
-  - **国内版**：走 `gateway.qoder.com.cn`
+  - **国内版**：按选中账号的实际入口走公网 `gateway.qoder.com.cn` 或企业实例专属网关；Key 绑定区域不覆盖账号的 VPC 选择
   - **不绑定**：跟随看板顶部的全局出口
 - 请求的模型和 Key 绑定的出口不匹配时，直接返回 400，给出说明
 
@@ -147,6 +147,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | `QD_AFFINITY_MAX_MSGS` | `0` | 对话超过 N 条消息后不再固定账号，`0` 表示不限制 |
 | `QD_AFFINITY_DEBUG` | `0` | 打印会话亲和的调试日志 |
 | `QD_INTL_GATEWAY` | `https://api3.qoder.sh` | 国际版推理主机。连接失败时依次切换到 `api2` / `api1` |
+| `QD_CN_VPC_ENDPOINT` | — | 国内版默认 VPC 实例名或专属域（如 `TARGET` / `TARGET.vpc.qoder.com.cn`）。账号显式实例 / 显式公网、凭证域推断优先于该默认；未设且无其它来源时走公网。按账号推导 openapi / gateway / website，VPC 不回退公网。仅 CN 生效，见[企业 VPC 专属域](accounts.md#企业-vpc-专属域cn) |
 
 ### 会话缓存保温（可选）
 
@@ -167,7 +168,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `QD_QUEUE_MAX_ROUNDS` | `3` | 上游排队（10605 / RESOURCE_LIMIT）时最多等待重试几轮 |
+| `QD_QUEUE_MAX_ROUNDS` | `6` | 上游排队（10605 / RESOURCE_LIMIT）时最多等待重试几轮 |
 | `QD_QUEUE_WAIT_MAX_SECS` | `180` | 单轮最多等待的秒数 |
 | `QD_QUEUE_WAIT_BUDGET_SECS` | `600` | 排队总共最多等待的秒数 |
 | `QD_QUEUE_WAIT_JITTER` | `2` | 每次排队等待额外加上 0 到 N 秒的随机抖动，避免多个客户端同时唤醒 |

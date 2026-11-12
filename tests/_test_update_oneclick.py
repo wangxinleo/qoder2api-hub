@@ -22,9 +22,6 @@ def _write(path, text):
         fh.write(text)
 
 
-check("一键更新只拉取本 fork 的 release（不覆盖回上游）",
-      U.REPO == "wangxinleo/qoder2api-hub", U.REPO)
-
 # ---------------------------------------------------------------- 文件选择
 _tmp = tempfile.mkdtemp()
 _rel = os.path.join(_tmp, "repo-1.0.0")
@@ -79,15 +76,12 @@ check("解压过滤路径穿越（.. / 绝对路径）",
 
 # ---------------------------------------------------------------- apply 语义
 _real_latest = U.latest_release
-_old_container = U._in_container
 U.latest_release = lambda timeout=8: {"tag": "v1.0.0", "version": "1.0.0",
                                        "url": "", "tarball": ""}
-U._in_container = lambda: False
 try:
     _noop = U.apply_update(_rel)
 finally:
     U.latest_release = _real_latest
-    U._in_container = _old_container
 check("已是最新时 apply 直接返回 noop（不下载）",
       _noop.get("ok") is True and _noop.get("noop") is True, _noop.get("message"))
 _old_container = U._in_container

@@ -9,7 +9,6 @@ accounts/*
 
 # 运行时数据：请求流水与指标快照
 usage/
-backups/
 logs/
 
 # 运行时进程状态：pid 文件是本地瞬时状态，绝不能随仓库分发
@@ -37,8 +36,3 @@ Thumbs.db
 python/
 .tmp_*
 _acc/
-
-.qoder
-.trellis
-AGENTS.md
-.gitattributes

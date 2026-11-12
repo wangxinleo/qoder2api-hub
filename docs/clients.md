@@ -37,7 +37,7 @@ Cherry Studio、Chatbox、NextChat、Kelivo 等客户端，按上面的通用参
 
 **`namespace` 容器会展开，不再丢弃**（issue #127）：Codex / MCP 把工具装在 `type:"namespace"` 里发出，
 网关递归展开 `tools` / `children` / `functions`（深度上限 4）成交互的 `function` 条目 —— 容器本身不出站，
-所以不会触发 #63 的 `unknown variant namespace`；回程在 `response.output_item.added` 那一帧就把
+所以不会触发 #63 的 `unknown variant namespace`；回程在 `response.output_item.added` 那一帧就把 
 `namespace` 字段补回（客户端按 `(name, namespace, kind)` 三元组匹配执行器）。
 
 - 重名工具（两个 MCP server 同名）**只保留第一个**并打 WARN —— 展平后无法区分；
@@ -45,7 +45,7 @@ Cherry Studio、Chatbox、NextChat、Kelivo 等客户端，按上面的通用参
   `custom_tool_names()` 也会递归进容器，否则回程判型错、调用不执行；
 - Codex Desktop 0.162+ 会把整份工具清单放进 `input` 的 `additional_tools` 条目，网关现在会与顶层 `tools` 合并。
 
-仍然不支持：`web_search` / `web_fetch` 这类需要网关自己出网执行的工具（会丢弃并 WARN），以及 Codex remote compaction
+仍然不支持：`web_search` / `web_fetch` 这类需要网关自己出网执行的工具（会丢弃并 WARN），以及 Codex remote compaction 
 （`compaction_trigger`）——后者目前记一条 WARNING 后按普通请求继续，长会话仍可能撞上下文窗口。
 
 最简单的方式是用下面的[智能体一键配置](#智能体一键配置)。手动配置的话，在 `~/.codex/config.toml` 里加一个 provider：

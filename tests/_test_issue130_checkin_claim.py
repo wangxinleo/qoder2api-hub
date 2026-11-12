@@ -41,8 +41,6 @@ class _FakeAcc:
     credits = {"remain": 1, "size": 2}
     campaign_codes = {}
     campaign_status = {}
-    def is_enterprise(self):
-        return False
     def campaign_checkin(self, gap=None, only_kinds=None):
         return {"ok": True, "claimed": [], "already": [], "earned": 0,
                 "blocked": [{"failure_code": "SAME_PERSON_ALREADY_CLAIMED",
