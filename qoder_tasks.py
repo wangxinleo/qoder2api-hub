@@ -736,6 +736,10 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
     only_kinds = ("", "CREDITS") if only_daily else None
     logs = []
     name = account.nickname or account.uid[:8]
+    if getattr(account, "is_vpc", False):
+        logs.append(f"— [{name}] {qoder_accounts.VPC_SKIP_MSG}，跳过")
+        return {"ok": True, "skipped_vpc": True, "logs": logs,
+                "earned_credit": 0, "credits": account.credits}
     logs.append(f"开始为账号 [{name}] 执行每日签到...")
 
     # --- 1) 活动平台（官方现行机制） ---
@@ -866,6 +870,12 @@ def run_pro_claim(account):
     """
     logs = []
     name = account.nickname or account.uid[:8]
+    if getattr(account, "is_vpc", False):
+        logs.append(f"— [{name}] {qoder_accounts.VPC_SKIP_MSG}，跳过")
+        return {"ok": True, "skipped_vpc": True, "logs": logs,
+                "earned_credit": 0, "already_claimed": False,
+                "state": "skipped_vpc", "msg": qoder_accounts.VPC_SKIP_MSG,
+                "credits": account.credits}
     ok, elig = account.pro_eligibility()
     if not ok:
         logs.append(f"! [{name}] Pro 升级包资格查询失败: {elig}")

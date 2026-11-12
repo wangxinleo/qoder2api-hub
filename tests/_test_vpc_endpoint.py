@@ -33,10 +33,6 @@ CASES = {
     "ACME.VPC.QODER.COM.CN": ("acme", "https://acme.vpc.qoder.com.cn",
                               "https://acme-openapi.vpc.qoder.com.cn",
                               "https://acme-gateway.vpc.qoder.com.cn"),
-    "https://acme-openapi.vpc.qoder.com.cn/": (
-        "acme", "https://acme.vpc.qoder.com.cn",
-        "https://acme-openapi.vpc.qoder.com.cn",
-        "https://acme-gateway.vpc.qoder.com.cn"),
     "acme-gateway.vpc.qoder.com.cn": (
         "acme", "https://acme.vpc.qoder.com.cn",
         "https://acme-openapi.vpc.qoder.com.cn",
@@ -57,6 +53,8 @@ BAD = (
     "other.example.com", "acme.vpc.qoder.com.cn.evil.test",
     "ftp://acme", "u:p@acme.vpc.qoder.com.cn",
     "acme..vpc.qoder.com.cn", "-acme", "acme-",
+    "https://acme-openapi.vpc.qoder.com.cn/",
+    "https://acme.vpc.qoder.com.cn",
 )
 for value in BAD:
     try:

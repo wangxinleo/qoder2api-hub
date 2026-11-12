@@ -260,18 +260,22 @@ VPC_DOMAIN_SUFFIX = "vpc.qoder.com.cn"
 def parse_vpc_endpoint(value):
     """把 QD_CN_VPC_ENDPOINT 解析成企业 VPC 的三个官方主机。
 
-    接受实例名（acme）或三个按服务拆分的域名（acme.vpc.qoder.com.cn /
-    acme-openapi.vpc.qoder.com.cn / acme-gateway.vpc.qoder.com.cn）。
-    空值返回 None；路径、端口、凭据、query、fragment 或空白一律拒绝，
+    只接受裸实例名（acme）或三个按服务拆分的裸域名
+    （acme.vpc.qoder.com.cn / acme-openapi.vpc.qoder.com.cn /
+    acme-gateway.vpc.qoder.com.cn）。
+    空值返回 None；scheme、路径、端口、凭据、query、fragment 或空白一律拒绝，
     避免一个值只改掉流程里的一部分端点。
     """
     raw = str(value or "")
     if not raw.strip():
         return None
+    if "://" in raw:
+        raise ValueError("invalid VPC endpoint: expected a bare instance name or "
+                         "a bare domain under %s" % VPC_DOMAIN_SUFFIX)
     if raw != raw.strip() or any(ch in raw for ch in "\r\n\t"):
         raise ValueError("invalid VPC endpoint: surrounding whitespace or "
                          "control characters")
-    target = raw if "://" in raw else "https://" + raw
+    target = "https://" + raw
     try:
         parsed = urllib.parse.urlsplit(target)
         port = parsed.port
@@ -1235,6 +1239,10 @@ def native_machine_identity(realm, account_id, force=False):
 # 签到能力探测缓存：404（接口不存在）后 N 秒内不再重复探测，避免每次巡检都
 # 打一个必然失败的请求；到期自动重探，官方上线即可自动恢复。
 CHECKIN_PROBE_TTL = 6 * 3600
+# 企业 VPC 账号只参与推理和 token 刷新，不参与个人签到/活动。
+# 该策略是业务决定，不提供运行时开关；需要变更请改这里并跑回归。
+VPC_SKIP_REASON = "vpc_account"
+VPC_SKIP_MSG = "企业 VPC 账号不参与个人签到/活动"
 # 活动列表缓存 TTL：活动状态变化很慢（每日一轮），20 秒内复用可让看板切换视图
 # /账号不再等那 1–4 秒的上游请求；领取动作会强制绕过并立即失效缓存。
 CAMPAIGNS_TTL = 20
@@ -2035,6 +2043,14 @@ class Account(object):
         return (self.realm + ":vpc:" + cfg["vpc_instance"]
                 if cfg.get("vpc_instance") else self.realm)
 
+    @property
+    def is_vpc(self):
+        """账号实际生效的端点是否为企业 VPC 实例。
+
+        VPC 账号只参与推理和必要的 token 刷新，不参与个人签到/活动。
+        """
+        return bool(self.vpc_endpoint)
+
     def _credits_source_allowed(self, host):
         cfg = self.realm_config()
         if cfg.get("vpc_instance"):
@@ -2783,6 +2799,8 @@ class Account(object):
         True  = 本账号所在区域存在 /daily-check-in 接口
         False = 接口不存在（404/405/410，实测国际版即如此）——缓存 TTL 内跳过
         """
+        if self.is_vpc:
+            return False, VPC_SKIP_REASON
         if self._checkin_cap is None:
             return None, ""
         if time.time() - self._checkin_cap_at > CHECKIN_PROBE_TTL:
@@ -2791,6 +2809,8 @@ class Account(object):
 
     def can_checkin(self):
         """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。"""
+        if self.is_vpc:
+            return False
         capable, _ = self.checkin_capability()
         if capable is False:
             return False
@@ -2804,6 +2824,9 @@ class Account(object):
         接口在本区域不存在时返回 (False, {"unavailable": True, reason:...})，
         并记录能力探测结果（活动上线后 TTL 到期会自动重探）。
         """
+        if self.is_vpc:
+            return False, {"unavailable": True, "reason": VPC_SKIP_REASON,
+                           "error": VPC_SKIP_MSG}
         # issue: 国际版签不到到 —— 基址走候选（openapi.qoder.sh 在部分网络不可达），
         # 只在连接失败 / 404 时换下一个，业务 4xx 不换。
         q, _code, _err = self._openapi_json(PATH_CHECKIN_STATUS,
@@ -2864,6 +2887,10 @@ class Account(object):
         不再按区域门控：接口不存在（国际版 404）按"本区域无此接口"跳过并给
         出明确原因，而不是静默什么都不做（历史问题：看板点签到毫无反应）。
         """
+        if self.is_vpc:
+            return {"ok": True, "unavailable": True,
+                    "reason": VPC_SKIP_REASON, "msg": VPC_SKIP_MSG,
+                    "skipped_vpc": True}
         ok, st = self.checkin_status()
         if not ok:
             if st.get("unavailable"):
@@ -2968,6 +2995,9 @@ class Account(object):
 
     def fetch_achievements(self, force=False):
         """已获得的成就 key 列表（用于解释活动「需先完成某成就」）。"""
+        if self.is_vpc:
+            return {"ok": False, "unavailable": True, "keys": [],
+                    "error": VPC_SKIP_MSG, "skipped_vpc": True}
         now = time.time()
         if not force and self._achievements_cache \
                 and now - self._achievements_cache[0] < CREDIT_USAGE_TTL:
@@ -3069,6 +3099,16 @@ class Account(object):
         返回 {ok, available, show_campaign, claimable, campaign_url, campaigns,
               identity}，每条活动含 action_type / claim_status / benefit / end_at。
         """
+        if self.is_vpc:
+            st = {"ok": True, "available": False, "show_campaign": False,
+                  "claimable": False, "campaign_url": "", "campaigns": [],
+                  "identity": getattr(self, "machine_identity_source", "derived"),
+                  "machine_headers": getattr(self, "machine_headers_state",
+                                             MACHINE_HEADERS_OMITTED),
+                  "hint": VPC_SKIP_MSG, "skipped_vpc": True}
+            self.campaign_status = st
+            self._campaigns_cache = (time.time(), st)
+            return st
         now = time.time()
         if not force and self._campaigns_cache \
                 and now - self._campaigns_cache[0] < CAMPAIGNS_TTL:
@@ -3181,6 +3221,8 @@ class Account(object):
 
     def campaign_reward(self, campaign_id):
         """GET …/campaigns/{id}/reward -> 该活动的发放状态（幂等，只读）。"""
+        if self.is_vpc:
+            return {"error": VPC_SKIP_MSG, "skipped_vpc": True}
         cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_REWARD % campaign_id)
         try:
@@ -3199,6 +3241,8 @@ class Account(object):
             （实测：同机多号共享每轮一次的额度，第二个号会被 BLOCKED 且列表里
             隐藏该活动——官方文档写"每账号"，实际执行是"每人"）。
         """
+        if self.is_vpc:
+            return {"ok": False, "error": VPC_SKIP_MSG, "skipped_vpc": True}
         cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
@@ -3286,6 +3330,12 @@ class Account(object):
             的 epoch 秒与可读文本（见 next_checkin_window）；**无论本次是否真的
             领到都给出**，前端只在"没到账"时渲染。
         """
+        if self.is_vpc:
+            return {"ok": True, "skipped_vpc": True, "earned": 0,
+                    "claimed": [], "already": [], "blocked": [], "pending": [],
+                    "locked": [], "codes": [], "views": [], "campaigns": [],
+                    "message": VPC_SKIP_MSG, "next_available_at": 0,
+                    "next_available_note": ""}
         claim_gap = CLAIM_GAP_DEFAULT if gap is None else max(0.0, float(gap))
         # 领取前只需"身份有效"（内存 → 落盘 → 组件），**不要** force 刷新：
         # force 会让每次签到都换一套身份并把落盘缓存刷掉，「重建不换」就失效了
@@ -3914,6 +3964,8 @@ class Account(object):
 
     # -- Pro 升级包（一次性 +1800） ---------------------------------------
     def pro_eligibility(self):
+        if self.is_vpc:
+            return True, False
         cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_ELIGIBILITY
         try:
@@ -3929,6 +3981,8 @@ class Account(object):
             return False, str(exc)
 
     def pro_claim(self):
+        if self.is_vpc:
+            return {"ok": False, "error": VPC_SKIP_MSG, "skipped_vpc": True}
         cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_CLAIM
         try:
