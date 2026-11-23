@@ -231,15 +231,16 @@ claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，�
 **守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
 （没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
 
-**基线（v1.3.7 · 2026-10-13）**：
+**基线（v1.9.13-wangxinleo · 2026-11-23，同步上游 v1.9.8~v1.9.13 后）**：
 
 | 口径 | 数值 |
 |---|---|
-| 套件数 | **28 suites** |
-| 全部断言 | **1005 checks** |
-| 结果 | 0 failed / exit 0 |
-| 前端六套件小计 | **105**（9/19/19/15/12/31） |
-| legacy 套件 | 630（其中 4 条 SKIP，语义见 `_test_qoder.py` 的 SUMMARY 说明） |
+| 套件数 | **165 suites**（另有 3 个 unittest 风格套件打印 `OK`、无 SUMMARY 行：`_test_official_web.py` / `_test_web_backends.py` / `_test_web_response.py`） |
+| 全部断言 | **4850 checks** |
+| 结果 | 164 passed / 1 failed（`_test_update_oneclick.py` 的「已是最新时 apply 直接返回 noop」） |
+| 既有环境现象 | 上一条失败在**容器内必然发生**（`_in_container()` 为真时 `apply_update` 在版本比对前就被容器守卫拦下）；已在合并前基线 3ec4926 复跑证实同败，**非回归**。非容器环境应为 0 failed |
+
+（历史基线：v1.3.7 · 2026-10-13 = 28 suites / 1005 checks。）
 
 **提交前建议三步**：
 
