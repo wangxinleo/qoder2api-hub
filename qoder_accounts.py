@@ -1836,15 +1836,20 @@ class _VpcRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _opener_for_request():
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _opener_for_request(*, follow_redirects=True):
     """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
 
     「现建」是对 #27 固化行为的修复——默认 opener（urllib.request.urlopen）
     首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
     """
     proxies = _proxy_map_from_env()
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies),
-                                       _VpcRedirectHandler())
+    redirects = _VpcRedirectHandler() if follow_redirects else _NoRedirectHandler()
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies), redirects)
 
 
 def upstream_clock_skew(timeout=4.0):
@@ -1867,7 +1872,7 @@ def upstream_clock_skew(timeout=4.0):
 
 
 def http_json(url, data=None, method=None, headers=None, timeout=30,
-              retries=3, backoff=1.0, log=None):
+              retries=3, backoff=1.0, log=None, *, follow_redirects=True):
     """urlopen + json decode with retries. 所有 openapi 调用统一走这里。"""
     validate_public_http_url(url)
     attempts = max(1, int(retries or 1))
@@ -1880,7 +1885,8 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
             headers=headers or {},
         )
         try:
-            with _opener_for_request().open(req, timeout=timeout) as resp:
+            opener = _opener_for_request(follow_redirects=follow_redirects)
+            with opener.open(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             last = exc
@@ -3257,18 +3263,24 @@ class Account(object):
                 body = ""
             code = ""
             try:
-                code = str((json.loads(body) or {}).get("errorCode") or "")
-            except Exception:
-                code = ""
-            if exc.code == 409 or code.upper() in ("ALREADY_CLAIMED", "REPLAYED"):
+                detail = json.loads(body)
+                code = str(detail.get("failureCode") or detail.get("errorCode") or "").upper()
+            except (AttributeError, ValueError):
+                pass
+            if code in ("ALREADY_CLAIMED", "REPLAYED"):
                 return {"ok": True, "status": "CLAIMED", "replayed": True,
                         "message": "今日已领取（上游幂等确认）"}
-            return {"ok": False, "error": "HTTP %d %s" % (exc.code, body[:160])}
+            if code == "SAME_PERSON_ALREADY_CLAIMED":
+                return {"ok": False, "blocked": True, "failure_code": code}
+            if code in _CAMPAIGN_FAILURE_CN:
+                return {"ok": False, "failure_code": code,
+                        "message": _CAMPAIGN_FAILURE_CN[code]}
+            return {"ok": False, "error": "活动领取请求被拒绝（HTTP %d）" % exc.code}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         status = str(r.get("status") or "").upper()
         failure = str(r.get("failureCode") or "").upper()
-        if failure == "SAME_PERSON_ALREADY_CLAIMED" or status == "BLOCKED":
+        if failure == "SAME_PERSON_ALREADY_CLAIMED":
             return {"ok": False, "blocked": True, "status": status or "BLOCKED",
                     "replayed": False, "failure_code": failure or "BLOCKED",
                     "amount": int(((r.get("benefit") or {})
@@ -3292,7 +3304,8 @@ class Account(object):
                     "redemption_code": code,
                     "message": _CAMPAIGN_FAILURE_CN[failure], "raw": r}
         return {
-            "ok": status in ("CLAIMED", "GRANTED", "SUCCESS"),
+            "ok": not failure and r.get("success") is not False
+                  and status in ("CLAIMED", "GRANTED", "SUCCESS"),
             "status": status,
             "replayed": bool(r.get("replayed")),
             "failure_code": failure or "",
@@ -3403,7 +3416,11 @@ class Account(object):
                 #   ACHIEVEMENT_NOT_COMPLETED=locked）
                 if reason == "REDEMPTION_CODE_OUT_OF_STOCK":
                     pending.append(c)
-                elif reason == "ACHIEVEMENT_NOT_COMPLETED"                         or c.get("achievement_completed") is False:
+                elif reason == "ACHIEVEMENT_NOT_COMPLETED":
+                    locked.append(c)
+                elif reason in _CAMPAIGN_FAILURE_CN:
+                    errors.append("%s: %s（%s）" % (cname, _CAMPAIGN_FAILURE_CN[reason], reason))
+                elif c.get("achievement_completed") is False:
                     locked.append(c)
                 continue
             if c["action_type"] and c["action_type"] != "CLAIM_BENEFIT":
@@ -3433,13 +3450,18 @@ class Account(object):
                     self.save(os.path.dirname(self.path))
                 blocked.append({"campaign": label,
                                 "failure_code": res.get("failure_code")})
-            elif res.get("failure_code") in _CAMPAIGN_FAILURE_CN:
-                # 领取瞬间名额发完 / 任务未完成等：按"待重试/被锁"分类，不算失败
-                slot = (pending if res["failure_code"] == "REDEMPTION_CODE_OUT_OF_STOCK"
-                        else locked)
-                slot.append(c)
+            elif res.get("failure_code") == "REDEMPTION_CODE_OUT_OF_STOCK":
+                pending.append(c)
+            elif res.get("failure_code") == "ACHIEVEMENT_NOT_COMPLETED":
+                locked.append(c)
             else:
-                errors.append("%s: %s" % (cname, res.get("error")))
+                code = res.get("failure_code")
+                detail = _CAMPAIGN_FAILURE_CN.get(code) or res.get("error")
+                if not detail:
+                    detail = "上游未确认领取（status=%s）" % (res.get("status") or "?")
+                if code in _CAMPAIGN_FAILURE_CN:
+                    detail += "（%s）" % code
+                errors.append("%s: %s" % (cname, detail))
             # 每个 claim 请求之后统一等待一次：成功/被挡/失败都刚打过上游，
             # 相邻请求间隔由 gap 保证（默认 CLAIM_GAP_DEFAULT，防风控）。
             time.sleep(claim_gap)
@@ -3455,6 +3477,8 @@ class Account(object):
         elif already:
             msg = "今日活动奖励已领取（%s）" % "、".join(
                 self.campaign_label(c) for c in already)
+        elif errors:
+            msg = "活动领取未成功：%s" % "; ".join(errors)[:200]
         elif pending:
             msg = ("名额已发完，次日 10:00 后可再领：%s（活动 %s）" % (
                 "、".join(c["required_achievement_key"] or "无门槛任务"
@@ -3465,8 +3489,6 @@ class Account(object):
                 ", ".join(c["required_achievement_key"] or "?"
                           for c in locked),
                 ", ".join(c["campaign_key"] or c["campaign_id"] for c in locked)))
-        elif errors:
-            msg = "活动领取失败：%s" % "; ".join(errors)[:200]
         else:
             msg = "当前账号暂无可领取的官方活动"
         # 有待补货/待完成任务的活动时，把它们附在结论里（一键签到日志要能看到）

@@ -97,7 +97,7 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 
 ### Claude Code 连续工具调用
 
-白名单模型（Qwen / GLM / DeepSeek）默认在 `cn` 和 `intl` 两个出口保留结构化工具历史，
+白名单模型（Qwen / GLM / DeepSeek / Kimi）默认在 `cn` 和 `intl` 两个出口保留结构化工具历史，
 不再把 `assistant.tool_calls` 和 `role:tool` 改写为正文信封，减少模型复述工具协议后提前结束的问题。
 缺少工具 ID 的历史仍会回退；`QD_STRUCTURED_TOOL_HISTORY=off` 可关闭，
 `QD_STRUCTURED_TOOL_HISTORY_REALMS=cn` 可恢复仅国内区启用的范围。
@@ -105,6 +105,12 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 上游只返回截断工具数组、或正文里出现 `[Bash 工具调用]` 等伪调用时，网关会明确返回协议错误
 （Anthropic 流式为 `event: error`，非流式为 HTTP 502），不会伪装成成功的 `end_turn`。
 这类参数不完整的调用不会被猜测执行；代码围栏中的格式示例仍作为普通正文返回。
+
+### 容器停止与 SIGTERM（#156）
+
+镜像默认以 Python 作为 PID 1，进程现显式处理 SIGTERM：退出监听循环并关闭 socket，随后运行 PID 文件等退出清理。不要在主线程的信号处理器中调用 `HTTPServer.shutdown()`，它会等待同线程的 `serve_forever()` 返回而死锁。
+
+`docker stop` 不再依赖宽限期结束后的 SIGKILL；发布流水线用真实默认容器验证停止耗时和退出码（必须为 0，而不是 137）。退出会中断仍在执行的请求，不承诺等待所有上游推理完成。Compose 的 `init: true` 可作为用户侧额外选项，但修复不依赖它，直接 `docker run` 同样适用。
 
 ### 容器启动自检
 
@@ -193,3 +199,21 @@ Linux / macOS 先 `./stop-qoder-proxy.sh` 再 `./start-qoder-proxy.sh`（常驻/
 | `QD_UPDATE_ALLOW_CONTAINER` | 关 | 容器里默认拒绝自更新（镜像重建会覆盖），改为在宿主机 `docker compose pull` |
 
 > 容器部署请用 `docker compose pull`：镜像里的代码由镜像决定，容器内自更新会被下次重建覆盖。
+
+## 关闭网关（面板按钮 / `POST /admin/shutdown`）
+
+面板「设置 → 运行信息 → 关闭网关」与 `POST /admin/shutdown` 都能停掉网关进程，
+等价于 stop 脚本。安全模型与一键更新一致：**面板会话 + 本机来源 + 请求体显式
+`{"confirm": true}`**，容器里也可用（只是进程退出，`restart: unless-stopped` 的
+容器策略会按编排决定是否重新拉起）。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `QD_SHUTDOWN_DISABLE` | 关 | 设为 `1` 完全禁用关闭端点，面板按钮同时隐藏 |
+| `QD_SHUTDOWN_ALLOW_REMOTE` | 关 | 默认仅接受 loopback 直连，带 `Forwarded` / `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` 的代理请求也拒绝；设 `1` 才放开（面板会话仍然必需） |
+
+`200` 仅确认关停已安排，延迟不是响应刷新同步保证，也不承诺排空在途请求。若反向代理移除了所有来源头，服务端无法仅凭 loopback socket 区分它与本机直连；需要在代理层禁用此路由或设置 `QD_SHUTDOWN_DISABLE=1`。
+
+关闭后必须用启动脚本重新拉起（Windows `start-qoder-proxy.bat` /
+Linux·macOS `./start-qoder-proxy.sh`）。正在转发的请求可能被中断，请避开高峰期操作。
+容器里更推荐 `docker compose restart`：它走 SIGTERM，收尾路径相同且不需要重启镜像。
